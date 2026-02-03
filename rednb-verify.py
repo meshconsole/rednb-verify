@@ -210,16 +210,18 @@ def generate_manifest(notebook: Path, month_only: bool, algo: str) -> Dict:
 # ---------- CLI ----------
 
 NON_REPUDIATION_WARNING = """
-## Non-Repudiation Warning ⚠️
-
-Signing a manifest is a serious cryptographic act.
-
-By signing a hash manifest, you assert that:
-- These files existed
-- In this exact form
-- At or before the signing time
-
-Anyone with your public key can verify this claim.
+╔══════════════════════════════════════════════════╗
+║           Non-Repudiation Warning ⚠️             ║
+║                                                  ║
+║Signing a manifest is a serious cryptographic act.║
+║                                                  ║
+║By signing a hash manifest, you assert that:      ║
+║- These files existed                             ║
+║- In this exact form                              ║
+║- At or before the signing time                   ║
+║                                                  ║
+║Anyone with your public key can verify this claim.║
+╚══════════════════════════════════════════════════╝
 """
 
 def main():
