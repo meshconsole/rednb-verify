@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.4.3
+Version: 0.4.4
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
