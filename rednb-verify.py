@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 HASH_ALGO = "sha256"
 
 
