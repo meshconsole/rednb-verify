@@ -5,6 +5,15 @@ Version: 0.4.4
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
+
+CLI/Commands:
+rednb-verify.py [options] [notebook_directory]
+"-m", "--month-only" : Hashes only month files
+"-o", "--output": Set output path of manifest, default is outside of notebook directory
+"--verify" : Set to verification mode
+"--manifest": Set manifest file to compare against
+"--report": Optional, Creates report of comparison between manifest and notebook
+"--hash": Select what type of hash to use from the python library, input type string, ex "blake2b"
 """
 
 import argparse
