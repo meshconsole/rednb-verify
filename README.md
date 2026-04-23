@@ -4,7 +4,7 @@
 
 It creates cryptographic manifests of notebook entries and optionally signs them, producing a verifiable snapshot of the notebook at a specific point in time.
 
-The project focuses on **tamper detection, auditability, and long-term trust**, not secrecy.
+The project focuses on **tamper detection, auditability, and long-term trust**, and not secrecy.
 
 ---
 
