@@ -21,7 +21,7 @@ The project focuses on **tamper detection, auditability, and long-term trust**, 
 ### 2. Flexible Signing Backends
 - Support **GPG-based signing**
 - Do **not** require GPG exclusively
-- Allow future signing backends without renaming the project
+- Allow future signing backends
 
 ### 3. Hardware-Backed Signing (Planned)
 - Support **FIDO2 / security keys**
