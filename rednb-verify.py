@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.4.4
+Version: 0.5.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -13,7 +13,6 @@ rednb-verify.py [options] [notebook_directory]
 "--verify" : Set to verification mode
 "--manifest": Set manifest file to compare against
 "--report": Optional, Creates report of comparison between manifest and notebook
-"--hash": Select what type of hash to use from the python library, input type string, ex "blake2b"
 """
 
 import argparse
@@ -26,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-VERSION = "0.4.4"
+VERSION = "0.5.0"
 HASH_ALGO = "sha256"
 
 
@@ -36,8 +35,8 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def hash_file(path: Path, algo: str) -> str:
-    h = hashlib.new(algo)
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
@@ -93,81 +92,26 @@ def gpg_available() -> bool:
         return False
 
 
-def list_secret_keys() -> List[Dict]:
-    """
-    Returns a list of secret keys with:
-    - fingerprint (uppercase)
-    - uid
-    - expiration date
-    """
-    result = subprocess.run(
-        ["gpg", "--list-secret-keys", "--with-colons"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    keys = []
-    current = None
-
-    for line in result.stdout.splitlines():
-        parts = line.split(":")
-
-        if parts[0] == "sec":
-            expires = parts[6]
-            current = {
-                "fingerprint": None,
-                "uid": "",
-                "expires": (
-                    datetime.utcfromtimestamp(int(expires)).strftime("%Y-%m-%d")
-                    if expires.isdigit() and int(expires) > 0
-                    else "never"
-                ),
-            }
-            keys.append(current)
-
-        elif parts[0] == "fpr" and current and current["fingerprint"] is None:
-            current["fingerprint"] = parts[9].upper()
-
-        elif parts[0] == "uid" and current and not current["uid"]:
-            current["uid"] = parts[9]
-
-    # Remove incomplete entries defensively
-    return [k for k in keys if k["fingerprint"] and k["uid"]]
-
-
-def choose_key(keys: List[Dict]) -> str | None:
-    print("\nAvailable signing keys:\n")
-    for idx, key in enumerate(keys):
-        print(
-            f"[{idx:02d}] {key['uid']} | FPR:{key['fingerprint']} | expires:{key['expires']}"
-        )
-
-    choice = input("\nSelect key index to use (or press Enter to cancel): ").strip()
-    if not choice:
-        return None
-
-    if not choice.isdigit():
-        print("[ERROR] Invalid selection.")
-        return None
-
-    idx = int(choice)
-    if idx < 0 or idx >= len(keys):
-        print("[ERROR] Selection out of range.")
-        return None
-
-    return keys[idx]["fingerprint"]
-
-
-
-def gpg_detach_sign(manifest_path: Path, key_fpr: str | None) -> bool:
-    cmd = ["gpg", "--detach-sign", "--armor"]
-    if key_fpr:
-        cmd.extend(["--local-user", key_fpr])
-    cmd.append(manifest_path.name)
-
+def gpg_has_secret_keys() -> bool:
     try:
-        subprocess.run(cmd, cwd=manifest_path.parent, check=True)
+        result = subprocess.run(
+            ["gpg", "--list-secret-keys", "--with-colons"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return any(line.startswith("sec:") for line in result.stdout.splitlines())
+    except Exception:
+        return False
+
+
+def gpg_detach_sign(manifest_path: Path) -> bool:
+    try:
+        subprocess.run(
+            ["gpg", "--detach-sign", "--armor", manifest_path.name],
+            cwd=manifest_path.parent,
+            check=True,
+        )
         return True
     except subprocess.CalledProcessError:
         return False
@@ -187,7 +131,7 @@ def gpg_verify(manifest: Path, signature: Path) -> bool:
 
 # ---------- Manifest ----------
 
-def collect_files(base: Path, month_only: bool, algo: str) -> Dict[str, str]:
+def collect_files(base: Path, month_only: bool) -> Dict[str, str]:
     files = {}
     for root, _, filenames in os.walk(base):
         for name in filenames:
@@ -195,59 +139,76 @@ def collect_files(base: Path, month_only: bool, algo: str) -> Dict[str, str]:
             rel = path.relative_to(base)
             if month_only and not is_month_file(path):
                 continue
-            files[str(rel)] = hash_file(path, algo)
+            files[rel.as_posix()] = sha256_file(path)
     return dict(sorted(files.items()))
 
 
-def generate_manifest(notebook: Path, month_only: bool, algo: str) -> Dict:
-    files = collect_files(notebook, month_only, algo)
+def generate_manifest(notebook: Path, month_only: bool) -> Dict:
+    files = collect_files(notebook, month_only)
     hashes = list(files.values())
 
+    created = utc_timestamp()
     return {
         "tool": "rednb-verify",
         "version": VERSION,
-        "created": utc_timestamp(),
-        "hash_algorithm": algo,
+        "created": created,
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "hash_algorithm": HASH_ALGO,
+        "merkle_hash": "sha256",
         "mode": "month-files" if month_only else "full-tree",
         "files": [
-            {"path": p, algo: h} for p, h in files.items()
+            {"path": p, HASH_ALGO: h} for p, h in files.items()
         ],
         "merkle_root": merkle_root(hashes),
     }
 
 
-# ---------- CLI ----------
+# ---------- Verification ----------
 
-NON_REPUDIATION_WARNING = """
-╔══════════════════════════════════════════════════╗
-║           Non-Repudiation Warning ⚠️             ║
-║                                                  ║
-║Signing a manifest is a serious cryptographic act.║
-║                                                  ║
-║By signing a hash manifest, you assert that:      ║
-║- These files existed                             ║
-║- In this exact form                              ║
-║- At or before the signing time                   ║
-║                                                  ║
-║Anyone with your public key can verify this claim.║
-╚══════════════════════════════════════════════════╝
-"""
+def verify_manifest(manifest: Dict, notebook: Path) -> Dict[str, List[str]]:
+    results = {
+        "ok": [],
+        "missing": [],
+        "modified": [],
+        "new": [],
+    }
+
+    algo = manifest.get("hash_algorithm", "sha256")
+    expected = {f["path"]: f[algo] for f in manifest["files"]}
+    actual = collect_files(notebook, manifest["mode"] == "month-files")
+
+    for path, h in expected.items():
+        if path not in actual:
+            results["missing"].append(path)
+        elif actual[path] != h:
+            results["modified"].append(path)
+        else:
+            results["ok"].append(path)
+
+    for path in actual:
+        if path not in expected:
+            results["new"].append(path)
+
+    return results
+
+
+# ---------- CLI ----------
 
 def main():
     parser = argparse.ArgumentParser(
         description="Verify RedNotebook integrity"
     )
     parser.add_argument("notebook_dir", type=Path)
-    parser.add_argument("-m", "--month-only", action="store_true")
-    parser.add_argument("-o", "--output", type=Path)
-    parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--report", type=Path)
-    parser.add_argument(
-        "--hash",
-        default=HASH_ALGO,
-        help="Hash algorithm name (e.g. 'sha256', 'sha512', 'blake2b').",
-    )
+    parser.add_argument("-m", "--month-only", action="store_true",
+                        help="Hash only YYYY-MM.txt files")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="Output directory (default: cwd)")
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify an existing manifest")
+    parser.add_argument("--manifest", type=Path,
+                        help="Manifest file to verify")
+    parser.add_argument("--report", type=Path,
+                        help="Verification report file")
 
     args = parser.parse_args()
 
@@ -260,60 +221,50 @@ def main():
             sys.exit(2)
 
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        sig = args.manifest.with_suffix(args.manifest.suffix + ".asc")
+        results = verify_manifest(manifest, args.notebook_dir)
 
+        report_path = args.report or out_dir / f"report-{utc_timestamp()}.json"
+        report_path.write_text(
+            json.dumps(results, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        sig = args.manifest.with_suffix(args.manifest.suffix + ".asc")
         if sig.exists() and gpg_available():
             if gpg_verify(args.manifest, sig):
                 print("[OK] GPG signature verified.")
             else:
-                print("[WARN] Manifest signature invalid.")
+                print("[WARN] GPG signature invalid.")
         else:
             print("[WARN] Manifest not signed.")
 
-        print("[OK] Verification complete.")
+        if any(k != "ok" and results[k] for k in results):
+            print("Verification completed with issues.")
+            sys.exit(1)
+
+        print("[OK] Verification successful.")
         return
 
-    try:
-        hashlib.new(args.hash)
-    except ValueError:
-        print(f"[ERROR] Unsupported hash algorithm: {args.hash}")
-        sys.exit(2)
+    manifest = generate_manifest(args.notebook_dir, args.month_only)
+    manifest_name = f"hashes-{manifest['created']}.json"
+    manifest_path = out_dir / manifest_name
 
-    manifest = generate_manifest(args.notebook_dir, args.month_only, args.hash)
-    name = f"hashes-{manifest['created']}.json"
-    path = out_dir / name
-
-    path.write_text(
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    print(f"Manifest created: {path}")
-
-    if not gpg_available():
-        print("[INFO] GPG not available — manifest not signed.")
-        return
-
-    keys = list_secret_keys()
-    if not keys:
-        print("[WARN] GPG available but no secret keys found — not signing.")
-        return
-
-    print(NON_REPUDIATION_WARNING)
-    confirm = input("Do you want to sign this manifest? [y/N]: ").strip().lower()
-    if confirm != "y":
-        print("[INFO] Manifest left unsigned.")
-        return
-
-    key_fpr = choose_key(keys)
-    if key_fpr is None:
-        print("[INFO] Signing cancelled.")
-        return
-
-    if gpg_detach_sign(path, key_fpr):
-        print("[OK] Manifest signed with GPG.")
+    if gpg_available():
+        if not gpg_has_secret_keys():
+            print("[WARN] GPG available but no secret keys found — not signing.")
+        elif gpg_detach_sign(manifest_path):
+            print("[OK] Manifest signed with GPG.")
+        else:
+            print("[WARN] GPG signing failed.")
     else:
-        print("[WARN] GPG signing failed.")
+        print("[INFO] GPG not available — manifest not signed.")
+
+    print(f"Manifest created: {manifest_path}")
 
 
 if __name__ == "__main__":
