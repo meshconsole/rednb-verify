@@ -26,6 +26,7 @@ rednb-verify.py [options] [notebook_directory]
 "--no-sign"             : Skip all signing
 "--quiet"               : Suppress non-error output; implies --no-sign unless signing is explicit
 "--exclude PATTERN"     : Exclude files matching glob (repeatable)
+"--no-config / --no-cf" : Ignore ~/.config/rednb-verify/config.json for this run
 """
 
 import argparse
@@ -670,7 +671,10 @@ def _sign_with_ssh(
 def main():
     global _quiet
 
-    config = load_config()
+    # Pre-scan argv so --no-config/--no-cf skips loading before argparse runs
+    _no_config = "--no-config" in sys.argv or "--no-cf" in sys.argv
+    config = {} if _no_config else load_config()
+    _config_active = bool(config)
 
     parser = argparse.ArgumentParser(
         description="rednb-verify — RedNotebook integrity and tamper detection",
@@ -763,6 +767,8 @@ supported hash algorithms:
                         help="Suppress non-error output; implies --no-sign unless signing is explicit")
     parser.add_argument("--exclude", action="append", metavar="PATTERN",
                         help="Exclude files matching glob pattern (repeatable)")
+    parser.add_argument("--no-config", "--no-cf", action="store_true", dest="no_config",
+                        help="Ignore ~/.config/rednb-verify/config.json for this run")
 
     # Apply config file as default layer (CLI args override)
     cfg: Dict = {}
@@ -787,6 +793,10 @@ supported hash algorithms:
 
     # Activate quiet mode before any output
     _quiet = args.quiet
+
+    # Notify user that a config file is in effect
+    if _config_active:
+        _qprint(f"[INFO] Using config: {CONFIG_PATH}")
 
     # Validate --report format
     if args.report not in ("txt", "json"):
