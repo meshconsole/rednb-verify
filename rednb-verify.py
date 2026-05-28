@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 HASH_ALGO = "sha256"
 
 
@@ -94,26 +94,69 @@ def gpg_available() -> bool:
         return False
 
 
-def gpg_has_secret_keys() -> bool:
-    try:
-        result = subprocess.run(
-            ["gpg", "--list-secret-keys", "--with-colons"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return any(line.startswith("sec:") for line in result.stdout.splitlines())
-    except Exception:
-        return False
+def list_secret_keys() -> List[Dict]:
+    result = subprocess.run(
+        ["gpg", "--list-secret-keys", "--with-colons"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    keys = []
+    current = None
+
+    for line in result.stdout.splitlines():
+        parts = line.split(":")
+
+        if parts[0] == "sec":
+            expires = parts[6]
+            current = {
+                "fingerprint": None,
+                "uid": "",
+                "expires": (
+                    datetime.fromtimestamp(int(expires), tz=timezone.utc).strftime("%Y-%m-%d")
+                    if expires.isdigit() and int(expires) > 0
+                    else "never"
+                ),
+            }
+            keys.append(current)
+
+        elif parts[0] == "fpr" and current and current["fingerprint"] is None:
+            current["fingerprint"] = parts[9].upper()
+
+        elif parts[0] == "uid" and current and not current["uid"]:
+            current["uid"] = parts[9]
+
+    return [k for k in keys if k["fingerprint"] and k["uid"]]
 
 
-def gpg_detach_sign(manifest_path: Path) -> bool:
+def choose_key(keys: List[Dict]) -> str | None:
+    print("\nAvailable signing keys:\n")
+    for idx, key in enumerate(keys):
+        print(f"  [{idx:02d}] {key['uid']}")
+        print(f"        FPR: {key['fingerprint']}")
+        print(f"        Expires: {key['expires']}")
+
+    choice = input("\nSelect key index (or Enter to cancel): ").strip()
+    if not choice:
+        return None
+    if not choice.isdigit():
+        print("[ERROR] Invalid selection.")
+        return None
+    idx = int(choice)
+    if idx < 0 or idx >= len(keys):
+        print("[ERROR] Selection out of range.")
+        return None
+    return keys[idx]["fingerprint"]
+
+
+def gpg_detach_sign(manifest_path: Path, key_fpr: str | None) -> bool:
+    cmd = ["gpg", "--detach-sign", "--armor"]
+    if key_fpr:
+        cmd.extend(["--local-user", key_fpr])
+    cmd.append(manifest_path.name)
     try:
-        subprocess.run(
-            ["gpg", "--detach-sign", "--armor", manifest_path.name],
-            cwd=manifest_path.parent,
-            check=True,
-        )
+        subprocess.run(cmd, cwd=manifest_path.parent, check=True)
         return True
     except subprocess.CalledProcessError:
         return False
@@ -196,6 +239,22 @@ def verify_manifest(manifest: Dict, notebook: Path) -> Dict[str, List[str]]:
 
 # ---------- CLI ----------
 
+NON_REPUDIATION_WARNING = """
+╔══════════════════════════════════════════════════╗
+║          Non-Repudiation Warning                 ║
+║                                                  ║
+║ Signing a manifest is a serious cryptographic    ║
+║ act. By signing, you assert that:                ║
+║                                                  ║
+║  - These files existed                           ║
+║  - In this exact form                            ║
+║  - At or before the signing time                 ║
+║                                                  ║
+║ Anyone with your public key can verify this.     ║
+╚══════════════════════════════════════════════════╝
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Verify RedNotebook integrity"
@@ -268,15 +327,25 @@ def main():
         encoding="utf-8",
     )
 
-    if gpg_available():
-        if not gpg_has_secret_keys():
-            print("[WARN] GPG available but no secret keys found — not signing.")
-        elif gpg_detach_sign(manifest_path):
-            print("[OK] Manifest signed with GPG.")
-        else:
-            print("[WARN] GPG signing failed.")
-    else:
+    if not gpg_available():
         print("[INFO] GPG not available — manifest not signed.")
+    else:
+        keys = list_secret_keys()
+        if not keys:
+            print("[WARN] GPG available but no secret keys found — not signing.")
+        else:
+            print(NON_REPUDIATION_WARNING)
+            confirm = input("Sign this manifest? [y/N]: ").strip().lower()
+            if confirm != "y":
+                print("[INFO] Manifest left unsigned.")
+            else:
+                key_fpr = choose_key(keys)
+                if key_fpr is None:
+                    print("[INFO] Signing cancelled.")
+                elif gpg_detach_sign(manifest_path, key_fpr):
+                    print("[OK] Manifest signed with GPG.")
+                else:
+                    print("[WARN] GPG signing failed.")
 
     print(f"Manifest created: {manifest_path}")
 
