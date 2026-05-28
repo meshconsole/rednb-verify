@@ -6,15 +6,18 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.5.3 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
+**Version:** 0.5.4 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
 
 ---
 
 ## Quick Start
 
 ```bash
-# Create a manifest of your journal
+# Create a manifest (signing menu appears)
 python rednb-verify.py ~/journal
+
+# Create a manifest without signing
+python rednb-verify.py ~/journal --no-sign
 
 # Verify the journal against a manifest
 python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json
@@ -43,11 +46,12 @@ rednb-verify.py [options] notebook_dir
 | `--report FILE` | Write a JSON verification report to this path |
 | `--hash ALGO` | Hash algorithm for files (default: `sha256`) |
 | `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
-| `--ssh-sign` | Sign the manifest with an SSH key after creation |
-| `--ssh-verify` | Verify an SSH signature during `--verify` |
-| `--ssh-sig FILE` | Path to SSH signature file (default: `<manifest>.sshsig`) |
-| `--ssh-kl DIR` | Directory to scan for SSH keys (default: `~/.ssh`) |
+| `--ssh-sign` | Sign the manifest with an SSH key (skips signing menu) |
+| `--ssh-verify` | Force SSH signature check during `--verify` |
+| `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`=SSH |
+| `--ssh-kl FILE_OR_DIR` | SSH `.pub` key file (used directly) or directory to scan (default: `~/.ssh`) |
 | `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
+| `--no-sign` | Skip all signing prompts |
 
 ### Examples
 
@@ -55,24 +59,29 @@ rednb-verify.py [options] notebook_dir
 # Hash only month files, save manifest alongside the journal
 python rednb-verify.py ~/journal --month-only --output ~/journal
 
+# Create manifest and skip signing
+python rednb-verify.py ~/journal --no-sign
+
 # Use blake2b for file hashes, sha256 for the Merkle tree
 python rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
 
-# Create and sign with GPG in one step
-python rednb-verify.py ~/journal --output ~/journal
-# (GPG signing is prompted automatically if keys are available)
+# Create and sign — interactive menu asks how to sign
+python rednb-verify.py ~/journal
 
-# Create and sign with SSH
+# Create and sign with SSH directly (skips menu)
 python rednb-verify.py ~/journal --ssh-sign
 
 # Create and sign with a FIDO2/YubiKey-backed SSH key
 python rednb-verify.py ~/journal --ssh-sign --ssh-fido
 
-# Verify with both GPG and SSH signature checks
+# Use a specific SSH public key file directly (no directory scan)
+python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
+
+# Verify with both GPG and SSH signatures at the same time
 python rednb-verify.py ~/journal \
   --verify \
   --manifest ~/journal/hashes-20260528T120000Z.json \
-  --ssh-verify \
+  --sig ~/journal/hashes-20260528T120000Z.json.asc,~/journal/hashes-20260528T120000Z.json.sshsig \
   --report ~/journal/report.json
 ```
 
@@ -118,9 +127,15 @@ Interactive key selection shows fingerprint and expiry for each key.
 
 ### SSH
 
-Use `--ssh-sign` to sign with an SSH key. The tool scans `~/.ssh` (or `--ssh-kl`) for key pairs and prompts for selection if multiple are found.
+Use `--ssh-sign` to sign with an SSH key. The tool scans `~/.ssh` (or the directory given by `--ssh-kl`) for key pairs and prompts for selection if multiple are found.
 
-The signature is saved as `<manifest>.sshsig`. During `--verify`, pass `--ssh-verify` to check it.
+Pass a `.pub` file directly to `--ssh-kl` to skip scanning and use that key immediately:
+
+```bash
+python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
+```
+
+The signature is saved as `<manifest>.sshsig`. During `--verify`, pass `--ssh-verify` to force an SSH check, or use `--sig` to specify the file explicitly.
 
 #### FIDO2 / Hardware Keys
 
@@ -133,6 +148,19 @@ python rednb-verify.py ~/journal --ssh-sign --ssh-fido
 # Sign preferring a specific FIDO2 key by name
 python rednb-verify.py ~/journal --ssh-sign --ssh-fido yubikey
 ```
+
+### Verifying Multiple Signatures
+
+Use `--sig` with a comma-separated list to verify GPG and SSH signatures in a single run. The type is detected by extension (`.asc` → GPG, `.sshsig` → SSH):
+
+```bash
+python rednb-verify.py ~/journal \
+  --verify \
+  --manifest hashes-20260528T120000Z.json \
+  --sig hashes-20260528T120000Z.json.asc,hashes-20260528T120000Z.json.sshsig
+```
+
+When `--sig` is omitted, both signature types are still auto-detected from the manifest directory.
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.5.3
+Version: 0.5.4
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -15,10 +15,10 @@ rednb-verify.py [options] [notebook_directory]
 "--report"              : Optional, creates report of comparison between manifest and notebook
 "--hash"                : Hash algorithm for files (default: sha256), e.g. sha512, blake2b
 "--hash-merkle"         : Hash algorithm for Merkle tree (default: same as --hash)
-"--ssh-sign"            : Sign manifest with an SSH key
-"--ssh-verify"          : Verify an SSH signature during --verify
-"--ssh-sig"             : Path to SSH signature file (default: <manifest>.sshsig)
-"--ssh-kl"              : Directory to scan for SSH keys (default: ~/.ssh)
+"--ssh-sign"            : Sign manifest with an SSH key (skips signing menu)
+"--ssh-verify"          : Force SSH signature check during --verify
+"--sig"                 : Signature file(s) — comma-separated, .asc=GPG .sshsig=SSH
+"--ssh-kl"              : SSH key file (.pub) or directory to scan (default: ~/.ssh)
 "--ssh-fido"            : Prefer FIDO2/hardware-backed SSH keys; optional key name filter
 "--no-sign"             : Skip all signing prompts (GPG and SSH)
 """
@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 HASH_ALGO = "sha256"
 
 
@@ -174,9 +174,9 @@ def gpg_detach_sign(manifest_path: Path, key_fpr: str | None) -> bool:
 def gpg_verify(manifest: Path, signature: Path) -> bool:
     try:
         subprocess.run(
-            ["gpg", "--verify", signature.name, manifest.name],
-            cwd=manifest.parent,
+            ["gpg", "--verify", str(signature.resolve()), str(manifest.resolve())],
             check=True,
+            capture_output=True,
         )
         return True
     except subprocess.CalledProcessError:
@@ -292,12 +292,40 @@ def choose_ssh_key(candidates: List[SshKeyCandidate]) -> Optional[SshKeyCandidat
 
 
 def select_ssh_key(
-    directory: Path,
+    ssh_kl: Path,
     require_private: bool,
     prefer_fido: bool,
     keyname: Optional[str],
 ) -> Optional[SshKeyCandidate]:
-    candidates = scan_ssh_keys(directory, require_private=require_private)
+    """Resolve an SSH key from a direct .pub file path or a directory to scan."""
+    if ssh_kl.is_file():
+        # Direct public key file — use it immediately without scanning
+        pub_path = ssh_kl
+        try:
+            line = pub_path.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError):
+            print(f"[WARN] Could not read public key: {pub_path}")
+            return None
+        parsed = _parse_pubkey_line(line)
+        if not parsed:
+            print(f"[WARN] Could not parse public key: {pub_path}")
+            return None
+        key_type, comment = parsed
+        is_fido = "sk-" in key_type
+        priv_path = pub_path.with_suffix("")
+        if require_private and not priv_path.exists():
+            print(f"[WARN] Private key not found alongside {pub_path.name}")
+            return None
+        return SshKeyCandidate(
+            pub_path=pub_path,
+            priv_path=priv_path if priv_path.exists() else None,
+            key_type=key_type,
+            comment=comment,
+            filename=pub_path.name,
+            is_fido=is_fido,
+        )
+    # Directory: scan and optionally prompt for selection
+    candidates = scan_ssh_keys(ssh_kl, require_private=require_private)
     candidates = _filter_ssh_candidates(candidates, prefer_fido=prefer_fido, keyname=keyname)
     return choose_ssh_key(candidates)
 
@@ -313,7 +341,6 @@ def _detect_ssh_sig_candidates(manifest_path: Path) -> List[Path]:
 
 
 def ssh_sign_manifest(manifest_path: Path, key_path: Path, sig_path: Path) -> bool:
-    # ssh-keygen writes <manifest>.sig; we rename to our target path
     default_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
     appended_sig = manifest_path.parent / f"{manifest_path.name}.sig"
     for candidate in (default_sig, appended_sig):
@@ -481,29 +508,109 @@ SSH_NON_REPUDIATION_WARNING = """
 """
 
 
+def _prompt_signing_menu() -> int:
+    """Ask user how to sign the manifest. Returns 1=GPG, 2=SSH, 3=Both, 4=None."""
+    print("""
+How would you like to sign this manifest?
+
+  [1] Sign with GPG
+  [2] Sign with SSH
+  [3] Sign with both GPG and SSH
+  [4] Manifest only (skip signing)
+""")
+    choice = input("Option: ").strip()
+    if not choice or choice == "4":
+        return 4
+    if choice in ("1", "2", "3"):
+        return int(choice)
+    print("[WARN] Invalid selection — skipping signing.")
+    return 4
+
+
+def _sign_with_gpg(manifest_path: Path) -> None:
+    if not gpg_available():
+        print("[WARN] GPG not available — GPG signing skipped.")
+        return
+    keys = list_secret_keys()
+    if not keys:
+        print("[WARN] No GPG secret keys found — GPG signing skipped.")
+        return
+    print(NON_REPUDIATION_WARNING)
+    confirm = input("Sign this manifest with GPG? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("[INFO] GPG signing cancelled.")
+        return
+    key_fpr = choose_key(keys)
+    if key_fpr is None:
+        print("[INFO] GPG signing cancelled.")
+        return
+    if gpg_detach_sign(manifest_path, key_fpr):
+        print("[OK] Manifest signed with GPG.")
+    else:
+        print("[WARN] GPG signing failed.")
+
+
+def _sign_with_ssh(
+    manifest_path: Path,
+    sig_path: Path,
+    ssh_kl_path: Path,
+    prefer_fido: bool,
+    keyname: Optional[str],
+) -> None:
+    if not ssh_keygen_available():
+        print("[WARN] ssh-keygen not available — SSH signing skipped.")
+        return
+    signer = select_ssh_key(
+        ssh_kl_path, require_private=True,
+        prefer_fido=prefer_fido, keyname=keyname,
+    )
+    if signer is None or signer.priv_path is None:
+        print("[WARN] No suitable SSH key found for signing.")
+        return
+    print(SSH_NON_REPUDIATION_WARNING)
+    confirm = input("Sign this manifest with SSH? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("[INFO] SSH signing cancelled.")
+        return
+    if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
+        print(f"[OK] SSH signature created: {sig_path.name}")
+    else:
+        print("[WARN] SSH signing failed.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="rednb-verify — RedNotebook integrity and tamper detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Create a manifest
+  # Create a manifest (signing menu appears)
   rednb-verify.py ~/journal
 
   # Month files only, save manifest inside the journal directory
   rednb-verify.py ~/journal --month-only --output ~/journal
 
-  # Verify and write a report
-  rednb-verify.py ~/journal --verify --manifest hashes-....json --report report.json
+  # Create and skip signing
+  rednb-verify.py ~/journal --no-sign
+
+  # Create and sign with SSH directly (skips menu)
+  rednb-verify.py ~/journal --ssh-sign
+
+  # Create and sign with a FIDO2 hardware key
+  rednb-verify.py ~/journal --ssh-sign --ssh-fido
+
+  # Use a specific SSH public key file directly
+  rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
 
   # Use blake2b for files, sha256 for the Merkle tree
   rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
 
-  # Create manifest and sign with SSH (FIDO2 hardware key preferred)
-  rednb-verify.py ~/journal --ssh-sign --ssh-fido
+  # Verify and write a report
+  rednb-verify.py ~/journal --verify --manifest hashes-....json --report report.json
 
-  # Verify with both GPG and SSH signature checks
-  rednb-verify.py ~/journal --verify --manifest hashes-....json --ssh-verify
+  # Verify with explicit signature files (GPG and SSH at the same time)
+  rednb-verify.py ~/journal --verify --manifest hashes-....json \\
+    --sig hashes-....json.asc,hashes-....json.sshsig
 
 supported hash algorithms (python hashlib):
   sha256, sha512, sha3_256, sha3_512, blake2b, blake2s, and others
@@ -520,19 +627,21 @@ supported hash algorithms (python hashlib):
     parser.add_argument("--manifest", type=Path,
                         help="Manifest file to verify")
     parser.add_argument("--report", type=Path,
-                        help="Verification report file")
+                        help="Verification report output path")
     parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo",
                         help="Hash algorithm for files (default: sha256)")
     parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
                         help="Hash algorithm for Merkle tree (default: same as --hash)")
     parser.add_argument("--ssh-sign", action="store_true",
-                        help="Sign manifest with an SSH key after creation")
+                        help="Sign manifest with an SSH key (skips signing menu)")
     parser.add_argument("--ssh-verify", action="store_true",
-                        help="Verify SSH signature during --verify")
-    parser.add_argument("--ssh-sig", type=Path,
-                        help="Path to SSH signature file (default: <manifest>.sshsig)")
+                        help="Force SSH signature check during --verify")
+    parser.add_argument("--sig", type=str, default=None,
+                        metavar="FILE[,FILE]",
+                        help="Signature file(s), comma-separated (.asc=GPG, .sshsig=SSH)")
     parser.add_argument("--ssh-kl", type=Path, default=Path("~/.ssh"),
-                        help="Directory to scan for SSH keys (default: ~/.ssh)")
+                        metavar="FILE_OR_DIR",
+                        help="SSH key .pub file (used directly) or directory to scan (default: ~/.ssh)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
                         help="Prefer FIDO2 hardware keys; optional name filter")
     parser.add_argument("--no-sign", action="store_true",
@@ -548,9 +657,21 @@ supported hash algorithms (python hashlib):
             print(f"[ERROR] Unsupported algorithm for {label}: {algo}")
             sys.exit(2)
 
+    # Resolve SSH key location (file used directly, directory scanned)
+    ssh_kl_path = Path(os.path.expanduser(str(args.ssh_kl)))
+
+    # Parse --sig into a list of Paths
+    sig_paths: List[Path] = []
+    if args.sig:
+        sig_paths = [Path(s.strip()) for s in args.sig.split(",") if s.strip()]
+
+    prefer_fido = args.ssh_fido is not None
+    keyname = args.ssh_fido or None
+
     out_dir = args.output or Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Verify mode ----
     if args.verify:
         if not args.manifest:
             print("[ERROR] --verify requires --manifest")
@@ -564,50 +685,63 @@ supported hash algorithms (python hashlib):
             json.dumps(results, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        print(f"Verification report: {report_path}")
 
-        sig = args.manifest.with_suffix(args.manifest.suffix + ".asc")
-        if sig.exists() and gpg_available():
-            if gpg_verify(args.manifest, sig):
-                print("[OK] GPG signature verified.")
-            else:
-                print("[WARN] GPG signature invalid.")
+        # Resolve which signature files to check
+        if sig_paths:
+            gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
+            ssh_sigs = [p for p in sig_paths if p.suffix == ".sshsig"]
+            unknown = [p for p in sig_paths if p.suffix not in (".asc", ".sshsig")]
+            for p in unknown:
+                print(f"[WARN] Unknown signature type for '{p.name}' — skipped (expected .asc or .sshsig).")
         else:
+            # Auto-detect from manifest location
+            auto_asc = args.manifest.with_suffix(args.manifest.suffix + ".asc")
+            gpg_sigs = [auto_asc] if auto_asc.exists() else []
+            auto_sshsig = args.manifest.with_suffix(args.manifest.suffix + ".sshsig")
+            ssh_sigs = [auto_sshsig] if (auto_sshsig.exists() or args.ssh_verify) else []
+
+        # GPG verification
+        if not gpg_sigs:
             print("[WARN] Manifest not GPG-signed.")
+        else:
+            for gpg_sig in gpg_sigs:
+                if not gpg_sig.exists():
+                    print(f"[WARN] GPG signature file not found: {gpg_sig.name}")
+                elif not gpg_available():
+                    print("[WARN] GPG not available — GPG verification skipped.")
+                else:
+                    if gpg_verify(args.manifest, gpg_sig):
+                        print(f"[OK] GPG signature verified: {gpg_sig.name}")
+                    else:
+                        print(f"[WARN] GPG signature invalid: {gpg_sig.name}")
 
-        ssh_dir = Path(os.path.expanduser(str(args.ssh_kl)))
-        ssh_sig_path = (
-            _normalize_ssh_sig_path(args.ssh_sig)
-            if args.ssh_sig
-            else args.manifest.with_suffix(args.manifest.suffix + ".sshsig")
-        )
-        sig_candidates = _detect_ssh_sig_candidates(args.manifest)
-
-        if args.ssh_verify or ssh_sig_path.exists():
+        # SSH verification
+        for ssh_sig in ssh_sigs:
             if not ssh_keygen_available():
                 print("[WARN] ssh-keygen not available — SSH verification skipped.")
-            elif not ssh_sig_path.exists():
-                print("[WARN] SSH signature file not found.")
-            else:
-                prefer_fido = args.ssh_fido is not None
-                keyname = args.ssh_fido or None
-                signer = select_ssh_key(
-                    ssh_dir, require_private=False,
-                    prefer_fido=prefer_fido, keyname=keyname,
-                )
-                if signer is None:
-                    print("[WARN] No suitable SSH key found for verification.")
-                else:
-                    result = ssh_verify_manifest(
-                        args.manifest, ssh_sig_path, signer.pub_path,
-                        multiple_signatures=len(sig_candidates) > 1 and args.ssh_sig is None,
-                        nonstandard_sig=ssh_sig_path != args.manifest.with_suffix(
-                            args.manifest.suffix + ".sshsig"
-                        ),
-                    )
-                    label = "[OK]" if result.status == "OK" else f"[{result.status}]"
-                    print(f"{label} {result.message}")
-                    for w in result.warnings:
-                        print(f"[WARN] {w}")
+                break
+            if not ssh_sig.exists():
+                print(f"[WARN] SSH signature file not found: {ssh_sig.name}")
+                continue
+            signer = select_ssh_key(
+                ssh_kl_path, require_private=False,
+                prefer_fido=prefer_fido, keyname=keyname,
+            )
+            if signer is None:
+                print("[WARN] No suitable SSH key found for verification.")
+                continue
+            result = ssh_verify_manifest(
+                args.manifest, ssh_sig, signer.pub_path,
+                multiple_signatures=len(ssh_sigs) > 1,
+                nonstandard_sig=ssh_sig != args.manifest.with_suffix(
+                    args.manifest.suffix + ".sshsig"
+                ),
+            )
+            label = "[OK]" if result.status == "OK" else f"[{result.status}]"
+            print(f"{label} {result.message}")
+            for w in result.warnings:
+                print(f"[WARN] {w}")
 
         if any(k != "ok" and results[k] for k in results):
             print("Verification completed with issues.")
@@ -616,7 +750,10 @@ supported hash algorithms (python hashlib):
         print("[OK] Verification successful.")
         return
 
-    manifest = generate_manifest(args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo)
+    # ---- Create mode ----
+    manifest = generate_manifest(
+        args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo
+    )
     manifest_name = f"hashes-{manifest['created']}.json"
     manifest_path = out_dir / manifest_name
 
@@ -624,59 +761,29 @@ supported hash algorithms (python hashlib):
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
-    if args.no_sign:
-        print("[INFO] Signing skipped (--no-sign).")
-    elif not gpg_available():
-        print("[INFO] GPG not available — manifest not signed.")
-    else:
-        keys = list_secret_keys()
-        if not keys:
-            print("[WARN] GPG available but no secret keys found — not signing.")
-        else:
-            print(NON_REPUDIATION_WARNING)
-            confirm = input("Sign this manifest? [y/N]: ").strip().lower()
-            if confirm != "y":
-                print("[INFO] Manifest left unsigned.")
-            else:
-                key_fpr = choose_key(keys)
-                if key_fpr is None:
-                    print("[INFO] Signing cancelled.")
-                elif gpg_detach_sign(manifest_path, key_fpr):
-                    print("[OK] Manifest signed with GPG.")
-                else:
-                    print("[WARN] GPG signing failed.")
-
     print(f"Manifest created: {manifest_path}")
 
-    if args.ssh_sign and not args.no_sign:
-        if not ssh_keygen_available():
-            print("[WARN] ssh-keygen not available — SSH signing skipped.")
-        else:
-            ssh_dir = Path(os.path.expanduser(str(args.ssh_kl)))
-            prefer_fido = args.ssh_fido is not None
-            keyname = args.ssh_fido or None
-            signer = select_ssh_key(
-                ssh_dir, require_private=True,
-                prefer_fido=prefer_fido, keyname=keyname,
-            )
-            if signer is None or signer.priv_path is None:
-                print("[WARN] No suitable SSH key found for signing.")
-            else:
-                print(SSH_NON_REPUDIATION_WARNING)
-                confirm = input("Sign this manifest with SSH? [y/N]: ").strip().lower()
-                if confirm != "y":
-                    print("[INFO] SSH signing cancelled.")
-                else:
-                    sig_path = (
-                        _normalize_ssh_sig_path(args.ssh_sig)
-                        if args.ssh_sig
-                        else manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
-                    )
-                    if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
-                        print(f"[OK] SSH signature created: {sig_path.name}")
-                    else:
-                        print("[WARN] SSH signing failed.")
+    # Resolve SSH sig output path: from --sig if a .sshsig path given, else default
+    ssh_sig_out = next(
+        (p for p in sig_paths if p.suffix == ".sshsig"),
+        manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
+    )
+
+    # ---- Signing ----
+    if args.no_sign:
+        print("[INFO] Signing skipped (--no-sign).")
+
+    elif args.ssh_sign:
+        # Explicit SSH flag — skip menu, sign with SSH only
+        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+
+    else:
+        # No explicit method — show interactive signing menu
+        sign_choice = _prompt_signing_menu()
+        if sign_choice in (1, 3):
+            _sign_with_gpg(manifest_path)
+        if sign_choice in (2, 3):
+            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
 
 
 if __name__ == "__main__":
