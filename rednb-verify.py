@@ -20,6 +20,7 @@ rednb-verify.py [options] [notebook_directory]
 "--ssh-sig"             : Path to SSH signature file (default: <manifest>.sshsig)
 "--ssh-kl"              : Directory to scan for SSH keys (default: ~/.ssh)
 "--ssh-fido"            : Prefer FIDO2/hardware-backed SSH keys; optional key name filter
+"--no-sign"             : Skip all signing prompts (GPG and SSH)
 """
 
 import argparse
@@ -475,7 +476,7 @@ SSH_NON_REPUDIATION_WARNING = """
 ║  - At or before the signing time                    ║
 ║                                                     ║
 ║ Anyone with your public key can verify this.        ║
-║ FIDO2/hardware keys are kept offline in the device. ║
+║ FIDO2/hardware keys are kept offline on the device. ║
 ╚═════════════════════════════════════════════════════╝
 """
 
@@ -534,6 +535,8 @@ supported hash algorithms (python hashlib):
                         help="Directory to scan for SSH keys (default: ~/.ssh)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
                         help="Prefer FIDO2 hardware keys; optional name filter")
+    parser.add_argument("--no-sign", action="store_true",
+                        help="Skip all signing prompts (GPG and SSH)")
 
     args = parser.parse_args()
     args.merkle_algo = args.merkle_algo or args.hash_algo
@@ -622,7 +625,9 @@ supported hash algorithms (python hashlib):
         encoding="utf-8",
     )
 
-    if not gpg_available():
+    if args.no_sign:
+        print("[INFO] Signing skipped (--no-sign).")
+    elif not gpg_available():
         print("[INFO] GPG not available — manifest not signed.")
     else:
         keys = list_secret_keys()
@@ -644,7 +649,7 @@ supported hash algorithms (python hashlib):
 
     print(f"Manifest created: {manifest_path}")
 
-    if args.ssh_sign:
+    if args.ssh_sign and not args.no_sign:
         if not ssh_keygen_available():
             print("[WARN] ssh-keygen not available — SSH signing skipped.")
         else:
