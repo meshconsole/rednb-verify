@@ -482,7 +482,32 @@ SSH_NON_REPUDIATION_WARNING = """
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Verify RedNotebook integrity"
+        description="rednb-verify — RedNotebook integrity and tamper detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # Create a manifest
+  rednb-verify.py ~/journal
+
+  # Month files only, save manifest inside the journal directory
+  rednb-verify.py ~/journal --month-only --output ~/journal
+
+  # Verify and write a report
+  rednb-verify.py ~/journal --verify --manifest hashes-....json --report report.json
+
+  # Use blake2b for files, sha256 for the Merkle tree
+  rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
+
+  # Create manifest and sign with SSH (FIDO2 hardware key preferred)
+  rednb-verify.py ~/journal --ssh-sign --ssh-fido
+
+  # Verify with both GPG and SSH signature checks
+  rednb-verify.py ~/journal --verify --manifest hashes-....json --ssh-verify
+
+supported hash algorithms (python hashlib):
+  sha256, sha512, sha3_256, sha3_512, blake2b, blake2s, and others
+  run: python -c "import hashlib; print(hashlib.algorithms_guaranteed)"
+"""
     )
     parser.add_argument("notebook_dir", type=Path)
     parser.add_argument("-m", "--month-only", action="store_true",
