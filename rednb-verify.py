@@ -450,7 +450,7 @@ def verify_manifest(manifest: Dict, notebook: Path) -> Dict[str, List[str]]:
 
 NON_REPUDIATION_WARNING = """
 ╔══════════════════════════════════════════════════╗
-║          Non-Repudiation Warning                 ║
+║             Non-Repudiation Warning              ║
 ║                                                  ║
 ║ Signing a manifest is a serious cryptographic    ║
 ║ act. By signing, you assert that:                ║
@@ -464,19 +464,19 @@ NON_REPUDIATION_WARNING = """
 """
 
 SSH_NON_REPUDIATION_WARNING = """
-╔══════════════════════════════════════════════════╗
-║       SSH Non-Repudiation Warning                ║
-║                                                  ║
-║ Signing with an SSH key binds your identity to   ║
-║ this manifest. By signing, you assert that:      ║
-║                                                  ║
-║  - These files existed                           ║
-║  - In this exact form                            ║
-║  - At or before the signing time                 ║
-║                                                  ║
-║ Anyone with your public key can verify this.     ║
-║ FIDO2/hardware keys keep the private key offline.║
-╚══════════════════════════════════════════════════╝
+╔═════════════════════════════════════════════════════╗
+║             SSH Non-Repudiation Warning             ║
+║                                                     ║
+║ Signing with an SSH key binds your identity to      ║
+║ this manifest. By signing, you assert that:         ║
+║                                                     ║
+║  - These files existed                              ║
+║  - In this exact form                               ║
+║  - At or before the signing time                    ║
+║                                                     ║
+║ Anyone with your public key can verify this.        ║
+║ FIDO2/hardware keys are kept offline in the device. ║
+╚═════════════════════════════════════════════════════╝
 """
 
 

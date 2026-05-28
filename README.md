@@ -166,7 +166,7 @@ Exit code is `1` if any issues are found, `0` if all tracked files are clean.
 
 ---
 
-## Non-Repudiation Warning
+## Non-Repudiation Warning ⚠️
 
 **Signing a manifest is a serious cryptographic act.**
 
