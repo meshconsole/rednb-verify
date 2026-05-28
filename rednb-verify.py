@@ -27,6 +27,7 @@ rednb-verify.py [options] [notebook_directory]
 "--quiet"               : Suppress non-error output; implies --no-sign unless signing is explicit
 "--exclude PATTERN"     : Exclude files matching glob (repeatable)
 "--no-config / --no-cf" : Ignore ~/.config/rednb-verify/config.json for this run
+"--config FILE"         : Load a specific config file instead of the default
 """
 
 import argparse
@@ -59,13 +60,13 @@ def _qprint(msg: str) -> None:
 
 # ---------- Config ----------
 
-def load_config() -> Dict:
-    """Load ~/.config/rednb-verify/config.json if present."""
-    if CONFIG_PATH.exists():
+def load_config(path: Path = CONFIG_PATH) -> Dict:
+    """Load a config JSON file if present. Defaults to ~/.config/rednb-verify/config.json."""
+    if path.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[WARN] Could not load config {CONFIG_PATH}: {exc}", file=sys.stderr)
+            print(f"[WARN] Could not load config {path}: {exc}", file=sys.stderr)
     return {}
 
 
@@ -671,9 +672,19 @@ def _sign_with_ssh(
 def main():
     global _quiet
 
-    # Pre-scan argv so --no-config/--no-cf skips loading before argparse runs
+    # Pre-scan argv so --no-config/--no-cf and --config FILE take effect
+    # before argparse runs (config must be loaded before set_defaults).
     _no_config = "--no-config" in sys.argv or "--no-cf" in sys.argv
-    config = {} if _no_config else load_config()
+    _config_path = CONFIG_PATH
+    if not _no_config:
+        for i, arg in enumerate(sys.argv[1:], 1):
+            if arg == "--config" and i + 1 < len(sys.argv):
+                _config_path = Path(sys.argv[i + 1]).expanduser()
+                break
+            if arg.startswith("--config="):
+                _config_path = Path(arg.split("=", 1)[1]).expanduser()
+                break
+    config = {} if _no_config else load_config(_config_path)
     _config_active = bool(config)
 
     parser = argparse.ArgumentParser(
@@ -769,6 +780,8 @@ supported hash algorithms:
                         help="Exclude files matching glob pattern (repeatable)")
     parser.add_argument("--no-config", "--no-cf", action="store_true", dest="no_config",
                         help="Ignore ~/.config/rednb-verify/config.json for this run")
+    parser.add_argument("--config", type=Path, metavar="FILE",
+                        help="Load a specific config file instead of the default")
 
     # Apply config file as default layer (CLI args override)
     cfg: Dict = {}
@@ -796,7 +809,7 @@ supported hash algorithms:
 
     # Notify user that a config file is in effect
     if _config_active:
-        _qprint(f"[INFO] Using config: {CONFIG_PATH}")
+        _qprint(f"[INFO] Using config: {_config_path}")
 
     # Validate --report format
     if args.report not in ("txt", "json"):
