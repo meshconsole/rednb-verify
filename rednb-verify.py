@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.5.0
+Version: 0.5.1
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
 
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
-"-m", "--month-only" : Hashes only month files
-"-o", "--output": Set output path of manifest, default is outside of notebook directory
-"--verify" : Set to verification mode
-"--manifest": Set manifest file to compare against
-"--report": Optional, Creates report of comparison between manifest and notebook
+"-m", "--month-only"    : Hashes only month files
+"-o", "--output"        : Set output path of manifest, default is outside of notebook directory
+"--verify"              : Set to verification mode
+"--manifest"            : Set manifest file to compare against
+"--report"              : Optional, creates report of comparison between manifest and notebook
+"--hash"                : Hash algorithm for files (default: sha256), e.g. sha512, blake2b
+"--hash-merkle"         : Hash algorithm for Merkle tree (default: same as --hash)
 """
 
 import argparse
@@ -25,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 HASH_ALGO = "sha256"
 
 
@@ -35,8 +37,8 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
+def hash_file(path: Path, algo: str) -> str:
+    h = hashlib.new(algo)
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
@@ -59,7 +61,7 @@ def is_month_file(path: Path) -> bool:
 
 # ---------- Merkle ----------
 
-def merkle_root(hashes: List[str]) -> str:
+def merkle_root(hashes: List[str], algo: str) -> str:
     if not hashes:
         return ""
 
@@ -70,7 +72,7 @@ def merkle_root(hashes: List[str]) -> str:
         for i in range(0, len(level), 2):
             left = level[i]
             right = level[i + 1] if i + 1 < len(level) else left
-            h = hashlib.sha256(left + right).digest()
+            h = hashlib.new(algo, left + right).digest()
             next_level.append(h)
         level = next_level
 
@@ -131,7 +133,7 @@ def gpg_verify(manifest: Path, signature: Path) -> bool:
 
 # ---------- Manifest ----------
 
-def collect_files(base: Path, month_only: bool) -> Dict[str, str]:
+def collect_files(base: Path, month_only: bool, algo: str) -> Dict[str, str]:
     files = {}
     for root, _, filenames in os.walk(base):
         for name in filenames:
@@ -139,12 +141,12 @@ def collect_files(base: Path, month_only: bool) -> Dict[str, str]:
             rel = path.relative_to(base)
             if month_only and not is_month_file(path):
                 continue
-            files[rel.as_posix()] = sha256_file(path)
+            files[rel.as_posix()] = hash_file(path, algo)
     return dict(sorted(files.items()))
 
 
-def generate_manifest(notebook: Path, month_only: bool) -> Dict:
-    files = collect_files(notebook, month_only)
+def generate_manifest(notebook: Path, month_only: bool, algo: str, merkle_algo: str) -> Dict:
+    files = collect_files(notebook, month_only, algo)
     hashes = list(files.values())
 
     created = utc_timestamp()
@@ -153,13 +155,13 @@ def generate_manifest(notebook: Path, month_only: bool) -> Dict:
         "version": VERSION,
         "created": created,
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "hash_algorithm": HASH_ALGO,
-        "merkle_hash": "sha256",
+        "hash_algorithm": algo,
+        "merkle_hash": merkle_algo,
         "mode": "month-files" if month_only else "full-tree",
         "files": [
-            {"path": p, HASH_ALGO: h} for p, h in files.items()
+            {"path": p, algo: h} for p, h in files.items()
         ],
-        "merkle_root": merkle_root(hashes),
+        "merkle_root": merkle_root(hashes, merkle_algo),
     }
 
 
@@ -175,7 +177,7 @@ def verify_manifest(manifest: Dict, notebook: Path) -> Dict[str, List[str]]:
 
     algo = manifest.get("hash_algorithm", "sha256")
     expected = {f["path"]: f[algo] for f in manifest["files"]}
-    actual = collect_files(notebook, manifest["mode"] == "month-files")
+    actual = collect_files(notebook, manifest["mode"] == "month-files", algo)
 
     for path, h in expected.items():
         if path not in actual:
@@ -209,8 +211,20 @@ def main():
                         help="Manifest file to verify")
     parser.add_argument("--report", type=Path,
                         help="Verification report file")
+    parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo",
+                        help="Hash algorithm for files (default: sha256)")
+    parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
+                        help="Hash algorithm for Merkle tree (default: same as --hash)")
 
     args = parser.parse_args()
+    args.merkle_algo = args.merkle_algo or args.hash_algo
+
+    for label, algo in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
+        try:
+            hashlib.new(algo)
+        except ValueError:
+            print(f"[ERROR] Unsupported algorithm for {label}: {algo}")
+            sys.exit(2)
 
     out_dir = args.output or Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -245,7 +259,7 @@ def main():
         print("[OK] Verification successful.")
         return
 
-    manifest = generate_manifest(args.notebook_dir, args.month_only)
+    manifest = generate_manifest(args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo)
     manifest_name = f"hashes-{manifest['created']}.json"
     manifest_path = out_dir / manifest_name
 
