@@ -6,14 +6,14 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.5.4 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
+**Version:** 0.5.5 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
 
 ---
 
 ## Quick Start
 
 ```bash
-# Create a manifest (signing menu appears)
+# Create a manifest (signing menu appears; saved next to the journal)
 python rednb-verify.py ~/journal
 
 # Create a manifest without signing
@@ -22,8 +22,8 @@ python rednb-verify.py ~/journal --no-sign
 # Verify the journal against a manifest
 python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json
 
-# Verify and write a report
-python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json --report report.json
+# Verify and write a JSON report
+python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json --report json
 ```
 
 ---
@@ -40,10 +40,10 @@ rednb-verify.py [options] notebook_dir
 |---|---|
 | `notebook_dir` | Path to the RedNotebook journal directory |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
-| `-o`, `--output DIR` | Output directory for the manifest (default: current directory) |
+| `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
 | `--verify` | Verify mode — compare notebook against a manifest |
 | `--manifest FILE` | Manifest file to verify against (required with `--verify`) |
-| `--report FILE` | Write a JSON verification report to this path |
+| `--report [txt\|json]` | Report format during verify: `txt` human-readable (default) or `json` structured |
 | `--hash ALGO` | Hash algorithm for files (default: `sha256`) |
 | `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
 | `--ssh-sign` | Sign the manifest with an SSH key (skips signing menu) |
@@ -82,7 +82,7 @@ python rednb-verify.py ~/journal \
   --verify \
   --manifest ~/journal/hashes-20260528T120000Z.json \
   --sig ~/journal/hashes-20260528T120000Z.json.asc,~/journal/hashes-20260528T120000Z.json.sshsig \
-  --report ~/journal/report.json
+  --report json
 ```
 
 ---
@@ -166,7 +166,12 @@ When `--sig` is omitted, both signature types are still auto-detected from the m
 
 ## Verification Report
 
-`--report` writes a JSON file with four categories:
+`--report` writes a verification report alongside the manifest (in the journal's parent directory by default). Format is controlled by the argument:
+
+- `--report` or `--report txt` — human-readable text (default)
+- `--report json` — structured JSON
+
+The JSON format has four categories:
 
 ```json
 {
