@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.6.1
+Version: 0.7.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -85,19 +85,60 @@ def _require_yaml():
         import yaml  # type: ignore
         return yaml
     except ImportError:
-        print("[ERROR] --per-day requires PyYAML:  pip install pyyaml")
+        print(f"{_tag('ERROR')} --per-day requires PyYAML:  pip install pyyaml")
         sys.exit(2)
+
+
+# ---------- Colour helpers ----------
+# Applied only when stdout/stderr is a real TTY (no colour when piped/redirected).
+
+_ANSI_RESET = "\033[0m"
+_ANSI: Dict[str, str] = {
+    "INFO":  "\033[33m",   # yellow
+    "OK":    "\033[97m",   # bright white
+    "WARN":  "\033[91m",   # light red
+    "ERROR": "\033[91m",   # light red
+}
+
+
+def _tag(label: str, *, stream=None) -> str:
+    """Return a coloured [LABEL] tag.  Falls back to plain text on non-TTY."""
+    tty = (stream or sys.stdout).isatty()
+    code = _ANSI.get(label.upper(), "")
+    if code and tty:
+        return f"{code}[{label}]{_ANSI_RESET}"
+    return f"[{label}]"
+
+
+def _info(msg: str) -> None:
+    _qprint(f"{_tag('INFO')} {msg}")
+
+
+def _ok(msg: str) -> None:
+    _qprint(f"{_tag('OK')} {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"{_tag('WARN')} {msg}")
+
+
+def _err(msg: str) -> None:
+    print(f"{_tag('ERROR', stream=sys.stderr)} {msg}", file=sys.stderr)
 
 
 # ---------- Config ----------
 
 def load_config(path: Path = CONFIG_PATH) -> Dict:
-    """Load a config JSON file if present. Defaults to ~/.config/rednb-verify/config.json."""
+    """Load a config JSON file if present.  Empty files are silently ignored."""
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                return {}
+            return json.loads(text)
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[WARN] Could not load config {path}: {exc}", file=sys.stderr)
+            print(f"{_tag('WARN', stream=sys.stderr)} Could not load config {path}: {exc}",
+                  file=sys.stderr)
     return {}
 
 
@@ -545,7 +586,7 @@ def collect_files_per_day(
         try:
             content = yaml.safe_load(month_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            _qprint(f"[WARN] Could not parse {month_path.name}: {exc}")
+            _warn(f"Could not parse {month_path.name}: {exc}")
             continue
         if not isinstance(content, dict):
             continue
@@ -692,8 +733,68 @@ def verify_manifest(
     return results
 
 
+def _write_text_manifest(manifest: Dict) -> str:
+    """Serialise a manifest dict to human-readable text format."""
+    algo = manifest.get("hash_algorithm", "sha256")
+    lines = [
+        "rednb-verify manifest",
+        f"version: {manifest.get('version', VERSION)}",
+        f"created: {manifest['created']}",
+        f"date: {manifest['date']}",
+        f"hash_algorithm: {algo}",
+        f"merkle_hash: {manifest.get('merkle_hash', algo)}",
+        f"mode: {manifest.get('mode', 'full-tree')}",
+        f"merkle_root: {manifest.get('merkle_root', '')}",
+    ]
+    if manifest.get("exclude"):
+        lines.append(f"exclude: {', '.join(manifest['exclude'])}")
+    lines += ["", "files:"]
+    for i, entry in enumerate(manifest["files"], 1):
+        lines.append(f"  {i:>5}. {entry['path']}")
+        lines.append(f"         {algo}: {entry[algo]}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_text_manifest(text: str) -> Dict:
+    """Parse a text-format manifest back to a dict (same shape as JSON manifest)."""
+    import re as _re
+    manifest: Dict = {"files": []}
+    in_files = False
+    current_path: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("rednb-verify manifest"):
+            continue
+        if stripped == "files:":
+            in_files = True
+            continue
+        if not in_files:
+            if ": " in stripped:
+                key, _, val = stripped.partition(": ")
+                manifest[key.strip()] = val.strip()
+        else:
+            m = _re.match(r"\d+\.\s+(.+)", stripped)
+            if m:
+                current_path = m.group(1).strip()
+            elif ": " in stripped and current_path is not None:
+                algo, _, h = stripped.partition(": ")
+                manifest["files"].append({"path": current_path, algo.strip(): h.strip()})
+    # exclude is stored as comma-separated string — convert to list
+    if "exclude" in manifest and isinstance(manifest["exclude"], str):
+        manifest["exclude"] = [e.strip() for e in manifest["exclude"].split(",") if e.strip()]
+    return manifest
+
+
+def _load_manifest(path: Path) -> Dict:
+    """Load a manifest file; auto-detects JSON or text format by extension."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        return json.loads(text)
+    return _parse_text_manifest(text)
+
+
 def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path: Path) -> None:
-    """Write JSON if path ends in .json, otherwise human-readable text."""
+    """Write JSON if path ends in .json, otherwise human-readable text with numbered lists."""
     if report_path.suffix.lower() == ".json":
         report_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
         return
@@ -709,7 +810,8 @@ def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path
     ]
     for label, key in [("OK", "ok"), ("NEW", "new"), ("MISSING", "missing"), ("MODIFIED", "modified")]:
         if results[key]:
-            lines += ["", f"--- {label} ---"] + [f"  {f}" for f in sorted(results[key])]
+            numbered = [f"  {i:>5}. {f}" for i, f in enumerate(sorted(results[key]), 1)]
+            lines += ["", f"--- {label} ---"] + numbered
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -762,7 +864,7 @@ How would you like to sign this manifest?
         return 4
     if choice in ("1", "2", "3"):
         return int(choice)
-    print("[WARN] Invalid selection — skipping signing.")
+    _warn("Invalid selection — skipping signing.")
     return 4
 
 
@@ -773,7 +875,7 @@ def _sign_with_gpg(
 ) -> None:
     """Sign with GPG. key_file uses armored export; key_fpr pre-selects keyring key."""
     if not gpg_available():
-        print("[WARN] GPG not available — GPG signing skipped.")
+        _warn("GPG not available — GPG signing skipped.")
         return
 
     # --- Key file path (temp homedir, no keyring pollution) ---
@@ -781,54 +883,52 @@ def _sign_with_gpg(
         if not _quiet:
             print(NON_REPUDIATION_WARNING)
             if input("Sign with GPG key file? [y/N]: ").strip().lower() != "y":
-                _qprint("[INFO] GPG signing cancelled.")
+                _info("GPG signing cancelled.")
                 return
         if _gpg_sign_with_keyfile(manifest_path, key_file):
-            _qprint("[OK] Manifest signed with GPG.")
+            _ok("Manifest signed with GPG.")
         else:
-            print("[WARN] GPG signing failed.")
+            _warn("GPG signing failed.")
         return
 
     # --- Keyring path ---
     try:
         keys = list_secret_keys()
     except subprocess.CalledProcessError:
-        print("[WARN] Could not list GPG keys.")
+        _warn("Could not list GPG keys.")
         return
     if not keys:
-        print("[WARN] No GPG secret keys found — GPG signing skipped.")
+        _warn("No GPG secret keys found — GPG signing skipped.")
         return
 
     if key_fpr:
-        # Pre-selected fingerprint — still ask unless quiet
         fpr = key_fpr
         if not _quiet:
             print(NON_REPUDIATION_WARNING)
             if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-                _qprint("[INFO] GPG signing cancelled.")
+                _info("GPG signing cancelled.")
                 return
     elif _quiet:
-        # Non-interactive: require exactly one key
         if len(keys) == 1:
             fpr = keys[0]["fingerprint"]
         else:
-            print("[ERROR] --quiet with --gpg requires a fingerprint when multiple keys exist.")
-            print(f"        Use: --gpg {keys[0]['fingerprint']}")
+            _err("--quiet with --gpg requires a fingerprint when multiple keys exist.")
+            _err(f"        Use: --gpg {keys[0]['fingerprint']}")
             sys.exit(2)
     else:
         print(NON_REPUDIATION_WARNING)
         if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-            _qprint("[INFO] GPG signing cancelled.")
+            _info("GPG signing cancelled.")
             return
         fpr = choose_gpg_key(keys)
         if fpr is None:
-            _qprint("[INFO] GPG signing cancelled.")
+            _info("GPG signing cancelled.")
             return
 
     if gpg_detach_sign(manifest_path, fpr):
-        _qprint("[OK] Manifest signed with GPG.")
+        _ok("Manifest signed with GPG.")
     else:
-        print("[WARN] GPG signing failed.")
+        _warn("GPG signing failed.")
 
 
 def _sign_with_ssh(
@@ -840,21 +940,21 @@ def _sign_with_ssh(
 ) -> None:
     """Sign manifest with SSH."""
     if not ssh_keygen_available():
-        print("[WARN] ssh-keygen not available — SSH signing skipped.")
+        _warn("ssh-keygen not available — SSH signing skipped.")
         return
     signer = select_ssh_key(ssh_kl_path, require_private=True, prefer_fido=prefer_fido, keyname=keyname)
     if signer is None or signer.priv_path is None:
-        print("[WARN] No suitable SSH key found for signing.")
+        _warn("No suitable SSH key found for signing.")
         return
     if not _quiet:
         print(SSH_NON_REPUDIATION_WARNING)
         if input("Sign this manifest with SSH? [y/N]: ").strip().lower() != "y":
-            _qprint("[INFO] SSH signing cancelled.")
+            _info("SSH signing cancelled.")
             return
     if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
-        _qprint(f"[OK] SSH signature created: {sig_path.name}")
+        _ok(f"SSH signature created: {sig_path.name}")
     else:
-        print("[WARN] SSH signing failed.")
+        _warn("SSH signing failed.")
 
 
 def main():
@@ -956,13 +1056,17 @@ supported hash algorithms:
                         help="Hash only YYYY-MM.txt files")
     parser.add_argument("-o", "--output", type=Path,
                         help="Output directory (default: parent of journal directory)")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify an existing manifest")
-    parser.add_argument("--manifest", type=Path,
-                        help="Manifest file to verify")
+    parser.add_argument("--verify", nargs="?", const="__auto__", default=None,
+                        metavar="MANIFEST_OR_DIR",
+                        help="Verify mode: path to a manifest file, or directory to search "
+                             "for the latest manifest. Without argument, searches the output "
+                             "directory (journal parent by default).")
+    parser.add_argument("--manifest", nargs="?", const="txt", default="txt",
+                        metavar="txt|json",
+                        help="Manifest creation format: txt (default) or json")
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
-                        help="Report format during --verify: txt (default) or json")
+                        help="Verification report format: txt (default) or json")
     parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO",
                         help="Hash algorithm for files (default: sha256)")
     parser.add_argument("--hash-list", action="store_true",
@@ -1036,16 +1140,19 @@ supported hash algorithms:
     _verbose = args.verbose
 
     if args.quiet and args.verbose:
-        print("[ERROR] --quiet and --verbose are mutually exclusive.")
+        _err("--quiet and --verbose are mutually exclusive.")
         sys.exit(2)
 
     # Notify user that a config file is in effect
     if _config_active:
-        _qprint(f"[INFO] Using config: {_config_path}")
+        _info(f"Using config: {_config_path}")
 
-    # Validate --report format
+    # Validate format flags
     if args.report not in ("txt", "json"):
-        print(f"[ERROR] --report must be 'txt' or 'json', got: {args.report!r}")
+        _err(f"--report must be 'txt' or 'json', got: {args.report!r}")
+        sys.exit(2)
+    if args.manifest not in ("txt", "json"):
+        _err(f"--manifest must be 'txt' or 'json', got: {args.manifest!r}")
         sys.exit(2)
 
     # --hash-list: print available algorithms and exit (no notebook_dir needed)
@@ -1055,7 +1162,7 @@ supported hash algorithms:
             print(f"  {algo}")
         sys.exit(0)
 
-    # notebook_dir required for all modes except --resign
+    # notebook_dir required except for --resign and --hash-list
     if args.notebook_dir is None and not args.resign:
         parser.error("notebook_dir is required")
 
@@ -1084,7 +1191,7 @@ supported hash algorithms:
         try:
             hashlib.new(algo)
         except ValueError:
-            print(f"[ERROR] Unsupported algorithm for {label}: {algo}")
+            _err(f"Unsupported algorithm for {label}: {algo}")
             sys.exit(2)
 
     # Parse --sig
@@ -1101,17 +1208,17 @@ supported hash algorithms:
     if args.exclude_from:
         excf = Path(os.path.expanduser(str(args.exclude_from)))
         if not excf.exists():
-            print(f"[ERROR] --exclude-from file not found: {excf}")
+            _err(f"--exclude-from file not found: {excf}")
             sys.exit(2)
         for raw_line in excf.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if line and not line.startswith("#"):
                 exclude.append(line)
-        _vprint(f"[INFO] Loaded exclusion patterns from {excf.name}")
+        _vprint(f"{_tag('INFO')} Loaded exclusion patterns from {excf.name}")
 
     # --jobs validation
     if args.jobs < 0:
-        print("[ERROR] --jobs must be 0 (auto) or a positive integer.")
+        _err("--jobs must be 0 (auto) or a positive integer.")
         sys.exit(2)
     jobs: int = args.jobs
 
@@ -1131,18 +1238,18 @@ supported hash algorithms:
     if args.resign:
         manifest_path = args.resign.resolve()
         if not manifest_path.exists():
-            print(f"[ERROR] Manifest not found: {manifest_path}")
+            _err(f"Manifest not found: {manifest_path}")
             sys.exit(2)
         try:
-            json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"[ERROR] Could not read manifest: {exc}")
+            _load_manifest(manifest_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _err(f"Could not read manifest: {exc}")
             sys.exit(2)
         if not want_gpg and not want_ssh:
-            print("[ERROR] --resign requires a signing method: --gpg and/or --ssh-sign")
+            _err("--resign requires a signing method: --gpg and/or --ssh-sign")
             sys.exit(2)
         ssh_sig_out = next(
-            (p for p in sig_paths if p.suffix == ".sshsig"),
+            (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
             manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
         )
         _qprint(f"Re-signing: {manifest_path.name}")
@@ -1155,12 +1262,33 @@ supported hash algorithms:
     # ------------------------------------------------------------------ #
     #  Verify mode                                                         #
     # ------------------------------------------------------------------ #
-    if args.verify:
-        if not args.manifest:
-            print("[ERROR] --verify requires --manifest")
-            sys.exit(2)
+    if args.verify is not None:
+        # Resolve manifest path from --verify argument or auto-search
+        verify_arg = args.verify
+        if verify_arg == "__auto__":
+            verify_arg = str(out_dir)
 
-        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        target = Path(verify_arg)
+        if target.is_dir():
+            candidates = sorted(
+                list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
+            )
+            if not candidates:
+                _err(f"No manifest found in {target}")
+                sys.exit(2)
+            manifest_path = candidates[-1]
+            _info(f"Using latest manifest: {manifest_path.name}")
+        else:
+            manifest_path = target.resolve()
+            if not manifest_path.exists():
+                _err(f"Manifest not found: {manifest_path}")
+                sys.exit(2)
+
+        try:
+            manifest = _load_manifest(manifest_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _err(f"Could not read manifest: {exc}")
+            sys.exit(2)
 
         # Manifest age warning
         if args.warn_age is not None:
@@ -1170,8 +1298,8 @@ supported hash algorithms:
                 ).replace(tzinfo=timezone.utc)
                 age_days = (datetime.now(timezone.utc) - created).days
                 if age_days > args.warn_age:
-                    print(
-                        f"[WARN] Manifest is {age_days} days old — consider refreshing "
+                    _warn(
+                        f"Manifest is {age_days} days old — consider refreshing "
                         f"(threshold: {args.warn_age} days)."
                     )
             except (KeyError, ValueError):
@@ -1180,66 +1308,72 @@ supported hash algorithms:
         results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
-        write_report(results, report_path, args.manifest)
+        write_report(results, report_path, manifest_path)
         _qprint(f"Verification report: {report_path}")
 
         # Resolve signature files
+        _SSH_EXTS = (".sshsig", ".sig")
         if sig_paths:
             gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
-            ssh_sigs = [p for p in sig_paths if p.suffix == ".sshsig"]
+            ssh_sigs = [p for p in sig_paths if p.suffix in _SSH_EXTS]
             for p in sig_paths:
-                if p.suffix not in (".asc", ".sshsig"):
-                    print(f"[WARN] Unknown signature type '{p.name}' — skipped (expected .asc or .sshsig).")
+                if p.suffix not in (".asc",) + _SSH_EXTS:
+                    _warn(f"Unknown signature type '{p.name}' — skipped (expected .asc or .sshsig).")
         else:
-            auto_asc = args.manifest.with_suffix(args.manifest.suffix + ".asc")
+            auto_asc = manifest_path.with_suffix(manifest_path.suffix + ".asc")
             gpg_sigs = [auto_asc] if auto_asc.exists() else []
-            auto_ssh = args.manifest.with_suffix(args.manifest.suffix + ".sshsig")
-            ssh_sigs = [auto_ssh] if (auto_ssh.exists() or args.ssh_verify) else []
+            auto_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
+            auto_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
+            ssh_sigs = [p for p in (auto_ssh, auto_sig) if p.exists()]
+            if args.ssh_verify and not ssh_sigs:
+                ssh_sigs = [auto_ssh]  # will report missing below
 
         # GPG verification
         if not gpg_sigs:
-            _qprint("[WARN] Manifest not GPG-signed.")
+            _warn("Manifest not GPG-signed.")
         else:
             for gpg_sig in gpg_sigs:
                 if not gpg_sig.exists():
-                    print(f"[WARN] GPG signature not found: {gpg_sig.name}")
+                    _warn(f"GPG signature not found: {gpg_sig.name}")
                 elif not gpg_available():
-                    print("[WARN] GPG not available — GPG verification skipped.")
+                    _warn("GPG not available — GPG verification skipped.")
                 else:
-                    if gpg_verify(args.manifest, gpg_sig):
-                        _qprint(f"[OK] GPG signature verified: {gpg_sig.name}")
+                    if gpg_verify(manifest_path, gpg_sig):
+                        _ok(f"GPG signature verified: {gpg_sig.name}")
                     else:
-                        print(f"[WARN] GPG signature invalid: {gpg_sig.name}")
+                        _warn(f"GPG signature invalid: {gpg_sig.name}")
 
         # SSH verification
         for ssh_sig in ssh_sigs:
             if not ssh_keygen_available():
-                print("[WARN] ssh-keygen not available — SSH verification skipped.")
+                _warn("ssh-keygen not available — SSH verification skipped.")
                 break
             if not ssh_sig.exists():
-                print(f"[WARN] SSH signature not found: {ssh_sig.name}")
+                _warn(f"SSH signature not found: {ssh_sig.name}")
                 continue
             signer = select_ssh_key(ssh_kl_path, require_private=False,
                                     prefer_fido=prefer_fido, keyname=keyname)
             if signer is None:
-                print("[WARN] No suitable SSH key found for verification.")
+                _warn("No suitable SSH key found for verification.")
                 continue
+            canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
             result = ssh_verify_manifest(
-                args.manifest, ssh_sig, signer.pub_path,
+                manifest_path, ssh_sig, signer.pub_path,
                 multiple_signatures=len(ssh_sigs) > 1,
-                nonstandard_sig=ssh_sig != args.manifest.with_suffix(
-                    args.manifest.suffix + ".sshsig"),
+                nonstandard_sig=ssh_sig != canonical_ssh,
             )
-            label = "[OK]" if result.status == "OK" else f"[{result.status}]"
-            _qprint(f"{label} {result.message}")
+            if result.status == "OK":
+                _ok(result.message)
+            else:
+                _qprint(f"{_tag(result.status)} {result.message}")
             for w in result.warnings:
-                print(f"[WARN] {w}")
+                _warn(w)
 
         if any(k != "ok" and results[k] for k in results):
             _qprint("Verification completed with issues.")
             sys.exit(1)
 
-        _qprint("[OK] Verification successful.")
+        _ok("Verification successful.")
         return
 
     # ------------------------------------------------------------------ #
@@ -1261,22 +1395,27 @@ supported hash algorithms:
         per_day=args.per_day,
         jobs=jobs,
     )
-    manifest_name = f"hashes-{manifest['created']}.json"
+    manifest_fmt = args.manifest  # "txt" or "json"
+    ext = ".json" if manifest_fmt == "json" else ".txt"
+    manifest_name = f"hashes-{manifest['created']}{ext}"
     manifest_path = out_dir / manifest_name
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    if manifest_fmt == "json":
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    else:
+        manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
     _qprint(f"Manifest created: {manifest_path}")
 
     # SSH sig output path: from --sig if a .sshsig path given, else default
     ssh_sig_out = next(
-        (p for p in sig_paths if p.suffix == ".sshsig"),
+        (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
         manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
     )
 
     # ---- Signing ----
     if args.no_sign:
-        _qprint("[INFO] Signing skipped (--no-sign).")
+        _info("Signing skipped (--no-sign).")
 
     elif want_gpg and want_ssh:
         _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
