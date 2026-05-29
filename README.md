@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.6.0 | **Python:** 3.10+ | **Dependencies:** none (stdlib only; `pyyaml` required for `--per-day`)
+**Version:** 0.6.1 | **Python:** 3.10+ | **Dependencies:** none (stdlib only; `pyyaml` required for `--per-day`)
 
 ---
 
@@ -49,7 +49,7 @@ rednb-verify.py [options] notebook_dir
 |---|---|
 | `notebook_dir` | Path to the RedNotebook journal directory |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
-| `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD` (requires `pyyaml`) |
+| `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combines with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
 | `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
 | `--verify` | Verify mode — compare notebook against a manifest |
@@ -108,8 +108,11 @@ python rednb-verify.py ~/journal --exclude "*.tmp" --exclude ".~lock.*"
 # Exclude patterns from a file (like .gitignore)
 python rednb-verify.py ~/journal --exclude-from ~/journal-excludes.txt
 
-# Per-day hashing — each day entry gets its own hash (requires PyYAML)
+# Per-day hashing, full-tree (day entries + attachments)
 python rednb-verify.py ~/journal --per-day --no-sign
+
+# Per-day hashing, month-only (day entries only, no attachments)
+python rednb-verify.py ~/journal --per-day --month-only --no-sign
 
 # Parallel hashing with auto worker count
 python rednb-verify.py ~/journal --jobs 0 --no-sign
@@ -215,9 +218,22 @@ When `--sig` is omitted, both signature types are still auto-detected from the m
 
 ---
 
-## Per-Day Hashing
+## Modes
 
-`--per-day` (`-D`) provides finer-grained tamper detection by hashing each journal day individually rather than whole month files. The manifest then contains one entry per day entry in the format `YYYY-MM/DD`:
+The combination of `--per-day` and `--month-only` controls what gets hashed and at what granularity:
+
+| Flags | Mode | What is hashed |
+|---|---|---|
+| _(neither)_ | `full-tree` | Every file as a whole |
+| `--month-only` | `month-only` | Whole `YYYY-MM.txt` files only |
+| `--per-day` | `per-day/full-tree` | Individual day entries **+** all non-month files |
+| `--per-day --month-only` | `per-day/month-only` | Individual day entries only |
+
+`per-day/full-tree` gives the most complete coverage: day-level granularity within journal entries and whole-file hashes for attachments and other assets.
+
+### Per-Day Detail
+
+`--per-day` provides finer-grained tamper detection by hashing each journal day individually. The manifest contains one entry per day in the format `YYYY-MM/DD`:
 
 ```json
 {
@@ -226,9 +242,9 @@ When `--sig` is omitted, both signature types are still auto-detected from the m
 }
 ```
 
-RedNotebook month files are YAML. Each day is parsed with **PyYAML** (`pip install pyyaml`) and its full content (text field plus any custom categories) is canonicalised to JSON before hashing, so any edit — even to a tag or category — is detected.
+RedNotebook month files are YAML. Each day is parsed with **PyYAML** (`pip install pyyaml`) and its full content — text, tags, and all custom categories — is canonicalised to sorted JSON before hashing, so any edit to any field is detected.
 
-`--per-day` and `--month-only` are mutually exclusive. Verification automatically detects the manifest mode and uses the same hashing strategy.
+Verification automatically reads the `mode` field from the manifest and uses the matching strategy. Backward-compatible with manifests created by earlier versions.
 
 ---
 

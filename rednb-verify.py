@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.6.0
+Version: 0.6.1
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -604,12 +604,32 @@ def generate_manifest(
     per_day: bool = False,
     jobs: int = 1,
 ) -> Dict:
-    if per_day:
+    if per_day and not month_only:
+        # per-day/full-tree: individual day entries + all non-month files.
+        # Pass the YYYY-MM.txt glob to collect_files so month files are
+        # never hashed twice and don't appear in verbose output.
+        _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
+        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        other_files = collect_files(
+            notebook, False, algo,
+            exclude=list(exclude) + [_MONTH_GLOB],
+            jobs=jobs,
+        )
+        files = dict(sorted({**day_files, **other_files}.items()))
+        mode = "per-day/full-tree"
+    elif per_day and month_only:
+        # per-day/month-only: individual day entries, no attachments
         files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
-        mode = "per-day"
+        mode = "per-day/month-only"
+    elif month_only:
+        # month-only: whole YYYY-MM.txt files, no attachments
+        files = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
+        mode = "month-only"
     else:
-        files = collect_files(notebook, month_only, algo, exclude=exclude, jobs=jobs)
-        mode = "month-files" if month_only else "full-tree"
+        # full-tree: every file as-is
+        files = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
+        mode = "full-tree"
+
     hashes = list(files.values())
     manifest: Dict = {
         "tool": "rednb-verify",
@@ -642,10 +662,23 @@ def verify_manifest(
     if extra_exclude:
         exclude.extend(extra_exclude)
     mode = manifest.get("mode", "full-tree")
-    if mode == "per-day":
+    _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
+    if mode == "per-day/full-tree":
+        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        other_files = collect_files(
+            notebook, False, algo,
+            exclude=list(exclude) + [_MONTH_GLOB],
+            jobs=jobs,
+        )
+        actual = dict(sorted({**day_files, **other_files}.items()))
+    elif mode in ("per-day", "per-day/month-only"):
+        # "per-day" kept for backward compatibility with v0.6.0 manifests
         actual = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+    elif mode in ("month-files", "month-only"):
+        # "month-files" kept for backward compatibility with pre-v0.6.0 manifests
+        actual = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
     else:
-        actual = collect_files(notebook, mode == "month-files", algo, exclude=exclude, jobs=jobs)
+        actual = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
     for path, h in expected.items():
         if path not in actual:
             results["missing"].append(path)
@@ -1212,11 +1245,16 @@ supported hash algorithms:
     # ------------------------------------------------------------------ #
     #  Create mode                                                         #
     # ------------------------------------------------------------------ #
-    if args.per_day and args.month_only:
-        print("[ERROR] --per-day and --month-only are mutually exclusive.")
-        sys.exit(2)
-
-    _vprint(f"Hashing: {args.notebook_dir}")
+    # Determine and display mode when verbose
+    if args.per_day and not args.month_only:
+        _mode_label = "per-day/full-tree"
+    elif args.per_day and args.month_only:
+        _mode_label = "per-day/month-only"
+    elif args.month_only:
+        _mode_label = "month-only"
+    else:
+        _mode_label = "full-tree"
+    _vprint(f"Hashing ({_mode_label}): {args.notebook_dir}")
     manifest = generate_manifest(
         args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo,
         exclude=exclude,
