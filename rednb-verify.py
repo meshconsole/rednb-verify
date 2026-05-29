@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.7.0
+Version: 0.7.1
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -20,13 +20,12 @@ rednb-verify.py [options] [notebook_directory]
 "--hash-merkle"            : Hash algorithm for Merkle tree (default: same as --hash)
 "--gpg [FINGERPRINT]"      : Sign with GPG; optional fingerprint pre-selects key (skips menu)
 "--gpg-k FILE"             : GPG armored key file; implies --gpg
-"--ssh-sign"               : Sign with SSH key (skips menu)
+"--ssh [FILE_OR_DIR]"      : Sign with SSH key; optional .pub file or directory to scan (default: ~/.ssh)
 "--ssh-verify"             : Force SSH signature check during --verify
-"--sig FILE[,FILE]"        : Signature file(s) comma-separated (.asc=GPG, .sshsig=SSH)
-"--ssh-kl FILE|DIR"        : SSH .pub key file (used directly) or directory to scan; implies --ssh-sign
+"--sig FILE[,FILE]"        : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
 "--ssh-fido [NAME]"        : Prefer FIDO2/hardware-backed SSH keys; optional name filter
 "--no-sign"                : Skip all signing
-"--resign MANIFEST"        : Re-sign an existing manifest (requires --gpg and/or --ssh-sign)
+"--resign MANIFEST"        : Re-sign an existing manifest (requires --gpg and/or --ssh)
 "--warn-age DAYS"          : Warn during verify if manifest is older than N days
 "--verbose / -v"           : Print per-file hash timing and detailed progress
 "--quiet"                  : Suppress non-error output; implies --no-sign unless signing is explicit
@@ -58,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -415,16 +414,16 @@ def select_ssh_key(
         try:
             line = ssh_kl.read_text(encoding="utf-8").splitlines()[0]
         except (OSError, IndexError):
-            print(f"[WARN] Could not read public key: {ssh_kl}")
+            _warn(f"Could not read public key: {ssh_kl}")
             return None
         parsed = _parse_pubkey_line(line)
         if not parsed:
-            print(f"[WARN] Could not parse public key: {ssh_kl}")
+            _warn(f"Could not parse public key: {ssh_kl}")
             return None
         key_type, comment = parsed
         priv_path = ssh_kl.with_suffix("")
         if require_private and not priv_path.exists():
-            print(f"[WARN] Private key not found alongside {ssh_kl.name}")
+            _warn(f"Private key not found alongside {ssh_kl.name}")
             return None
         return SshKeyCandidate(
             pub_path=ssh_kl,
@@ -1007,19 +1006,19 @@ examples:
   # Sign with GPG key file
   rednb-verify.py ~/journal --gpg-k ~/backup-key.asc
 
-  # Sign with SSH (skips menu)
-  rednb-verify.py ~/journal --ssh-sign
+  # Sign with SSH (scans ~/.ssh)
+  rednb-verify.py ~/journal --ssh
 
-  # Sign with both GPG and SSH (no menu)
-  rednb-verify.py ~/journal --gpg --ssh-sign
+  # Sign with SSH using a specific key file
+  rednb-verify.py ~/journal --ssh ~/.ssh/id_ed25519.pub
+
+  # Sign with both GPG and SSH
+  rednb-verify.py ~/journal --gpg --ssh
 
   # Re-sign an existing manifest
   rednb-verify.py --resign hashes-....json --gpg
-  rednb-verify.py --resign hashes-....json --ssh-sign
-  rednb-verify.py --resign hashes-....json --gpg --ssh-sign
-
-  # Use specific SSH public key file (implies --ssh-sign)
-  rednb-verify.py ~/journal --ssh-kl ~/.ssh/id_ed25519.pub
+  rednb-verify.py --resign hashes-....json --ssh
+  rednb-verify.py --resign hashes-....json --gpg --ssh
 
   # Show available hash algorithms
   rednb-verify.py . --hash-list
@@ -1077,20 +1076,19 @@ supported hash algorithms:
                         help="Sign with GPG; optionally specify key fingerprint (skips menu)")
     parser.add_argument("--gpg-k", type=Path, default=None, metavar="FILE",
                         help="GPG armored key file to sign with; implies --gpg")
-    parser.add_argument("--ssh-sign", action="store_true",
-                        help="Sign with SSH key (skips menu)")
+    parser.add_argument("--ssh", nargs="?", const="", default=None, metavar="FILE_OR_DIR",
+                        help="Sign with SSH key; optionally specify a .pub file or directory "
+                             "to scan (default: ~/.ssh)")
     parser.add_argument("--ssh-verify", action="store_true",
                         help="Force SSH signature check during --verify")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
-                        help="Signature file(s), comma-separated (.asc=GPG, .sshsig=SSH)")
-    parser.add_argument("--ssh-kl", type=Path, default=None, metavar="FILE_OR_DIR",
-                        help="SSH .pub file (used directly) or directory to scan; implies --ssh-sign")
+                        help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
                         help="Prefer FIDO2 hardware keys; optional name filter")
     parser.add_argument("--no-sign", action="store_true",
                         help="Skip all signing")
     parser.add_argument("--resign", type=Path, default=None, metavar="MANIFEST",
-                        help="Re-sign an existing manifest (requires --gpg and/or --ssh-sign)")
+                        help="Re-sign an existing manifest (requires --gpg and/or --ssh)")
     parser.add_argument("--warn-age", type=int, default=None, dest="warn_age", metavar="DAYS",
                         help="Warn during --verify if manifest is older than N days")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1123,7 +1121,7 @@ supported hash algorithms:
     if config.get("gpg_key"):
         cfg["gpg"] = config["gpg_key"]
     if config.get("ssh_kl"):
-        cfg["ssh_kl"] = Path(os.path.expanduser(config["ssh_kl"]))
+        cfg["ssh"] = os.path.expanduser(config["ssh_kl"])
     if config.get("exclude"):
         cfg["exclude"] = list(config["exclude"])
     if config.get("manifest_age_warn_days"):
@@ -1170,18 +1168,14 @@ supported hash algorithms:
     if args.gpg_k is not None and args.gpg is None:
         args.gpg = ""
 
-    # --ssh-kl (explicit) implies --ssh-sign
-    if args.ssh_kl is not None and not args.ssh_sign:
-        args.ssh_sign = True
-
     # --quiet implies --no-sign unless an explicit signing method was given
-    if args.quiet and args.gpg is None and not args.ssh_sign:
+    if args.quiet and args.gpg is None and args.ssh is None:
         args.no_sign = True
 
-    # Resolve SSH key location (None → default ~/.ssh)
+    # Resolve SSH key location from --ssh argument (None → default ~/.ssh)
     ssh_kl_path = (
-        Path(os.path.expanduser(str(args.ssh_kl)))
-        if args.ssh_kl is not None
+        Path(os.path.expanduser(args.ssh))
+        if args.ssh        # non-empty string = user supplied a path
         else Path(os.path.expanduser("~/.ssh"))
     )
 
@@ -1230,7 +1224,7 @@ supported hash algorithms:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     want_gpg = args.gpg is not None
-    want_ssh = args.ssh_sign
+    want_ssh = args.ssh is not None
 
     # ------------------------------------------------------------------ #
     #  Resign mode                                                         #
@@ -1246,7 +1240,7 @@ supported hash algorithms:
             _err(f"Could not read manifest: {exc}")
             sys.exit(2)
         if not want_gpg and not want_ssh:
-            _err("--resign requires a signing method: --gpg and/or --ssh-sign")
+            _err("--resign requires a signing method: --gpg and/or --ssh")
             sys.exit(2)
         ssh_sig_out = next(
             (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
