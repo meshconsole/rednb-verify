@@ -1246,7 +1246,7 @@ supported hash algorithms:
             (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
             manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
         )
-        _qprint(f"Re-signing: {manifest_path.name}")
+        _ok(f"Re-signing: {manifest_path.name}")
         if want_gpg:
             _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
         if want_ssh:
@@ -1303,7 +1303,7 @@ supported hash algorithms:
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
         write_report(results, report_path, manifest_path)
-        _qprint(f"Verification report: {report_path}")
+        _ok(f"Verification report: {report_path}")
 
         # Resolve signature files
         _SSH_EXTS = (".sshsig", ".sig")
@@ -1364,7 +1364,7 @@ supported hash algorithms:
                 _warn(w)
 
         if any(k != "ok" and results[k] for k in results):
-            _qprint("Verification completed with issues.")
+            _warn("Verification completed with issues.")
             sys.exit(1)
 
         _ok("Verification successful.")
@@ -1399,7 +1399,7 @@ supported hash algorithms:
         )
     else:
         manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
-    _qprint(f"Manifest created: {manifest_path}")
+    _ok(f"Manifest created: {manifest_path}")
 
     # SSH sig output path: from --sig if a .sshsig path given, else default
     ssh_sig_out = next(
