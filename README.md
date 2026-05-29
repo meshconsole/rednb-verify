@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.5.5 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
+**Version:** 0.5.6 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
 
 ---
 
@@ -19,11 +19,17 @@ python rednb-verify.py ~/journal
 # Create a manifest without signing
 python rednb-verify.py ~/journal --no-sign
 
+# Create a manifest with per-file hash timing
+python rednb-verify.py ~/journal --no-sign --verbose
+
 # Verify the journal against a manifest
 python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json
 
-# Verify and write a JSON report
-python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json --report json
+# Verify and write a JSON report, warn if manifest is older than 90 days
+python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json --report json --warn-age 90
+
+# Re-sign an existing manifest with GPG
+python rednb-verify.py --resign hashes-20260528T120000Z.json --gpg
 ```
 
 ---
@@ -45,13 +51,23 @@ rednb-verify.py [options] notebook_dir
 | `--manifest FILE` | Manifest file to verify against (required with `--verify`) |
 | `--report [txt\|json]` | Report format during verify: `txt` human-readable (default) or `json` structured |
 | `--hash ALGO` | Hash algorithm for files (default: `sha256`) |
+| `--hash-list` | Print available hash algorithms and exit |
 | `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
+| `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
+| `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
 | `--ssh-sign` | Sign the manifest with an SSH key (skips signing menu) |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`=SSH |
 | `--ssh-kl FILE_OR_DIR` | SSH `.pub` key file (used directly) or directory to scan (default: `~/.ssh`) |
 | `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
 | `--no-sign` | Skip all signing prompts |
+| `--resign FILE` | Re-sign an existing manifest without re-hashing (requires `--gpg` and/or `--ssh-sign`) |
+| `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
+| `-v`, `--verbose` | Print per-file hash timing and detailed progress |
+| `--quiet` | Suppress all non-error output; implies `--no-sign` unless a signing flag is given |
+| `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
+| `--no-config`, `--no-cf` | Ignore `~/.config/rednb-verify/config.json` for this run |
+| `--config FILE` | Load a specific config file instead of the default |
 
 ### Examples
 
@@ -61,6 +77,9 @@ python rednb-verify.py ~/journal --month-only --output ~/journal
 
 # Create manifest and skip signing
 python rednb-verify.py ~/journal --no-sign
+
+# Show per-file hash timing
+python rednb-verify.py ~/journal --no-sign --verbose
 
 # Use blake2b for file hashes, sha256 for the Merkle tree
 python rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
@@ -77,12 +96,29 @@ python rednb-verify.py ~/journal --ssh-sign --ssh-fido
 # Use a specific SSH public key file directly (no directory scan)
 python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
 
+# Exclude editor lock files and temp files
+python rednb-verify.py ~/journal --exclude "*.tmp" --exclude ".~lock.*"
+
+# Non-interactive / cron use (suppress output, pre-select GPG key)
+python rednb-verify.py ~/journal --quiet --gpg ABCDEF1234567890
+
+# Re-sign an existing manifest without re-hashing the journal
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --gpg
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --ssh-sign
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --gpg --ssh-sign
+
 # Verify with both GPG and SSH signatures at the same time
 python rednb-verify.py ~/journal \
   --verify \
   --manifest ~/journal/hashes-20260528T120000Z.json \
   --sig ~/journal/hashes-20260528T120000Z.json.asc,~/journal/hashes-20260528T120000Z.json.sshsig \
   --report json
+
+# Verify and warn if manifest is older than 90 days
+python rednb-verify.py ~/journal \
+  --verify \
+  --manifest ~/journal/hashes-20260528T120000Z.json \
+  --warn-age 90
 ```
 
 ---
@@ -94,7 +130,7 @@ Manifests are human-readable JSON files named `hashes-<timestamp>.json`.
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.5.3",
+  "version": "0.5.6",
   "created": "20260528T120000Z",
   "date": "2026-05-28",
   "hash_algorithm": "sha256",
@@ -191,6 +227,37 @@ Exit code is `1` if any issues are found, `0` if all tracked files are clean.
 
 ---
 
+## Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All checks passed / manifest created successfully |
+| `1` | Verification found issues — modified, missing, or new files |
+| `2` | Usage or input error — bad arguments, missing files, unsupported algorithm |
+
+---
+
+## Config File
+
+`~/.config/rednb-verify/config.json` is loaded automatically as a default layer. CLI flags always override config values.
+
+```json
+{
+    "hash": "sha256",
+    "hash_merkle": null,
+    "quiet": false,
+    "no_sign": false,
+    "gpg_key": "FINGERPRINT",
+    "ssh_kl": "~/.ssh/id_ed25519.pub",
+    "exclude": ["*.tmp", ".~lock.*"],
+    "manifest_age_warn_days": 90
+}
+```
+
+A notification is printed when the config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file.
+
+---
+
 ## What This Tool Is Not
 
 - **Not encryption** — files remain readable; this tool proves whether they changed
@@ -269,6 +336,9 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 
 ## Planned
 
+- RFC 3161 trusted timestamping (cryptographic proof of time from a timestamp authority)
+- Manifest chaining (each manifest references the previous one, making history tamper-evident)
+- `--json` output mode (structured JSON on stdout for piping and scripting)
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
 - RedNotebook UI integration
 - Per-date and per-entry granularity within month files

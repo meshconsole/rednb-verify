@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.5.5
+Version: 0.5.6
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -9,7 +9,7 @@ Creates and verifies cryptographic manifests for notebook directories.
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
 "-m", "--month-only"    : Hashes only month files
-"-o", "--output"        : Output directory for manifest (default: cwd)
+"-o", "--output"        : Output directory for manifest (default: journal parent)
 "--verify"              : Verification mode
 "--manifest"            : Manifest file to verify against
 "--report txt|json"     : Report format during --verify (default: txt)
@@ -24,10 +24,18 @@ rednb-verify.py [options] [notebook_directory]
 "--ssh-kl FILE|DIR"     : SSH .pub key file (used directly) or directory to scan; implies --ssh-sign
 "--ssh-fido [NAME]"     : Prefer FIDO2/hardware-backed SSH keys; optional name filter
 "--no-sign"             : Skip all signing
+"--resign MANIFEST"     : Re-sign an existing manifest (requires --gpg and/or --ssh-sign)
+"--warn-age DAYS"       : Warn during verify if manifest is older than N days
+"--verbose / -v"        : Print per-file hash timing and detailed progress
 "--quiet"               : Suppress non-error output; implies --no-sign unless signing is explicit
 "--exclude PATTERN"     : Exclude files matching glob (repeatable)
 "--no-config / --no-cf" : Ignore ~/.config/rednb-verify/config.json for this run
 "--config FILE"         : Load a specific config file instead of the default
+
+Exit codes:
+  0  all checks passed / manifest created successfully
+  1  verification found issues (modified, missing, or unexpected files)
+  2  usage or input error (bad arguments, missing files, unsupported algorithm)
 """
 
 import argparse
@@ -39,22 +47,30 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
-# Set by main() before any output; suppresses _qprint calls
+# Set by main() before any output
 _quiet: bool = False
+_verbose: bool = False
 
 
 def _qprint(msg: str) -> None:
     """Print only when not in quiet mode."""
     if not _quiet:
+        print(msg)
+
+
+def _vprint(msg: str) -> None:
+    """Print only in verbose mode (quiet still suppresses it)."""
+    if _verbose and not _quiet:
         print(msg)
 
 
@@ -448,7 +464,13 @@ def collect_files(
                 continue
             if any(fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_str, pat) for pat in exclude):
                 continue
-            files[rel_str] = hash_file(path, algo)
+            if _verbose:
+                t0 = time.perf_counter()
+                files[rel_str] = hash_file(path, algo)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
+            else:
+                files[rel_str] = hash_file(path, algo)
     return dict(sorted(files.items()))
 
 
@@ -670,7 +692,7 @@ def _sign_with_ssh(
 
 
 def main():
-    global _quiet
+    global _quiet, _verbose
 
     # Pre-scan argv so --no-config/--no-cf and --config FILE take effect
     # before argparse runs (config must be loaded before set_defaults).
@@ -698,6 +720,9 @@ examples:
   # Skip signing
   rednb-verify.py ~/journal --no-sign
 
+  # Verbose: show per-file hash timing
+  rednb-verify.py ~/journal --no-sign --verbose
+
   # Sign with GPG (interactive key selection)
   rednb-verify.py ~/journal --gpg
 
@@ -712,6 +737,11 @@ examples:
 
   # Sign with both GPG and SSH (no menu)
   rednb-verify.py ~/journal --gpg --ssh-sign
+
+  # Re-sign an existing manifest
+  rednb-verify.py --resign hashes-....json --gpg
+  rednb-verify.py --resign hashes-....json --ssh-sign
+  rednb-verify.py --resign hashes-....json --gpg --ssh-sign
 
   # Use specific SSH public key file (implies --ssh-sign)
   rednb-verify.py ~/journal --ssh-kl ~/.ssh/id_ed25519.pub
@@ -728,23 +758,29 @@ examples:
   # Verify — human-readable report saved next to journal (default)
   rednb-verify.py ~/journal --verify --manifest hashes-....json
 
-  # Verify with JSON report
-  rednb-verify.py ~/journal --verify --manifest hashes-....json --report json
+  # Verify with JSON report and age warning
+  rednb-verify.py ~/journal --verify --manifest hashes-....json --report json --warn-age 90
 
   # Verify GPG + SSH signatures in one run
   rednb-verify.py ~/journal --verify --manifest hashes-....json \\
     --sig hashes-....json.asc,hashes-....json.sshsig
+
+exit codes:
+  0  all checks passed / manifest created successfully
+  1  verification found issues (modified, missing, or unexpected files)
+  2  usage or input error (bad arguments, missing files, unsupported algorithm)
 
 supported hash algorithms:
   sha256 (default), sha512, sha3_256, sha3_512, blake2b, blake2s ...
   use --hash-list to see all available algorithms
 """
     )
-    parser.add_argument("notebook_dir", type=Path)
+    parser.add_argument("notebook_dir", type=Path, nargs="?",
+                        help="Path to the RedNotebook journal directory")
     parser.add_argument("-m", "--month-only", action="store_true",
                         help="Hash only YYYY-MM.txt files")
     parser.add_argument("-o", "--output", type=Path,
-                        help="Output directory (default: cwd)")
+                        help="Output directory (default: parent of journal directory)")
     parser.add_argument("--verify", action="store_true",
                         help="Verify an existing manifest")
     parser.add_argument("--manifest", type=Path,
@@ -774,6 +810,12 @@ supported hash algorithms:
                         help="Prefer FIDO2 hardware keys; optional name filter")
     parser.add_argument("--no-sign", action="store_true",
                         help="Skip all signing")
+    parser.add_argument("--resign", type=Path, default=None, metavar="MANIFEST",
+                        help="Re-sign an existing manifest (requires --gpg and/or --ssh-sign)")
+    parser.add_argument("--warn-age", type=int, default=None, dest="warn_age", metavar="DAYS",
+                        help="Warn during --verify if manifest is older than N days")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print per-file hash timing and detailed progress")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress non-error output; implies --no-sign unless signing is explicit")
     parser.add_argument("--exclude", action="append", metavar="PATTERN",
@@ -799,13 +841,20 @@ supported hash algorithms:
         cfg["ssh_kl"] = Path(os.path.expanduser(config["ssh_kl"]))
     if config.get("exclude"):
         cfg["exclude"] = list(config["exclude"])
+    if config.get("manifest_age_warn_days"):
+        cfg["warn_age"] = int(config["manifest_age_warn_days"])
     if cfg:
         parser.set_defaults(**cfg)
 
     args = parser.parse_args()
 
-    # Activate quiet mode before any output
+    # Activate output modes before any printing
     _quiet = args.quiet
+    _verbose = args.verbose
+
+    if args.quiet and args.verbose:
+        print("[ERROR] --quiet and --verbose are mutually exclusive.")
+        sys.exit(2)
 
     # Notify user that a config file is in effect
     if _config_active:
@@ -815,6 +864,17 @@ supported hash algorithms:
     if args.report not in ("txt", "json"):
         print(f"[ERROR] --report must be 'txt' or 'json', got: {args.report!r}")
         sys.exit(2)
+
+    # --hash-list: print available algorithms and exit (no notebook_dir needed)
+    if args.hash_list:
+        print("Available hash algorithms:")
+        for algo in sorted(hashlib.algorithms_guaranteed):
+            print(f"  {algo}")
+        sys.exit(0)
+
+    # notebook_dir required for all modes except --resign
+    if args.notebook_dir is None and not args.resign:
+        parser.error("notebook_dir is required")
 
     # --gpg-k implies --gpg
     if args.gpg_k is not None and args.gpg is None:
@@ -835,13 +895,6 @@ supported hash algorithms:
         else Path(os.path.expanduser("~/.ssh"))
     )
 
-    # --hash-list: print available algorithms and exit
-    if args.hash_list:
-        print("Available hash algorithms:")
-        for algo in sorted(hashlib.algorithms_guaranteed):
-            print(f"  {algo}")
-        sys.exit(0)
-
     args.merkle_algo = args.merkle_algo or args.hash_algo
 
     for label, algo in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
@@ -861,10 +914,42 @@ supported hash algorithms:
     keyname = args.ssh_fido or None
     exclude: List[str] = args.exclude or []
 
-    # Default output: parent of the journal directory
-    notebook_path = args.notebook_dir.resolve()
-    out_dir = (args.output or notebook_path.parent).resolve()
+    # Resolve output directory
+    if args.resign:
+        out_dir = (args.output or args.resign.resolve().parent).resolve()
+    else:
+        out_dir = (args.output or args.notebook_dir.resolve().parent).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    want_gpg = args.gpg is not None
+    want_ssh = args.ssh_sign
+
+    # ------------------------------------------------------------------ #
+    #  Resign mode                                                         #
+    # ------------------------------------------------------------------ #
+    if args.resign:
+        manifest_path = args.resign.resolve()
+        if not manifest_path.exists():
+            print(f"[ERROR] Manifest not found: {manifest_path}")
+            sys.exit(2)
+        try:
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[ERROR] Could not read manifest: {exc}")
+            sys.exit(2)
+        if not want_gpg and not want_ssh:
+            print("[ERROR] --resign requires a signing method: --gpg and/or --ssh-sign")
+            sys.exit(2)
+        ssh_sig_out = next(
+            (p for p in sig_paths if p.suffix == ".sshsig"),
+            manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
+        )
+        _qprint(f"Re-signing: {manifest_path.name}")
+        if want_gpg:
+            _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
+        if want_ssh:
+            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+        return
 
     # ------------------------------------------------------------------ #
     #  Verify mode                                                         #
@@ -875,6 +960,22 @@ supported hash algorithms:
             sys.exit(2)
 
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+
+        # Manifest age warning
+        if args.warn_age is not None:
+            try:
+                created = datetime.strptime(
+                    manifest["created"], "%Y%m%dT%H%M%SZ"
+                ).replace(tzinfo=timezone.utc)
+                age_days = (datetime.now(timezone.utc) - created).days
+                if age_days > args.warn_age:
+                    print(
+                        f"[WARN] Manifest is {age_days} days old — consider refreshing "
+                        f"(threshold: {args.warn_age} days)."
+                    )
+            except (KeyError, ValueError):
+                pass
+
         results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude)
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
@@ -943,6 +1044,7 @@ supported hash algorithms:
     # ------------------------------------------------------------------ #
     #  Create mode                                                         #
     # ------------------------------------------------------------------ #
+    _vprint(f"Hashing: {args.notebook_dir}")
     manifest = generate_manifest(
         args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo,
         exclude=exclude,
@@ -961,9 +1063,6 @@ supported hash algorithms:
     )
 
     # ---- Signing ----
-    want_gpg = args.gpg is not None
-    want_ssh = args.ssh_sign
-
     if args.no_sign:
         _qprint("[INFO] Signing skipped (--no-sign).")
 

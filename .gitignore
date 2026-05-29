@@ -1,1 +1,4 @@
 .testing/
+manifest-*.json
+report-*.txt
+report-*.json
