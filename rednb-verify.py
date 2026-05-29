@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.5.6
+Version: 0.6.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
 
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
-"-m", "--month-only"    : Hashes only month files
-"-o", "--output"        : Output directory for manifest (default: journal parent)
-"--verify"              : Verification mode
-"--manifest"            : Manifest file to verify against
-"--report txt|json"     : Report format during --verify (default: txt)
-"--hash ALGO"           : Hash algorithm for files (default: sha256)
-"--hash-list"           : Print available hash algorithms and exit
-"--hash-merkle"         : Hash algorithm for Merkle tree (default: same as --hash)
-"--gpg [FINGERPRINT]"   : Sign with GPG; optional fingerprint pre-selects key (skips menu)
-"--gpg-k FILE"          : GPG armored key file; implies --gpg
-"--ssh-sign"            : Sign with SSH key (skips menu)
-"--ssh-verify"          : Force SSH signature check during --verify
-"--sig FILE[,FILE]"     : Signature file(s) comma-separated (.asc=GPG, .sshsig=SSH)
-"--ssh-kl FILE|DIR"     : SSH .pub key file (used directly) or directory to scan; implies --ssh-sign
-"--ssh-fido [NAME]"     : Prefer FIDO2/hardware-backed SSH keys; optional name filter
-"--no-sign"             : Skip all signing
-"--resign MANIFEST"     : Re-sign an existing manifest (requires --gpg and/or --ssh-sign)
-"--warn-age DAYS"       : Warn during verify if manifest is older than N days
-"--verbose / -v"        : Print per-file hash timing and detailed progress
-"--quiet"               : Suppress non-error output; implies --no-sign unless signing is explicit
-"--exclude PATTERN"     : Exclude files matching glob (repeatable)
-"--no-config / --no-cf" : Ignore ~/.config/rednb-verify/config.json for this run
-"--config FILE"         : Load a specific config file instead of the default
+"-m", "--month-only"       : Hashes only month files
+"-D", "--per-day"          : Hash individual day entries within month files (requires PyYAML)
+"-j", "--jobs N"           : Parallel hashing workers (0 = auto, default: 1)
+"-o", "--output"           : Output directory for manifest (default: journal parent)
+"--verify"                 : Verification mode
+"--manifest"               : Manifest file to verify against
+"--report txt|json"        : Report format during --verify (default: txt)
+"--hash ALGO"              : Hash algorithm for files (default: sha256)
+"--hash-list"              : Print available hash algorithms and exit
+"--hash-merkle"            : Hash algorithm for Merkle tree (default: same as --hash)
+"--gpg [FINGERPRINT]"      : Sign with GPG; optional fingerprint pre-selects key (skips menu)
+"--gpg-k FILE"             : GPG armored key file; implies --gpg
+"--ssh-sign"               : Sign with SSH key (skips menu)
+"--ssh-verify"             : Force SSH signature check during --verify
+"--sig FILE[,FILE]"        : Signature file(s) comma-separated (.asc=GPG, .sshsig=SSH)
+"--ssh-kl FILE|DIR"        : SSH .pub key file (used directly) or directory to scan; implies --ssh-sign
+"--ssh-fido [NAME]"        : Prefer FIDO2/hardware-backed SSH keys; optional name filter
+"--no-sign"                : Skip all signing
+"--resign MANIFEST"        : Re-sign an existing manifest (requires --gpg and/or --ssh-sign)
+"--warn-age DAYS"          : Warn during verify if manifest is older than N days
+"--verbose / -v"           : Print per-file hash timing and detailed progress
+"--quiet"                  : Suppress non-error output; implies --no-sign unless signing is explicit
+"--exclude PATTERN"        : Exclude files matching glob (repeatable)
+"--exclude-from FILE"      : File of glob patterns to exclude (one per line, # = comment)
+"--no-config / --no-cf"    : Ignore ~/.config/rednb-verify/config.json for this run
+"--config FILE"            : Load a specific config file instead of the default
 
 Exit codes:
   0  all checks passed / manifest created successfully
@@ -47,13 +50,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.5.6"
+VERSION = "0.6.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -72,6 +77,16 @@ def _vprint(msg: str) -> None:
     """Print only in verbose mode (quiet still suppresses it)."""
     if _verbose and not _quiet:
         print(msg)
+
+
+def _require_yaml():
+    """Import and return the yaml module, or exit with a clear install message."""
+    try:
+        import yaml  # type: ignore
+        return yaml
+    except ImportError:
+        print("[ERROR] --per-day requires PyYAML:  pip install pyyaml")
+        sys.exit(2)
 
 
 # ---------- Config ----------
@@ -452,9 +467,12 @@ def collect_files(
     month_only: bool,
     algo: str,
     exclude: Optional[List[str]] = None,
+    jobs: int = 1,
 ) -> Dict[str, str]:
-    files: Dict[str, str] = {}
     exclude = exclude or []
+
+    # Gather candidate paths first (always sequential — os.walk is not thread-safe)
+    paths_to_hash: List[tuple] = []
     for root, _, filenames in os.walk(base):
         for name in filenames:
             path = Path(root) / name
@@ -464,6 +482,13 @@ def collect_files(
                 continue
             if any(fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_str, pat) for pat in exclude):
                 continue
+            paths_to_hash.append((path, rel_str))
+
+    files: Dict[str, str] = {}
+
+    if jobs == 1:
+        # Sequential — original behavior
+        for path, rel_str in paths_to_hash:
             if _verbose:
                 t0 = time.perf_counter()
                 files[rel_str] = hash_file(path, algo)
@@ -471,6 +496,102 @@ def collect_files(
                 _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
             else:
                 files[rel_str] = hash_file(path, algo)
+    else:
+        # Parallel — print as each file completes when verbose
+        _lock = threading.Lock()
+
+        def _hash_one(path: Path, rel_str: str) -> tuple:
+            t0 = time.perf_counter()
+            h = hash_file(path, algo)
+            if _verbose:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                with _lock:
+                    _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
+            return rel_str, h
+
+        max_workers = jobs if jobs > 0 else None
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_hash_one, p, r): r for p, r in paths_to_hash}
+            for future in as_completed(futures):
+                rel_str, h = future.result()
+                files[rel_str] = h
+
+    return dict(sorted(files.items()))
+
+
+def collect_files_per_day(
+    base: Path,
+    algo: str,
+    exclude: Optional[List[str]] = None,
+    jobs: int = 1,
+) -> Dict[str, str]:
+    """Hash individual day entries within RedNotebook YYYY-MM.txt month files.
+
+    Each entry is identified by path ``YYYY-MM/DD`` (e.g. ``2026-05/14``).
+    Day content is serialised to canonical JSON before hashing so that all
+    fields (text, tags, custom categories) are captured.
+
+    Requires PyYAML (``pip install pyyaml``).
+    """
+    yaml = _require_yaml()
+    exclude = exclude or []
+
+    # Collect all (day_key, day_data) pairs from every month file
+    entries: List[tuple] = []
+    for month_path in sorted(base.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9].txt")):
+        rel_month = month_path.relative_to(base).as_posix()
+        if any(fnmatch.fnmatch(month_path.name, pat) or fnmatch.fnmatch(rel_month, pat) for pat in exclude):
+            continue
+        try:
+            content = yaml.safe_load(month_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _qprint(f"[WARN] Could not parse {month_path.name}: {exc}")
+            continue
+        if not isinstance(content, dict):
+            continue
+        year_month = month_path.stem  # e.g. "2026-05"
+        for day_num in sorted(content.keys()):
+            if not isinstance(day_num, int):
+                continue
+            day_key = f"{year_month}/{day_num:02d}"
+            entries.append((day_key, content[day_num]))
+
+    files: Dict[str, str] = {}
+
+    def _hash_day(day_key: str, day_data) -> tuple:
+        # Canonicalise: dicts → sorted JSON; plain strings kept as-is
+        if isinstance(day_data, dict):
+            canonical = json.dumps(day_data, ensure_ascii=False, sort_keys=True)
+        else:
+            canonical = str(day_data) if day_data is not None else ""
+        t0 = time.perf_counter()
+        h = hashlib.new(algo, canonical.encode("utf-8")).hexdigest()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return day_key, h, elapsed_ms
+
+    if jobs == 1:
+        for day_key, day_data in entries:
+            key, h, elapsed_ms = _hash_day(day_key, day_data)
+            files[key] = h
+            if _verbose:
+                _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
+    else:
+        _lock = threading.Lock()
+
+        def _hash_day_parallel(day_key: str, day_data) -> tuple:
+            key, h, elapsed_ms = _hash_day(day_key, day_data)
+            if _verbose:
+                with _lock:
+                    _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
+            return key, h
+
+        max_workers = jobs if jobs > 0 else None
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_hash_day_parallel, k, d): k for k, d in entries}
+            for future in as_completed(futures):
+                key, h = future.result()
+                files[key] = h
+
     return dict(sorted(files.items()))
 
 
@@ -480,8 +601,15 @@ def generate_manifest(
     algo: str,
     merkle_algo: str,
     exclude: Optional[List[str]] = None,
+    per_day: bool = False,
+    jobs: int = 1,
 ) -> Dict:
-    files = collect_files(notebook, month_only, algo, exclude=exclude)
+    if per_day:
+        files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        mode = "per-day"
+    else:
+        files = collect_files(notebook, month_only, algo, exclude=exclude, jobs=jobs)
+        mode = "month-files" if month_only else "full-tree"
     hashes = list(files.values())
     manifest: Dict = {
         "tool": "rednb-verify",
@@ -490,7 +618,7 @@ def generate_manifest(
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "hash_algorithm": algo,
         "merkle_hash": merkle_algo,
-        "mode": "month-files" if month_only else "full-tree",
+        "mode": mode,
         "files": [{"path": p, algo: h} for p, h in files.items()],
         "merkle_root": merkle_root(hashes, merkle_algo),
     }
@@ -505,6 +633,7 @@ def verify_manifest(
     manifest: Dict,
     notebook: Path,
     extra_exclude: Optional[List[str]] = None,
+    jobs: int = 1,
 ) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"ok": [], "missing": [], "modified": [], "new": []}
     algo = manifest.get("hash_algorithm", "sha256")
@@ -512,7 +641,11 @@ def verify_manifest(
     exclude = list(manifest.get("exclude", []))
     if extra_exclude:
         exclude.extend(extra_exclude)
-    actual = collect_files(notebook, manifest["mode"] == "month-files", algo, exclude=exclude)
+    mode = manifest.get("mode", "full-tree")
+    if mode == "per-day":
+        actual = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+    else:
+        actual = collect_files(notebook, mode == "month-files", algo, exclude=exclude, jobs=jobs)
     for path, h in expected.items():
         if path not in actual:
             results["missing"].append(path)
@@ -723,6 +856,15 @@ examples:
   # Verbose: show per-file hash timing
   rednb-verify.py ~/journal --no-sign --verbose
 
+  # Parallel hashing (4 workers)
+  rednb-verify.py ~/journal --no-sign --jobs 4
+
+  # Per-day hashing (requires PyYAML)
+  rednb-verify.py ~/journal --per-day --no-sign
+
+  # Exclude patterns from a file
+  rednb-verify.py ~/journal --exclude-from ~/my-excludes.txt --no-sign
+
   # Sign with GPG (interactive key selection)
   rednb-verify.py ~/journal --gpg
 
@@ -820,6 +962,12 @@ supported hash algorithms:
                         help="Suppress non-error output; implies --no-sign unless signing is explicit")
     parser.add_argument("--exclude", action="append", metavar="PATTERN",
                         help="Exclude files matching glob pattern (repeatable)")
+    parser.add_argument("--exclude-from", type=Path, default=None, metavar="FILE",
+                        help="File of glob patterns to exclude (one per line, # = comment)")
+    parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                        help="Parallel hashing workers (0 = auto, default: 1)")
+    parser.add_argument("-D", "--per-day", action="store_true",
+                        help="Hash individual day entries within month files (requires PyYAML)")
     parser.add_argument("--no-config", "--no-cf", action="store_true", dest="no_config",
                         help="Ignore ~/.config/rednb-verify/config.json for this run")
     parser.add_argument("--config", type=Path, metavar="FILE",
@@ -843,6 +991,8 @@ supported hash algorithms:
         cfg["exclude"] = list(config["exclude"])
     if config.get("manifest_age_warn_days"):
         cfg["warn_age"] = int(config["manifest_age_warn_days"])
+    if config.get("jobs") is not None:
+        cfg["jobs"] = int(config["jobs"])
     if cfg:
         parser.set_defaults(**cfg)
 
@@ -912,7 +1062,25 @@ supported hash algorithms:
 
     prefer_fido = args.ssh_fido is not None
     keyname = args.ssh_fido or None
-    exclude: List[str] = args.exclude or []
+    exclude: List[str] = list(args.exclude or [])
+
+    # --exclude-from: read patterns from file and merge into exclude list
+    if args.exclude_from:
+        excf = Path(os.path.expanduser(str(args.exclude_from)))
+        if not excf.exists():
+            print(f"[ERROR] --exclude-from file not found: {excf}")
+            sys.exit(2)
+        for raw_line in excf.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#"):
+                exclude.append(line)
+        _vprint(f"[INFO] Loaded exclusion patterns from {excf.name}")
+
+    # --jobs validation
+    if args.jobs < 0:
+        print("[ERROR] --jobs must be 0 (auto) or a positive integer.")
+        sys.exit(2)
+    jobs: int = args.jobs
 
     # Resolve output directory
     if args.resign:
@@ -976,7 +1144,7 @@ supported hash algorithms:
             except (KeyError, ValueError):
                 pass
 
-        results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude)
+        results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
         write_report(results, report_path, args.manifest)
@@ -1044,10 +1212,16 @@ supported hash algorithms:
     # ------------------------------------------------------------------ #
     #  Create mode                                                         #
     # ------------------------------------------------------------------ #
+    if args.per_day and args.month_only:
+        print("[ERROR] --per-day and --month-only are mutually exclusive.")
+        sys.exit(2)
+
     _vprint(f"Hashing: {args.notebook_dir}")
     manifest = generate_manifest(
         args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo,
         exclude=exclude,
+        per_day=args.per_day,
+        jobs=jobs,
     )
     manifest_name = f"hashes-{manifest['created']}.json"
     manifest_path = out_dir / manifest_name

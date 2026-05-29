@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.5.6 | **Python:** 3.10+ | **Dependencies:** none (stdlib only)
+**Version:** 0.6.0 | **Python:** 3.10+ | **Dependencies:** none (stdlib only; `pyyaml` required for `--per-day`)
 
 ---
 
@@ -19,8 +19,11 @@ python rednb-verify.py ~/journal
 # Create a manifest without signing
 python rednb-verify.py ~/journal --no-sign
 
-# Create a manifest with per-file hash timing
-python rednb-verify.py ~/journal --no-sign --verbose
+# Per-day granularity — hash each day entry individually (requires PyYAML)
+python rednb-verify.py ~/journal --per-day --no-sign
+
+# Parallel hashing (4 workers) with per-file timing
+python rednb-verify.py ~/journal --no-sign --jobs 4 --verbose
 
 # Verify the journal against a manifest
 python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json
@@ -46,6 +49,8 @@ rednb-verify.py [options] notebook_dir
 |---|---|
 | `notebook_dir` | Path to the RedNotebook journal directory |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
+| `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD` (requires `pyyaml`) |
+| `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
 | `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
 | `--verify` | Verify mode — compare notebook against a manifest |
 | `--manifest FILE` | Manifest file to verify against (required with `--verify`) |
@@ -66,6 +71,7 @@ rednb-verify.py [options] notebook_dir
 | `-v`, `--verbose` | Print per-file hash timing and detailed progress |
 | `--quiet` | Suppress all non-error output; implies `--no-sign` unless a signing flag is given |
 | `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
+| `--exclude-from FILE` | File of glob patterns to exclude (one per line; `#` = comment) |
 | `--no-config`, `--no-cf` | Ignore `~/.config/rednb-verify/config.json` for this run |
 | `--config FILE` | Load a specific config file instead of the default |
 
@@ -98,6 +104,15 @@ python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
 
 # Exclude editor lock files and temp files
 python rednb-verify.py ~/journal --exclude "*.tmp" --exclude ".~lock.*"
+
+# Exclude patterns from a file (like .gitignore)
+python rednb-verify.py ~/journal --exclude-from ~/journal-excludes.txt
+
+# Per-day hashing — each day entry gets its own hash (requires PyYAML)
+python rednb-verify.py ~/journal --per-day --no-sign
+
+# Parallel hashing with auto worker count
+python rednb-verify.py ~/journal --jobs 0 --no-sign
 
 # Non-interactive / cron use (suppress output, pre-select GPG key)
 python rednb-verify.py ~/journal --quiet --gpg ABCDEF1234567890
@@ -200,6 +215,23 @@ When `--sig` is omitted, both signature types are still auto-detected from the m
 
 ---
 
+## Per-Day Hashing
+
+`--per-day` (`-D`) provides finer-grained tamper detection by hashing each journal day individually rather than whole month files. The manifest then contains one entry per day entry in the format `YYYY-MM/DD`:
+
+```json
+{
+  "path": "2026-05/27",
+  "sha256": "52255c968cf2ae3e792cd71090850421f900422a0b44e4d79c8508c77e3f083f"
+}
+```
+
+RedNotebook month files are YAML. Each day is parsed with **PyYAML** (`pip install pyyaml`) and its full content (text field plus any custom categories) is canonicalised to JSON before hashing, so any edit — even to a tag or category — is detected.
+
+`--per-day` and `--month-only` are mutually exclusive. Verification automatically detects the manifest mode and uses the same hashing strategy.
+
+---
+
 ## Verification Report
 
 `--report` writes a verification report alongside the manifest (in the journal's parent directory by default). Format is controlled by the argument:
@@ -250,7 +282,8 @@ Exit code is `1` if any issues are found, `0` if all tracked files are clean.
     "gpg_key": "FINGERPRINT",
     "ssh_kl": "~/.ssh/id_ed25519.pub",
     "exclude": ["*.tmp", ".~lock.*"],
-    "manifest_age_warn_days": 90
+    "manifest_age_warn_days": 90,
+    "jobs": 4
 }
 ```
 
@@ -341,7 +374,6 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 - `--json` output mode (structured JSON on stdout for piping and scripting)
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
 - RedNotebook UI integration
-- Per-date and per-entry granularity within month files
 
 ---
 
