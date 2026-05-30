@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.6.1 | **Python:** 3.10+ | **Dependencies:** none (stdlib only; `pyyaml` required for `--per-day`)
+**Version:** 0.7.1 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
 
 ---
 
@@ -25,14 +25,17 @@ python rednb-verify.py ~/journal --per-day --no-sign
 # Parallel hashing (4 workers) with per-file timing
 python rednb-verify.py ~/journal --no-sign --jobs 4 --verbose
 
-# Verify the journal against a manifest
-python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json
+# Verify the journal (auto-finds the latest manifest)
+python rednb-verify.py ~/journal --verify
 
-# Verify and write a JSON report, warn if manifest is older than 90 days
-python rednb-verify.py ~/journal --verify --manifest hashes-20260528T120000Z.json --report json --warn-age 90
+# Verify against a specific manifest
+python rednb-verify.py ~/journal --verify hashes-20260528T120000Z.txt
+
+# Verify with JSON report, warn if manifest is older than 90 days
+python rednb-verify.py ~/journal --verify hashes-20260528T120000Z.txt --report json --warn-age 90
 
 # Re-sign an existing manifest with GPG
-python rednb-verify.py --resign hashes-20260528T120000Z.json --gpg
+python rednb-verify.py --resign hashes-20260528T120000Z.txt --gpg
 ```
 
 ---
@@ -40,7 +43,7 @@ python rednb-verify.py --resign hashes-20260528T120000Z.json --gpg
 ## Usage
 
 ```
-rednb-verify.py [options] notebook_dir
+rednb-verify.py [options] [notebook_dir]
 ```
 
 ### Arguments
@@ -49,24 +52,23 @@ rednb-verify.py [options] notebook_dir
 |---|---|
 | `notebook_dir` | Path to the RedNotebook journal directory |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
-| `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combines with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
+| `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
 | `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
-| `--verify` | Verify mode — compare notebook against a manifest |
-| `--manifest FILE` | Manifest file to verify against (required with `--verify`) |
-| `--report [txt\|json]` | Report format during verify: `txt` human-readable (default) or `json` structured |
+| `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
+| `--manifest [txt\|json]` | Manifest file format: `txt` (default) or `json` |
+| `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
 | `--hash ALGO` | Hash algorithm for files (default: `sha256`) |
 | `--hash-list` | Print available hash algorithms and exit |
 | `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
 | `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
 | `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
-| `--ssh-sign` | Sign the manifest with an SSH key (skips signing menu) |
+| `--ssh [FILE_OR_DIR]` | Sign with SSH key; optionally specify a `.pub` file or directory to scan (default: `~/.ssh`) |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`=SSH |
-| `--ssh-kl FILE_OR_DIR` | SSH `.pub` key file (used directly) or directory to scan (default: `~/.ssh`) |
 | `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
 | `--no-sign` | Skip all signing prompts |
-| `--resign FILE` | Re-sign an existing manifest without re-hashing (requires `--gpg` and/or `--ssh-sign`) |
+| `--resign FILE` | Re-sign an existing manifest without re-hashing (requires `--gpg` and/or `--ssh`) |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
 | `-v`, `--verbose` | Print per-file hash timing and detailed progress |
 | `--quiet` | Suppress all non-error output; implies `--no-sign` unless a signing flag is given |
@@ -93,14 +95,17 @@ python rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
 # Create and sign — interactive menu asks how to sign
 python rednb-verify.py ~/journal
 
-# Create and sign with SSH directly (skips menu)
-python rednb-verify.py ~/journal --ssh-sign
+# Sign with SSH (scans ~/.ssh for keys)
+python rednb-verify.py ~/journal --ssh
 
-# Create and sign with a FIDO2/YubiKey-backed SSH key
-python rednb-verify.py ~/journal --ssh-sign --ssh-fido
+# Sign with a specific SSH key file
+python rednb-verify.py ~/journal --ssh ~/.ssh/id_ed25519.pub
 
-# Use a specific SSH public key file directly (no directory scan)
-python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
+# Sign with a FIDO2/YubiKey-backed SSH key
+python rednb-verify.py ~/journal --ssh --ssh-fido
+
+# Sign with both GPG and SSH
+python rednb-verify.py ~/journal --gpg --ssh
 
 # Exclude editor lock files and temp files
 python rednb-verify.py ~/journal --exclude "*.tmp" --exclude ".~lock.*"
@@ -121,21 +126,25 @@ python rednb-verify.py ~/journal --jobs 0 --no-sign
 python rednb-verify.py ~/journal --quiet --gpg ABCDEF1234567890
 
 # Re-sign an existing manifest without re-hashing the journal
-python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --gpg
-python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --ssh-sign
-python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.json --gpg --ssh-sign
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.txt --gpg
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.txt --ssh
+python rednb-verify.py --resign ~/journal/hashes-20260528T120000Z.txt --gpg --ssh
+
+# Verify — auto-find latest manifest
+python rednb-verify.py ~/journal --verify
+
+# Verify against a specific manifest
+python rednb-verify.py ~/journal --verify ~/journal/hashes-20260528T120000Z.txt
 
 # Verify with both GPG and SSH signatures at the same time
 python rednb-verify.py ~/journal \
-  --verify \
-  --manifest ~/journal/hashes-20260528T120000Z.json \
-  --sig ~/journal/hashes-20260528T120000Z.json.asc,~/journal/hashes-20260528T120000Z.json.sshsig \
+  --verify ~/journal/hashes-20260528T120000Z.txt \
+  --sig ~/journal/hashes-20260528T120000Z.txt.asc,~/journal/hashes-20260528T120000Z.txt.sshsig \
   --report json
 
 # Verify and warn if manifest is older than 90 days
 python rednb-verify.py ~/journal \
-  --verify \
-  --manifest ~/journal/hashes-20260528T120000Z.json \
+  --verify ~/journal/hashes-20260528T120000Z.txt \
   --warn-age 90
 ```
 
@@ -143,12 +152,14 @@ python rednb-verify.py ~/journal \
 
 ## Manifest Format
 
-Manifests are human-readable JSON files named `hashes-<timestamp>.json`.
+Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.json` and contain a human-readable or JSON representation of file hashes and a Merkle tree root.
+
+The JSON format:
 
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.5.6",
+  "version": "0.7.1",
   "created": "20260528T120000Z",
   "date": "2026-05-28",
   "hash_algorithm": "sha256",
@@ -168,6 +179,9 @@ Manifests are human-readable JSON files named `hashes-<timestamp>.json`.
 - `merkle_hash` — algorithm used to compute the Merkle tree root
 - `date` — creation date in `YYYY-MM-DD` for human readability
 - `created` — full UTC timestamp for machine use
+- `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
+
+Use `--manifest json` to produce a JSON manifest instead of the default text format.
 
 ---
 
@@ -175,18 +189,23 @@ Manifests are human-readable JSON files named `hashes-<timestamp>.json`.
 
 ### GPG
 
-If GPG is available and secret keys are found, you are prompted to sign after manifest creation. A detached ASCII-armoured signature (`hashes-....json.asc`) is created alongside the manifest.
+If GPG is available and secret keys are found, you are prompted to sign after manifest creation. A detached ASCII-armoured signature (`hashes-....txt.asc`) is created alongside the manifest.
 
 Interactive key selection shows fingerprint and expiry for each key.
 
 ### SSH
 
-Use `--ssh-sign` to sign with an SSH key. The tool scans `~/.ssh` (or the directory given by `--ssh-kl`) for key pairs and prompts for selection if multiple are found.
-
-Pass a `.pub` file directly to `--ssh-kl` to skip scanning and use that key immediately:
+Use `--ssh` to sign with an SSH key. The tool scans `~/.ssh` for key pairs and prompts for selection if multiple are found. Pass a `.pub` file or directory to use a specific key:
 
 ```bash
-python rednb-verify.py ~/journal --ssh-sign --ssh-kl ~/.ssh/id_ed25519.pub
+# Sign with SSH (scans ~/.ssh)
+python rednb-verify.py ~/journal --ssh
+
+# Sign with a specific key file directly
+python rednb-verify.py ~/journal --ssh ~/.ssh/id_ed25519.pub
+
+# Sign scanning a specific directory
+python rednb-verify.py ~/journal --ssh ~/.ssh/work-keys/
 ```
 
 The signature is saved as `<manifest>.sshsig`. During `--verify`, pass `--ssh-verify` to force an SSH check, or use `--sig` to specify the file explicitly.
@@ -197,10 +216,10 @@ SSH keys backed by FIDO2 hardware (YubiKey, SoloKey, etc.) use key types prefixe
 
 ```bash
 # Sign preferring any FIDO2-backed key
-python rednb-verify.py ~/journal --ssh-sign --ssh-fido
+python rednb-verify.py ~/journal --ssh --ssh-fido
 
 # Sign preferring a specific FIDO2 key by name
-python rednb-verify.py ~/journal --ssh-sign --ssh-fido yubikey
+python rednb-verify.py ~/journal --ssh --ssh-fido yubikey
 ```
 
 ### Verifying Multiple Signatures
@@ -209,9 +228,8 @@ Use `--sig` with a comma-separated list to verify GPG and SSH signatures in a si
 
 ```bash
 python rednb-verify.py ~/journal \
-  --verify \
-  --manifest hashes-20260528T120000Z.json \
-  --sig hashes-20260528T120000Z.json.asc,hashes-20260528T120000Z.json.sshsig
+  --verify hashes-20260528T120000Z.txt \
+  --sig hashes-20260528T120000Z.txt.asc,hashes-20260528T120000Z.txt.sshsig
 ```
 
 When `--sig` is omitted, both signature types are still auto-detected from the manifest directory.
@@ -252,7 +270,7 @@ Verification automatically reads the `mode` field from the manifest and uses the
 
 `--report` writes a verification report alongside the manifest (in the journal's parent directory by default). Format is controlled by the argument:
 
-- `--report` or `--report txt` — human-readable text (default)
+- `--report` or `--report txt` — human-readable numbered list (default)
 - `--report json` — structured JSON
 
 The JSON format has four categories:
@@ -271,8 +289,6 @@ The JSON format has four categories:
 - `modified` — files whose hash has changed
 - `new` — files present in the notebook not tracked by the manifest
 
-Exit code is `1` if any issues are found, `0` if all tracked files are clean.
-
 ---
 
 ## Exit Codes
@@ -287,7 +303,7 @@ Exit code is `1` if any issues are found, `0` if all tracked files are clean.
 
 ## Config File
 
-`~/.config/rednb-verify/config.json` is loaded automatically as a default layer. CLI flags always override config values.
+`~/.config/rednb-verify/config.json` is loaded automatically as a default layer. CLI flags always override config values. An empty or missing config file is silently ignored.
 
 ```json
 {
@@ -303,7 +319,7 @@ Exit code is `1` if any issues are found, `0` if all tracked files are clean.
 }
 ```
 
-A notification is printed when the config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file.
+A notification is printed when a config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file.
 
 ---
 
@@ -374,7 +390,7 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 
 ## Design Principles
 
-- Single file, zero non-stdlib dependencies
+- Single file, minimal dependencies (stdlib only; PyYAML optional for `--per-day`)
 - Deterministic output
 - Explicit trust boundaries
 - No hidden metadata
