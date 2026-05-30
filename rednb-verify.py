@@ -404,36 +404,36 @@ def choose_ssh_key(candidates: List[SshKeyCandidate]) -> Optional[SshKeyCandidat
 
 
 def select_ssh_key(
-    ssh_kl: Path,
+    ssh_key: Path,
     require_private: bool,
     prefer_fido: bool,
     keyname: Optional[str],
 ) -> Optional[SshKeyCandidate]:
     """Resolve an SSH key from a direct .pub file or a directory to scan."""
-    if ssh_kl.is_file():
+    if ssh_key.is_file():
         try:
-            line = ssh_kl.read_text(encoding="utf-8").splitlines()[0]
+            line = ssh_key.read_text(encoding="utf-8").splitlines()[0]
         except (OSError, IndexError):
-            _warn(f"Could not read public key: {ssh_kl}")
+            _warn(f"Could not read public key: {ssh_key}")
             return None
         parsed = _parse_pubkey_line(line)
         if not parsed:
-            _warn(f"Could not parse public key: {ssh_kl}")
+            _warn(f"Could not parse public key: {ssh_key}")
             return None
         key_type, comment = parsed
-        priv_path = ssh_kl.with_suffix("")
+        priv_path = ssh_key.with_suffix("")
         if require_private and not priv_path.exists():
-            _warn(f"Private key not found alongside {ssh_kl.name}")
+            _warn(f"Private key not found alongside {ssh_key.name}")
             return None
         return SshKeyCandidate(
-            pub_path=ssh_kl,
+            pub_path=ssh_key,
             priv_path=priv_path if priv_path.exists() else None,
             key_type=key_type,
             comment=comment,
-            filename=ssh_kl.name,
+            filename=ssh_key.name,
             is_fido="sk-" in key_type,
         )
-    candidates = scan_ssh_keys(ssh_kl, require_private=require_private)
+    candidates = scan_ssh_keys(ssh_key, require_private=require_private)
     candidates = _filter_ssh_candidates(candidates, prefer_fido=prefer_fido, keyname=keyname)
     return choose_ssh_key(candidates)
 
@@ -933,7 +933,7 @@ def _sign_with_gpg(
 def _sign_with_ssh(
     manifest_path: Path,
     sig_path: Path,
-    ssh_kl_path: Path,
+    ssh_key_path: Path,
     prefer_fido: bool,
     keyname: Optional[str],
 ) -> None:
@@ -941,7 +941,7 @@ def _sign_with_ssh(
     if not ssh_keygen_available():
         _warn("ssh-keygen not available — SSH signing skipped.")
         return
-    signer = select_ssh_key(ssh_kl_path, require_private=True, prefer_fido=prefer_fido, keyname=keyname)
+    signer = select_ssh_key(ssh_key_path, require_private=True, prefer_fido=prefer_fido, keyname=keyname)
     if signer is None or signer.priv_path is None:
         _warn("No suitable SSH key found for signing.")
         return
@@ -1120,8 +1120,8 @@ supported hash algorithms:
         cfg["no_sign"] = True
     if config.get("gpg_key"):
         cfg["gpg"] = config["gpg_key"]
-    if config.get("ssh_kl"):
-        cfg["ssh"] = os.path.expanduser(config["ssh_kl"])
+    if config.get("ssh_key"):
+        cfg["ssh"] = os.path.expanduser(config["ssh_key"])
     if config.get("exclude"):
         cfg["exclude"] = list(config["exclude"])
     if config.get("manifest_age_warn_days"):
@@ -1173,7 +1173,7 @@ supported hash algorithms:
         args.no_sign = True
 
     # Resolve SSH key location from --ssh argument (None → default ~/.ssh)
-    ssh_kl_path = (
+    ssh_key_path = (
         Path(os.path.expanduser(args.ssh))
         if args.ssh        # non-empty string = user supplied a path
         else Path(os.path.expanduser("~/.ssh"))
@@ -1250,7 +1250,7 @@ supported hash algorithms:
         if want_gpg:
             _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
         if want_ssh:
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
         return
 
     # ------------------------------------------------------------------ #
@@ -1345,7 +1345,7 @@ supported hash algorithms:
             if not ssh_sig.exists():
                 _warn(f"SSH signature not found: {ssh_sig.name}")
                 continue
-            signer = select_ssh_key(ssh_kl_path, require_private=False,
+            signer = select_ssh_key(ssh_key_path, require_private=False,
                                     prefer_fido=prefer_fido, keyname=keyname)
             if signer is None:
                 _warn("No suitable SSH key found for verification.")
@@ -1413,20 +1413,20 @@ supported hash algorithms:
 
     elif want_gpg and want_ssh:
         _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
 
     elif want_gpg:
         _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
 
     elif want_ssh:
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
 
     else:
         sign_choice = _prompt_signing_menu()
         if sign_choice in (1, 3):
             _sign_with_gpg(manifest_path, key_fpr=None, key_file=None)
         if sign_choice in (2, 3):
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_kl_path, prefer_fido, keyname)
+            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
 
 
 if __name__ == "__main__":

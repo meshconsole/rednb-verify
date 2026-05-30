@@ -152,9 +152,28 @@ python rednb-verify.py ~/journal \
 
 ## Manifest Format
 
-Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.json` and contain a human-readable or JSON representation of file hashes and a Merkle tree root.
+Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.json`. Use `--manifest json` to produce JSON instead of the default text format.
 
-The JSON format:
+### Text format (default)
+
+```
+rednb-verify manifest
+version: 0.7.1
+created: 20260528T120000Z
+date: 2026-05-28
+hash_algorithm: sha256
+merkle_hash: sha256
+mode: full-tree
+merkle_root: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
+
+files:
+      1. 2026-05.txt
+         sha256: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
+      2. pexels-photo.jpg
+         sha256: a3f1bc8e0d2741c59930cf5a29e4b87d3e1092f54c8d70a1e3b29d84c7f02e11
+```
+
+### JSON format (`--manifest json`)
 
 ```json
 {
@@ -175,13 +194,12 @@ The JSON format:
 }
 ```
 
+**Fields:**
 - `hash_algorithm` — algorithm used for individual file hashes; also the field name on each file entry
 - `merkle_hash` — algorithm used to compute the Merkle tree root
 - `date` — creation date in `YYYY-MM-DD` for human readability
 - `created` — full UTC timestamp for machine use
 - `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
-
-Use `--manifest json` to produce a JSON manifest instead of the default text format.
 
 ---
 
@@ -273,17 +291,37 @@ Verification automatically reads the `mode` field from the manifest and uses the
 - `--report` or `--report txt` — human-readable numbered list (default)
 - `--report json` — structured JSON
 
-The JSON format has four categories:
+### Text format (default)
+
+```
+rednb-verify report — 2026-05-28
+Manifest: hashes-20260528T120000Z.txt
+
+OK:        2
+New:       1
+Missing:   0
+Modified:  0
+
+--- OK ---
+      1. 2026-05.txt
+      2. pexels-photo.jpg
+
+--- NEW ---
+      1. 2026-06.txt
+```
+
+### JSON format (`--report json`)
 
 ```json
 {
-  "ok": ["2026-05.txt"],
+  "ok": ["2026-05.txt", "pexels-photo.jpg"],
   "missing": [],
   "modified": [],
   "new": ["2026-06.txt"]
 }
 ```
 
+**Categories:**
 - `ok` — files matching the manifest exactly
 - `missing` — files in the manifest that are no longer present
 - `modified` — files whose hash has changed
@@ -312,7 +350,7 @@ The JSON format has four categories:
     "quiet": false,
     "no_sign": false,
     "gpg_key": "FINGERPRINT",
-    "ssh_kl": "~/.ssh/id_ed25519.pub",
+    "ssh_key": "~/.ssh/id_ed25519.pub",
     "exclude": ["*.tmp", ".~lock.*"],
     "manifest_age_warn_days": 90,
     "jobs": 4
