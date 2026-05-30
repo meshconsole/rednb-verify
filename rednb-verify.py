@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.7.1
+Version: 0.7.2
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -12,10 +12,10 @@ rednb-verify.py [options] [notebook_directory]
 "-D", "--per-day"          : Hash individual day entries within month files (requires PyYAML)
 "-j", "--jobs N"           : Parallel hashing workers (0 = auto, default: 1)
 "-o", "--output"           : Output directory for manifest (default: journal parent)
-"--verify"                 : Verification mode
-"--manifest"               : Manifest file to verify against
+"--verify [FILE|DIR]"      : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
+"--manifest-type txt|json" : Manifest creation format (default: txt)
 "--report txt|json"        : Report format during --verify (default: txt)
-"--hash ALGO"              : Hash algorithm for files (default: sha256)
+"--hash ALGO[:LEN]"        : Hash algorithm (default: sha256); shake_128/shake_256 require :LEN
 "--hash-list"              : Print available hash algorithms and exit
 "--hash-merkle"            : Hash algorithm for Merkle tree (default: same as --hash)
 "--gpg [FINGERPRINT]"      : Sign with GPG; optional fingerprint pre-selects key (skips menu)
@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -143,16 +143,42 @@ def load_config(path: Path = CONFIG_PATH) -> Dict:
 
 # ---------- Utilities ----------
 
+# Algorithms whose digest() / hexdigest() require an explicit byte-length argument.
+_VARIABLE_LENGTH_ALGOS = {"shake_128", "shake_256"}
+
+
+def _parse_algo_spec(spec: str) -> tuple:
+    """Parse 'algo' or 'algo:length' → (algo_name, length_or_None).
+
+    shake_128 and shake_256 require a length, e.g. 'shake_128:32'.
+    All other algorithms ignore the length component even if provided.
+    """
+    if ":" in spec:
+        algo, _, length_str = spec.partition(":")
+        try:
+            return algo.strip(), int(length_str.strip())
+        except ValueError:
+            return spec.strip(), None
+    return spec.strip(), None
+
+
+def _hexdigest(h, length: Optional[int]) -> str:
+    """Call h.hexdigest() with or without a length argument."""
+    return h.hexdigest(length) if length is not None else h.hexdigest()
+
+
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def hash_file(path: Path, algo: str) -> str:
+def hash_file(path: Path, algo_spec: str) -> str:
+    """Hash a file using an algorithm spec ('algo' or 'algo:length')."""
+    algo, length = _parse_algo_spec(algo_spec)
     h = hashlib.new(algo)
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
-    return h.hexdigest()
+    return _hexdigest(h, length)
 
 
 def is_month_file(path: Path) -> bool:
@@ -170,17 +196,18 @@ def is_month_file(path: Path) -> bool:
 
 # ---------- Merkle ----------
 
-def merkle_root(hashes: List[str], algo: str) -> str:
+def merkle_root(hashes: List[str], algo_spec: str) -> str:
     if not hashes:
         return ""
+    algo, length = _parse_algo_spec(algo_spec)
     level = [bytes.fromhex(h) for h in hashes]
     while len(level) > 1:
         next_level = []
         for i in range(0, len(level), 2):
             left = level[i]
             right = level[i + 1] if i + 1 < len(level) else left
-            h = hashlib.new(algo, left + right).digest()
-            next_level.append(h)
+            h = hashlib.new(algo, left + right)
+            next_level.append(h.digest(length) if length is not None else h.digest())
         level = next_level
     return level[0].hex()
 
@@ -238,11 +265,11 @@ def choose_gpg_key(keys: List[Dict]) -> Optional[str]:
     if not choice:
         return None
     if not choice.isdigit():
-        print("[ERROR] Invalid selection.")
+        _err("Invalid selection.")
         return None
     idx = int(choice)
     if idx < 0 or idx >= len(keys):
-        print("[ERROR] Selection out of range.")
+        _err("Selection out of range.")
         return None
     return keys[idx]["fingerprint"]
 
@@ -394,11 +421,11 @@ def choose_ssh_key(candidates: List[SshKeyCandidate]) -> Optional[SshKeyCandidat
     if not choice:
         return None
     if not choice.isdigit():
-        print("[ERROR] Invalid selection.")
+        _err("Invalid selection.")
         return None
     idx = int(choice)
     if idx < 0 or idx >= len(candidates):
-        print("[ERROR] Selection out of range.")
+        _err("Selection out of range.")
         return None
     return candidates[idx]
 
@@ -598,6 +625,8 @@ def collect_files_per_day(
 
     files: Dict[str, str] = {}
 
+    _algo, _length = _parse_algo_spec(algo)
+
     def _hash_day(day_key: str, day_data) -> tuple:
         # Canonicalise: dicts → sorted JSON; plain strings kept as-is
         if isinstance(day_data, dict):
@@ -605,9 +634,10 @@ def collect_files_per_day(
         else:
             canonical = str(day_data) if day_data is not None else ""
         t0 = time.perf_counter()
-        h = hashlib.new(algo, canonical.encode("utf-8")).hexdigest()
+        h = hashlib.new(_algo, canonical.encode("utf-8"))
+        digest = _hexdigest(h, _length)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        return day_key, h, elapsed_ms
+        return day_key, digest, elapsed_ms
 
     if jobs == 1:
         for day_key, day_data in entries:
@@ -1029,15 +1059,18 @@ examples:
   # Non-interactive / cron use
   rednb-verify.py ~/journal --quiet --gpg ABCDEF1234567890
 
-  # Verify — human-readable report saved next to journal (default)
-  rednb-verify.py ~/journal --verify --manifest hashes-....json
+  # Verify — auto-find latest manifest in the output directory
+  rednb-verify.py ~/journal --verify
+
+  # Verify a specific manifest
+  rednb-verify.py ~/journal --verify hashes-....txt
 
   # Verify with JSON report and age warning
-  rednb-verify.py ~/journal --verify --manifest hashes-....json --report json --warn-age 90
+  rednb-verify.py ~/journal --verify hashes-....txt --report json --warn-age 90
 
   # Verify GPG + SSH signatures in one run
-  rednb-verify.py ~/journal --verify --manifest hashes-....json \\
-    --sig hashes-....json.asc,hashes-....json.sshsig
+  rednb-verify.py ~/journal --verify hashes-....txt \\
+    --sig hashes-....txt.asc,hashes-....txt.sshsig
 
 exit codes:
   0  all checks passed / manifest created successfully
@@ -1049,6 +1082,8 @@ supported hash algorithms:
   use --hash-list to see all available algorithms
 """
     )
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"rednb-verify {VERSION}")
     parser.add_argument("notebook_dir", type=Path, nargs="?",
                         help="Path to the RedNotebook journal directory")
     parser.add_argument("-m", "--month-only", action="store_true",
@@ -1060,8 +1095,8 @@ supported hash algorithms:
                         help="Verify mode: path to a manifest file, or directory to search "
                              "for the latest manifest. Without argument, searches the output "
                              "directory (journal parent by default).")
-    parser.add_argument("--manifest", nargs="?", const="txt", default="txt",
-                        metavar="txt|json",
+    parser.add_argument("--manifest-type", nargs="?", const="txt", default="txt",
+                        metavar="txt|json", dest="manifest_type",
                         help="Manifest creation format: txt (default) or json")
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
@@ -1149,15 +1184,18 @@ supported hash algorithms:
     if args.report not in ("txt", "json"):
         _err(f"--report must be 'txt' or 'json', got: {args.report!r}")
         sys.exit(2)
-    if args.manifest not in ("txt", "json"):
-        _err(f"--manifest must be 'txt' or 'json', got: {args.manifest!r}")
+    if args.manifest_type not in ("txt", "json"):
+        _err(f"--manifest-type must be 'txt' or 'json', got: {args.manifest_type!r}")
         sys.exit(2)
 
     # --hash-list: print available algorithms and exit (no notebook_dir needed)
     if args.hash_list:
         print("Available hash algorithms:")
         for algo in sorted(hashlib.algorithms_guaranteed):
-            print(f"  {algo}")
+            if algo in _VARIABLE_LENGTH_ALGOS:
+                print(f"  {algo}:<length>   (e.g. --hash {algo}:32)")
+            else:
+                print(f"  {algo}")
         sys.exit(0)
 
     # notebook_dir required except for --resign and --hash-list
@@ -1181,11 +1219,23 @@ supported hash algorithms:
 
     args.merkle_algo = args.merkle_algo or args.hash_algo
 
-    for label, algo in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
+    for label, spec in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
+        algo_name, algo_len = _parse_algo_spec(spec)
         try:
-            hashlib.new(algo)
+            h = hashlib.new(algo_name)
         except ValueError:
-            _err(f"Unsupported algorithm for {label}: {algo}")
+            _err(f"Unsupported algorithm for {label}: {spec!r}")
+            sys.exit(2)
+        if algo_name in _VARIABLE_LENGTH_ALGOS and algo_len is None:
+            _err(f"{algo_name} requires a length: use {label} {algo_name}:32")
+            sys.exit(2)
+        if algo_name not in _VARIABLE_LENGTH_ALGOS and algo_len is not None:
+            _err(f"{algo_name} does not support a length parameter (remove :{algo_len})")
+            sys.exit(2)
+        try:
+            _hexdigest(h, algo_len)
+        except TypeError as exc:
+            _err(f"Algorithm error for {label} {spec!r}: {exc}")
             sys.exit(2)
 
     # Parse --sig
@@ -1389,7 +1439,7 @@ supported hash algorithms:
         per_day=args.per_day,
         jobs=jobs,
     )
-    manifest_fmt = args.manifest  # "txt" or "json"
+    manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
     manifest_name = f"hashes-{manifest['created']}{ext}"
     manifest_path = out_dir / manifest_name

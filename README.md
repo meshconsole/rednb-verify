@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.7.1 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
+**Version:** 0.7.2 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
 
 ---
 
@@ -55,10 +55,11 @@ rednb-verify.py [options] [notebook_dir]
 | `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
 | `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
+| `-V`, `--version` | Print version and exit |
 | `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
-| `--manifest [txt\|json]` | Manifest file format: `txt` (default) or `json` |
+| `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
 | `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
-| `--hash ALGO` | Hash algorithm for files (default: `sha256`) |
+| `--hash ALGO[:LEN]` | Hash algorithm for files (default: `sha256`). `shake_128` and `shake_256` require a byte length: `--hash shake_128:32` |
 | `--hash-list` | Print available hash algorithms and exit |
 | `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
 | `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
@@ -152,7 +153,7 @@ python rednb-verify.py ~/journal \
 
 ## Manifest Format
 
-Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.json`. Use `--manifest json` to produce JSON instead of the default text format.
+Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.json`. Use `--manifest-type json` to produce JSON instead of the default text format.
 
 ### Text format (default)
 
@@ -173,7 +174,7 @@ files:
          sha256: a3f1bc8e0d2741c59930cf5a29e4b87d3e1092f54c8d70a1e3b29d84c7f02e11
 ```
 
-### JSON format (`--manifest json`)
+### JSON format (`--manifest-type json`)
 
 ```json
 {
