@@ -1,0 +1,6 @@
+# rednb-verify — Python 3.10+
+#
+# No required dependencies. The tool runs entirely on the Python stdlib.
+#
+# Optional — install to enable --per-day (per-day journal entry hashing):
+pyyaml>=6.0

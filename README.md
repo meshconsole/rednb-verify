@@ -10,6 +10,33 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 
 ---
 
+## Installation
+
+**No install required.** Download the single file and run it:
+
+```bash
+curl -O https://raw.githubusercontent.com/meshconsole/rednb-verify/main/rednb-verify.py
+python rednb-verify.py --version
+```
+
+**Requirements:**
+- Python 3.10+
+- No mandatory third-party packages — runs on stdlib only
+
+**Optional dependency** — needed only for `--per-day` (per-day journal entry hashing):
+
+```bash
+pip install pyyaml
+# or
+pip install -r requirements.txt
+```
+
+**External tools** used when available (not required for basic operation):
+- `gpg` — for GPG signing and verification
+- `ssh-keygen` — for SSH signing and verification (ships with OpenSSH)
+
+---
+
 ## Quick Start
 
 ```bash
