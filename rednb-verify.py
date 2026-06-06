@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,23 @@ def _warn_security(msg: str) -> None:
 
 def _err(msg: str) -> None:
     print(f"{_tag('ERROR', stream=sys.stderr)} {msg}", file=sys.stderr)
+
+
+def check_sig_writable(sig_path: Path) -> None:
+    """Security-tier warning if a signature file is group/world-writable.
+
+    POSIX-only. On Windows, st_mode does not reflect real NTFS ACLs (every file
+    looks group/world-writable), so the check is skipped to avoid false alarms —
+    proper ACL inspection would require a non-stdlib dependency (pywin32).
+    """
+    if os.name == "nt":
+        return
+    try:
+        mode = sig_path.stat().st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        _warn_security(f"Sig file is group/world-writable: {sig_path}")
 
 
 # ---------- Config ----------
@@ -229,6 +247,16 @@ def apply_add_trust(config: Dict, tokens: List[str]) -> None:
 
 # Algorithms whose digest() / hexdigest() require an explicit byte-length argument.
 _VARIABLE_LENGTH_ALGOS = {"shake_128", "shake_256"}
+
+# Cryptographically broken hashes — unsafe as the SOLE integrity hash.
+_WEAK_ALGOS = {"md5", "sha1"}
+
+# Canonical manifest warning strings (stored in the manifest "warnings" field).
+WARN_WEAK_HASH = "WEAK HASHING ALGORITHM(S) IN USE ALONE"
+WARN_UNSIGNED = "MANIFEST UNSIGNED"
+WARN_EXCLUDED = "FILES EXCLUDED FROM MANIFEST"
+WARN_NO_FILES = "NO FILES FOUND IN NOTEBOOK DIRECTORY"
+WARN_NO_DAYS = "NO DAY ENTRIES FOUND"
 
 
 def _parse_algo_spec(spec: str) -> tuple:
@@ -758,6 +786,7 @@ def generate_manifest(
     per_day: bool = False,
     jobs: int = 1,
 ) -> Dict:
+    day_count: Optional[int] = None  # None = not a per-day mode
     if per_day and not month_only:
         # per-day/full-tree: individual day entries + all non-month files.
         # Pass the YYYY-MM.txt glob to collect_files so month files are
@@ -770,10 +799,12 @@ def generate_manifest(
             jobs=jobs,
         )
         files = dict(sorted({**day_files, **other_files}.items()))
+        day_count = len(day_files)
         mode = "per-day/full-tree"
     elif per_day and month_only:
         # per-day/month-only: individual day entries, no attachments
         files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        day_count = len(files)
         mode = "per-day/month-only"
     elif month_only:
         # month-only: whole YYYY-MM.txt files, no attachments
@@ -783,6 +814,18 @@ def generate_manifest(
         # full-tree: every file as-is
         files = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
         mode = "full-tree"
+
+    # Collect creation-time warnings (recorded regardless of --quiet).
+    warnings: List[str] = []
+    algo_name, _ = _parse_algo_spec(algo)
+    if algo_name in _WEAK_ALGOS:
+        warnings.append(WARN_WEAK_HASH)
+    if exclude:
+        warnings.append(WARN_EXCLUDED)
+    if not files:
+        warnings.append(WARN_NO_FILES)
+    if day_count == 0:
+        warnings.append(WARN_NO_DAYS)
 
     hashes = list(files.values())
     manifest: Dict = {
@@ -799,6 +842,8 @@ def generate_manifest(
     }
     if exclude:
         manifest["exclude"] = exclude
+    if warnings:
+        manifest["warnings"] = warnings
     return manifest
 
 
@@ -863,6 +908,8 @@ def _write_text_manifest(manifest: Dict) -> str:
     ]
     if manifest.get("exclude"):
         lines.append(f"exclude: {', '.join(manifest['exclude'])}")
+    if manifest.get("warnings"):
+        lines.append(f"warnings: {', '.join(manifest['warnings'])}")
     lines += ["", "files:"]
     for i, entry in enumerate(manifest["files"], 1):
         lines.append(f"  {i:>5}. {entry['path']}")
@@ -894,9 +941,10 @@ def _parse_text_manifest(text: str) -> Dict:
             elif ": " in stripped and current_path is not None:
                 algo, _, h = stripped.partition(": ")
                 manifest["files"].append({"path": current_path, algo.strip(): h.strip()})
-    # exclude is stored as comma-separated string — convert to list
-    if "exclude" in manifest and isinstance(manifest["exclude"], str):
-        manifest["exclude"] = [e.strip() for e in manifest["exclude"].split(",") if e.strip()]
+    # exclude / warnings stored as comma-separated strings — convert to lists
+    for _list_key in ("exclude", "warnings"):
+        if _list_key in manifest and isinstance(manifest[_list_key], str):
+            manifest[_list_key] = [e.strip() for e in manifest[_list_key].split(",") if e.strip()]
     # schema_version is numeric
     if "schema_version" in manifest:
         try:
@@ -1044,6 +1092,7 @@ def _sign_with_gpg(
                 return
         if _gpg_sign_with_keyfile(manifest_path, key_file):
             _ok("Manifest signed with GPG.")
+            check_sig_writable(manifest_path.parent / f"{manifest_path.name}.asc")
         else:
             _warn("GPG signing failed.")
         return
@@ -1084,6 +1133,7 @@ def _sign_with_gpg(
 
     if gpg_detach_sign(manifest_path, fpr):
         _ok("Manifest signed with GPG.")
+        check_sig_writable(manifest_path.parent / f"{manifest_path.name}.asc")
     else:
         _warn("GPG signing failed.")
 
@@ -1110,6 +1160,7 @@ def _sign_with_ssh(
             return
     if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
         _ok(f"SSH signature created: {sig_path.name}")
+        check_sig_writable(sig_path)
     else:
         _warn("SSH signing failed.")
 
@@ -1509,6 +1560,10 @@ supported hash algorithms:
         # Schema version gate (three-direction check)
         check_manifest_schema(manifest, args.schema_ignore, args.yes)
 
+        # Surface creation-time warnings recorded in the manifest (cosmetic, G6)
+        for w in manifest.get("warnings", []):
+            _warn(f"Manifest note: {w}")
+
         # Manifest age warning
         if args.warn_age is not None:
             try:
@@ -1559,6 +1614,7 @@ supported hash algorithms:
                 else:
                     if gpg_verify(manifest_path, gpg_sig):
                         _ok(f"GPG signature verified: {gpg_sig.name}")
+                        check_sig_writable(gpg_sig)
                     else:
                         _warn(f"GPG signature invalid: {gpg_sig.name}")
 
@@ -1583,6 +1639,7 @@ supported hash algorithms:
             )
             if result.status == "OK":
                 _ok(result.message)
+                check_sig_writable(ssh_sig)
             else:
                 _qprint(f"{_tag(result.status)} {result.message}")
             for w in result.warnings:
