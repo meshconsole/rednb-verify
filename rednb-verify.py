@@ -57,9 +57,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
+
+# Manifest structural contract. Separate from VERSION (build identifier).
+# Bump only on a BREAKING structural change (renamed/removed/retyped field),
+# never for an optional addition. Manifests without this field = version 0.
+MANIFEST_SCHEMA_VERSION = 1
 
 # Set by main() before any output
 _quiet: bool = False
@@ -783,6 +788,7 @@ def generate_manifest(
     manifest: Dict = {
         "tool": "rednb-verify",
         "version": VERSION,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "created": utc_timestamp(),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "hash_algorithm": algo,
@@ -847,6 +853,7 @@ def _write_text_manifest(manifest: Dict) -> str:
     lines = [
         "rednb-verify manifest",
         f"version: {manifest.get('version', VERSION)}",
+        f"schema_version: {manifest.get('schema_version', MANIFEST_SCHEMA_VERSION)}",
         f"created: {manifest['created']}",
         f"date: {manifest['date']}",
         f"hash_algorithm: {algo}",
@@ -890,6 +897,12 @@ def _parse_text_manifest(text: str) -> Dict:
     # exclude is stored as comma-separated string — convert to list
     if "exclude" in manifest and isinstance(manifest["exclude"], str):
         manifest["exclude"] = [e.strip() for e in manifest["exclude"].split(",") if e.strip()]
+    # schema_version is numeric
+    if "schema_version" in manifest:
+        try:
+            manifest["schema_version"] = int(manifest["schema_version"])
+        except (TypeError, ValueError):
+            pass
     return manifest
 
 
@@ -899,6 +912,42 @@ def _load_manifest(path: Path) -> Dict:
     if path.suffix.lower() == ".json":
         return json.loads(text)
     return _parse_text_manifest(text)
+
+
+def check_manifest_schema(manifest: Dict, schema_ignore: bool, yes: bool) -> None:
+    """Three-direction schema_version check at verify time.
+
+    equal  → proceed
+    lower  → security warning + best-effort + interactive prompt (quiet auto-continues)
+    higher → refuse + exit 2, unless --schema-ignore
+    """
+    found = manifest.get("schema_version", 0)
+    try:
+        found = int(found)
+    except (TypeError, ValueError):
+        found = 0
+
+    if found == MANIFEST_SCHEMA_VERSION:
+        return
+
+    if found > MANIFEST_SCHEMA_VERSION:
+        if not schema_ignore:
+            _err(f"Manifest schema version {found} is newer than this tool "
+                 f"supports (max: {MANIFEST_SCHEMA_VERSION}).")
+            _err("        Upgrade rednb-verify, or re-run with --schema-ignore "
+                 "to attempt anyway.")
+            sys.exit(2)
+        _warn_security(f"--schema-ignore: verifying schema {found} with a tool that "
+                       f"supports {MANIFEST_SCHEMA_VERSION} — results may be unreliable.")
+        return
+
+    # found < current (old manifest, includes absent = 0)
+    _warn_security(f"Old manifest format (schema {found}); trust cannot be "
+                   "fully evaluated. Hash and signature checks still apply.")
+    if not _quiet and not yes and sys.stdin.isatty():
+        if input("Continue verifying this old manifest? [y/N]: ").strip().lower() != "y":
+            _info("Verification cancelled.")
+            sys.exit(0)
 
 
 def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path: Path) -> None:
@@ -1456,6 +1505,9 @@ supported hash algorithms:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _err(f"Could not read manifest: {exc}")
             sys.exit(2)
+
+        # Schema version gate (three-direction check)
+        check_manifest_schema(manifest, args.schema_ignore, args.yes)
 
         # Manifest age warning
         if args.warn_age is not None:
