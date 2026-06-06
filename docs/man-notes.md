@@ -49,7 +49,6 @@ reflected in exit code and/or the manifest `warnings` field.
 **Security tier** — ALWAYS printed to **stderr**, even under `--quiet`. The
 operator must know; silently proceeding would be dangerous.
 - `[WARN]` old manifest / schema version 0 — trust cannot be evaluated
-- `[WARN]` signature file is group/world-writable
 - `[WARN]` signing key is untrusted (under `--trust low`)
 - `[WARN]` trust level is HIGH but no keys are pinned
 - `[WARN]` `--schema-ignore` used — results may be unreliable
@@ -383,18 +382,13 @@ Authenticates who signed since the manifest itself is signed.
 Multiple signers (GPG + SSH) accumulate in the same object.
 Used by `--trust high` verification to cross-reference against trust list.
 
-### Signature write-protection check
-Fires at TWO points: after signing (new file) and during verify (existing file).
-
-**Check:** file is writable by group or others (owner-writable is expected and fine):
-```python
-mode = sig_path.stat().st_mode
-if mode & (stat.S_IWGRP | stat.S_IWOTH):
-    _warn(f"Sig file is group/world-writable: {sig_path}")
-```
-
-Output: `[WARN] Sig file(s) are writable: /path/to/file.sshsig`
-Note for Windows: `stat` permissions are limited; mention ACL check in message.
+### Signature write-protection check — DROPPED
+Considered and removed. Rationale: the cryptographic signature already protects
+against sig tampering (a replaced sig won't verify against a trusted key), so the
+check only caught filesystem hygiene — not attacks. It was also inert on Windows
+(no NTFS ACL access without pywin32), had arbitrary scope (sig files but not
+manifests/journal, which are writable by design), and risked desensitizing users
+to warnings. Not implemented.
 
 ### Manifest schema versioning
 
