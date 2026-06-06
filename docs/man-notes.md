@@ -27,6 +27,44 @@ Exit codes always fire regardless of `--quiet`. Errors always go to stderr.
 
 ---
 
+## Output channel policy (stdout / stderr / `--quiet`)
+
+Industry-standard convention: `--quiet` suppresses informational NOISE on stdout;
+it never blinds the operator to problems. Warnings and errors go to **stderr**.
+This matches `curl -s`, `git --quiet`, `rsync --quiet`, `gpg --quiet`, etc.
+
+### The rule
+> Under `--quiet`, suppress the noise; never suppress something the operator
+> needs to act on. The distinction is SEVERITY/CONSEQUENCE, not "warn vs not-warn."
+
+### Two tiers of warning
+
+**Cosmetic tier** — suppressed by `--quiet`. Expected, low-stakes, already
+reflected in exit code and/or the manifest `warnings` field.
+- `[INFO]` progress (`Hashing 2026-05.txt...`)
+- `[INFO] Using config: ...`
+- `[WARN] Manifest not GPG-signed`
+- `[INFO] Signing skipped (--no-sign)`
+
+**Security tier** — ALWAYS printed to **stderr**, even under `--quiet`. The
+operator must know; silently proceeding would be dangerous.
+- `[WARN]` old manifest / schema version 0 — trust cannot be evaluated
+- `[WARN]` signature file is group/world-writable
+- `[WARN]` signing key is untrusted (under `--trust low`)
+- `[WARN]` trust level is HIGH but no keys are pinned
+- `[WARN]` `--schema-ignore` used — results may be unreliable
+- `[ERROR]` anything (always, plus exit code)
+
+### Implementation note
+Two helper paths needed:
+- `_warn()` — cosmetic tier: respects `--quiet` (suppressed), stdout or stderr
+- `_warn_security()` — security tier: ALWAYS prints, ALWAYS to stderr, ignores `--quiet`
+
+Decide a message's tier ONCE at the call site (don't re-derive ad hoc). When in
+doubt about whether something is security-relevant, it is — use the security tier.
+
+---
+
 ## Feature 1: Trust pinning config (`--set-cf`, `--add-trust`)
 
 ### New flags
@@ -110,7 +148,7 @@ Recognized fields:
 
 ### Startup warning
 If `trust-level` is `high` and BOTH trust lists (`trust.gpg` and `trust.ssh`) are empty,
-print `[WARN]` on invocation before any operation:
+print a security-tier `[WARN]` (always stderr) on invocation before any operation:
 ```
 [WARN] Trust level is HIGH but no keys are pinned. All signing will be refused.
        Use --add-trust or --set-cf to pin trusted fingerprints.
@@ -120,11 +158,11 @@ print `[WARN]` on invocation before any operation:
 - During `--verify`, if `--trust high` and a `signed_by` fingerprint in the manifest
   is not in the trust list → verification FAILS (not just warns)
 - Defends against key substitution attacks
-- If manifest has no `signed_by` field (pre-v0.8 manifest):
-  - Print `[WARN]` — old manifest format, trust cannot be evaluated
-  - Show hash/signature verification results
+- If manifest has no `signed_by` field (pre-v0.8 = schema_version 0):
+  - This is handled by the schema-version check (see Manifest schema versioning).
+  - Security-tier `[WARN]` (always stderr) — old manifest, trust cannot be evaluated
+  - Show hash/signature verification results (best-effort)
   - Prompt to continue if interactive; `--quiet` auto-continues
-  - Note: schema versioning will eventually enforce this (see Schema Versioning below)
 
 ### Exit code 3 — machine-readable
 Always fires even under `--quiet`. Always prints reason to stderr.
@@ -359,18 +397,53 @@ Output: `[WARN] Sig file(s) are writable: /path/to/file.sshsig`
 Note for Windows: `stat` permissions are limited; mention ACL check in message.
 
 ### Manifest schema versioning
-New field added to every manifest going forward:
+
+New top-level field on every manifest going forward:
 ```json
 "schema_version": 1
 ```
 
-On `--verify`:
-- Missing `schema_version` or tool version ≤ 0.7.2: old manifest path
-  1. `[WARN]` — old manifest format, trust cannot be evaluated
-  2. Verify hash integrity and signature validity normally
-  3. Prompt to continue if interactive; `--quiet` auto-continues
-- Future: breaking schema changes increment `schema_version`; old versions rejected with clear message
-- Treat "no schema_version key" as version 0 for forward compatibility
+`schema_version` is SEPARATE from the existing `version` field:
+- `version` → which build of rednb-verify wrote this (e.g. `"0.8.0"`) — informational
+- `schema_version` → structural contract of the manifest (integer) — enforced
+
+**Version assignment:**
+- Pre-v0.8 manifests have no `schema_version` → treated as **version 0**
+- All v0.8 additions (`signed_by`, `warnings`, `hashes` nested, `merkle_roots`,
+  `merkle_root_concat`) define **schema_version 1**
+- Current tool's max supported schema version is tracked as a constant
+  (e.g. `MANIFEST_SCHEMA_VERSION = 1`)
+
+**Bump policy (avoid over-bumping):**
+- Adding an OPTIONAL field → no bump (a v1 reader ignores unknown keys)
+- Renaming / removing a field, or changing a field's type or meaning → bump (1 → 2)
+
+**Verify behavior — three directions:**
+
+| Manifest schema vs tool max | Situation | Behavior |
+|---|---|---|
+| Equal | Normal | Verify normally |
+| Lower (or absent = 0) | Old manifest | Warn (security tier, stderr) + best-effort verify + interactive prompt; `--quiet` auto-continues |
+| Higher | Manifest from a NEWER tool | Refuse + exit 2, unless `--schema-ignore` |
+
+**Lower / version-0 (old manifest) path:**
+1. `[WARN]` (security tier — always stderr even under `--quiet`) — old manifest
+   format, trust cannot be evaluated
+2. Verify hash integrity and signature validity normally
+3. Prompt to continue if interactive; `--quiet` auto-continues (warning already
+   emitted to stderr)
+
+**Higher (newer manifest) path:**
+```
+[ERROR] Manifest schema version 2 is newer than this tool supports (max: 1).
+        Upgrade rednb-verify, or re-run with --schema-ignore to attempt anyway.
+```
+Exit 2. `--schema-ignore` downgrades this to a security-tier `[WARN]` and attempts
+verification anyway (best-effort, may produce false results — user's risk).
+
+**New flag: `--schema-ignore`**
+Bypasses the newer-manifest refusal. Attempts verification regardless of schema
+version. Prints a security-tier warning that results may be unreliable.
 
 ---
 
@@ -383,7 +456,8 @@ Split Arguments table into two sections:
 `-V/--version`, `--verify`, `--manifest-type`, `--report`, `--hash`, `--hash-list`,
 `--hash-merkle`, `--hash-merkle-concatenate`, `--gpg`, `--gpg-k`, `--ssh`,
 `--ssh-verify`, `--sig`, `--ssh-fido`, `--no-sign`, `--resign`, `--warn-age`,
-`-v/--verbose`, `--quiet`, `--exclude`, `--exclude-from`, `--trust`
+`-v/--verbose`, `--quiet`, `--exclude`, `--exclude-from`, `--trust`,
+`--schema-ignore`
 
 **Config management flags:**
 `--set-cf`, `--set-cf-run`, `--add-trust`, `--config-out`, `--no-config/--no-cf`, `--config`
