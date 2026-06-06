@@ -261,6 +261,34 @@ def _hexdigest(h, length: Optional[int]) -> str:
     return h.hexdigest(length) if length is not None else h.hexdigest()
 
 
+def _validate_algo_spec_or_exit(spec: str, label: str) -> tuple:
+    """Validate one algo spec against the registry; exit(2) with a clear message.
+
+    Returns (name, length) on success. Note: AVAILABLE_HASHES is defined just
+    below hash_file, so this is only called from main() after module load.
+    """
+    name, length = _parse_algo_spec(spec)
+    if name not in AVAILABLE_HASHES:
+        if name in _OPTIONAL_PIP:
+            _err(f"{label} {name!r} needs an optional package: "
+                 f"pip install {_OPTIONAL_PIP[name]}")
+        else:
+            _err(f"Unsupported algorithm for {label}: {spec!r}")
+        sys.exit(2)
+    if name in _VARIABLE_LENGTH_ALGOS and length is None:
+        _err(f"{name} requires a length: use {label} {name}:32")
+        sys.exit(2)
+    if name not in _VARIABLE_LENGTH_ALGOS and length is not None:
+        _err(f"{name} does not support a length parameter (remove :{length})")
+        sys.exit(2)
+    try:
+        _hexdigest(_new_hasher(name), length)
+    except TypeError as exc:
+        _err(f"Algorithm error for {label} {spec!r}: {exc}")
+        sys.exit(2)
+    return name, length
+
+
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -681,10 +709,15 @@ def ssh_verify_manifest(
 def collect_files(
     base: Path,
     month_only: bool,
-    algo: str,
+    algos: List[str],
     exclude: Optional[List[str]] = None,
     jobs: int = 1,
-) -> Dict[str, str]:
+) -> Dict[str, Dict[str, str]]:
+    """Hash files under base with one or more algorithms.
+
+    Returns {rel_path: {spec: hexdigest}}. Each file is hashed with every spec
+    in a single read pass (multi mode); a single-spec list yields a one-key dict.
+    """
     exclude = exclude or []
 
     # Gather candidate paths first (always sequential — os.walk is not thread-safe)
@@ -700,25 +733,21 @@ def collect_files(
                 continue
             paths_to_hash.append((path, rel_str))
 
-    files: Dict[str, str] = {}
+    files: Dict[str, Dict[str, str]] = {}
 
     if jobs == 1:
-        # Sequential — original behavior
         for path, rel_str in paths_to_hash:
+            t0 = time.perf_counter()
+            files[rel_str] = hash_file_multi(path, algos)
             if _verbose:
-                t0 = time.perf_counter()
-                files[rel_str] = hash_file(path, algo)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
-            else:
-                files[rel_str] = hash_file(path, algo)
     else:
-        # Parallel — print as each file completes when verbose
         _lock = threading.Lock()
 
         def _hash_one(path: Path, rel_str: str) -> tuple:
             t0 = time.perf_counter()
-            h = hash_file(path, algo)
+            h = hash_file_multi(path, algos)
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 with _lock:
@@ -737,15 +766,16 @@ def collect_files(
 
 def collect_files_per_day(
     base: Path,
-    algo: str,
+    algos: List[str],
     exclude: Optional[List[str]] = None,
     jobs: int = 1,
-) -> Dict[str, str]:
+) -> Dict[str, Dict[str, str]]:
     """Hash individual day entries within RedNotebook YYYY-MM.txt month files.
 
     Each entry is identified by path ``YYYY-MM/DD`` (e.g. ``2026-05/14``).
     Day content is serialised to canonical JSON before hashing so that all
-    fields (text, tags, custom categories) are captured.
+    fields (text, tags, custom categories) are captured. Returns
+    {day_key: {spec: hexdigest}} — multi-hashed like collect_files.
 
     Requires PyYAML (``pip install pyyaml``).
     """
@@ -772,9 +802,7 @@ def collect_files_per_day(
             day_key = f"{year_month}/{day_num:02d}"
             entries.append((day_key, content[day_num]))
 
-    files: Dict[str, str] = {}
-
-    _algo, _length = _parse_algo_spec(algo)
+    files: Dict[str, Dict[str, str]] = {}
 
     def _hash_day(day_key: str, day_data) -> tuple:
         # Canonicalise: dicts → sorted JSON; plain strings kept as-is
@@ -783,33 +811,32 @@ def collect_files_per_day(
         else:
             canonical = str(day_data) if day_data is not None else ""
         t0 = time.perf_counter()
-        h = hashlib.new(_algo, canonical.encode("utf-8"))
-        digest = _hexdigest(h, _length)
+        digests = hash_bytes_multi(canonical.encode("utf-8"), algos)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        return day_key, digest, elapsed_ms
+        return day_key, digests, elapsed_ms
 
     if jobs == 1:
         for day_key, day_data in entries:
-            key, h, elapsed_ms = _hash_day(day_key, day_data)
-            files[key] = h
+            key, digests, elapsed_ms = _hash_day(day_key, day_data)
+            files[key] = digests
             if _verbose:
                 _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
     else:
         _lock = threading.Lock()
 
         def _hash_day_parallel(day_key: str, day_data) -> tuple:
-            key, h, elapsed_ms = _hash_day(day_key, day_data)
+            key, digests, elapsed_ms = _hash_day(day_key, day_data)
             if _verbose:
                 with _lock:
                     _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
-            return key, h
+            return key, digests
 
         max_workers = jobs if jobs > 0 else None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_hash_day_parallel, k, d): k for k, d in entries}
             for future in as_completed(futures):
-                key, h = future.result()
-                files[key] = h
+                key, digests = future.result()
+                files[key] = digests
 
     return dict(sorted(files.items()))
 
@@ -817,21 +844,23 @@ def collect_files_per_day(
 def generate_manifest(
     notebook: Path,
     month_only: bool,
-    algo: str,
+    algos: List[str],
     merkle_algo: str,
     exclude: Optional[List[str]] = None,
     per_day: bool = False,
     jobs: int = 1,
 ) -> Dict:
+    algos = sorted(algos)          # alphabetical ordering throughout (man notes)
+    multi = len(algos) > 1
     day_count: Optional[int] = None  # None = not a per-day mode
     if per_day and not month_only:
         # per-day/full-tree: individual day entries + all non-month files.
         # Pass the YYYY-MM.txt glob to collect_files so month files are
         # never hashed twice and don't appear in verbose output.
         _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
-        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        day_files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
         other_files = collect_files(
-            notebook, False, algo,
+            notebook, False, algos,
             exclude=list(exclude) + [_MONTH_GLOB],
             jobs=jobs,
         )
@@ -840,22 +869,22 @@ def generate_manifest(
         mode = "per-day/full-tree"
     elif per_day and month_only:
         # per-day/month-only: individual day entries, no attachments
-        files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
         day_count = len(files)
         mode = "per-day/month-only"
     elif month_only:
         # month-only: whole YYYY-MM.txt files, no attachments
-        files = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
+        files = collect_files(notebook, True, algos, exclude=exclude, jobs=jobs)
         mode = "month-only"
     else:
         # full-tree: every file as-is
-        files = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
+        files = collect_files(notebook, False, algos, exclude=exclude, jobs=jobs)
         mode = "full-tree"
 
     # Collect creation-time warnings (recorded regardless of --quiet).
     warnings: List[str] = []
-    algo_name, _ = _parse_algo_spec(algo)
-    if algo_name in _WEAK_ALGOS:
+    weak_present = any(_parse_algo_spec(a)[0] in _WEAK_ALGOS for a in algos)
+    if weak_present and not multi:        # weak hash used ALONE
         warnings.append(WARN_WEAK_HASH)
     if exclude:
         warnings.append(WARN_EXCLUDED)
@@ -864,19 +893,35 @@ def generate_manifest(
     if day_count == 0:
         warnings.append(WARN_NO_DAYS)
 
-    hashes = list(files.values())
     manifest: Dict = {
         "tool": "rednb-verify",
         "version": VERSION,
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "created": utc_timestamp(),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "hash_algorithm": algo,
-        "merkle_hash": merkle_algo,
         "mode": mode,
-        "files": [{"path": p, algo: h} for p, h in files.items()],
-        "merkle_root": merkle_root(hashes, merkle_algo),
     }
+
+    if multi:
+        # files entry: {path, hashes: {algo: hex, ... alphabetical}}
+        manifest["hash_algorithm"] = algos
+        manifest["files"] = [
+            {"path": p, "hashes": {a: files[p][a] for a in algos}}
+            for p in files
+        ]
+        # one Merkle tree per algorithm: leaves = that algo's file hashes
+        manifest["merkle_roots"] = {
+            a: merkle_root([files[p][a] for p in files], a) for a in algos
+        }
+    else:
+        algo = algos[0]
+        manifest["hash_algorithm"] = algo
+        manifest["merkle_hash"] = merkle_algo
+        manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
+        manifest["merkle_root"] = merkle_root(
+            [files[p][algo] for p in files], merkle_algo
+        )
+
     if exclude:
         manifest["exclude"] = exclude
     if warnings:
@@ -893,33 +938,43 @@ def verify_manifest(
     jobs: int = 1,
 ) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"ok": [], "missing": [], "modified": [], "new": []}
-    algo = manifest.get("hash_algorithm", "sha256")
-    expected = {f["path"]: f[algo] for f in manifest["files"]}
+    ha = manifest.get("hash_algorithm", "sha256")
+    multi = isinstance(ha, list)
+    algos = sorted(ha) if multi else [ha]
+
+    # Normalise expected to {path: {algo: hash}} for both single and multi.
+    if multi:
+        expected = {f["path"]: dict(f["hashes"]) for f in manifest["files"]}
+    else:
+        expected = {f["path"]: {ha: f[ha]} for f in manifest["files"]}
+
     exclude = list(manifest.get("exclude", []))
     if extra_exclude:
         exclude.extend(extra_exclude)
     mode = manifest.get("mode", "full-tree")
     _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
     if mode == "per-day/full-tree":
-        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        day_files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
         other_files = collect_files(
-            notebook, False, algo,
+            notebook, False, algos,
             exclude=list(exclude) + [_MONTH_GLOB],
             jobs=jobs,
         )
         actual = dict(sorted({**day_files, **other_files}.items()))
     elif mode in ("per-day", "per-day/month-only"):
         # "per-day" kept for backward compatibility with v0.6.0 manifests
-        actual = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        actual = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
     elif mode in ("month-files", "month-only"):
         # "month-files" kept for backward compatibility with pre-v0.6.0 manifests
-        actual = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
+        actual = collect_files(notebook, True, algos, exclude=exclude, jobs=jobs)
     else:
-        actual = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
-    for path, h in expected.items():
+        actual = collect_files(notebook, False, algos, exclude=exclude, jobs=jobs)
+
+    # actual is {path: {algo: hash}}. A file is ok only if EVERY hash matches.
+    for path, exp in expected.items():
         if path not in actual:
             results["missing"].append(path)
-        elif actual[path] != h:
+        elif actual[path] != exp:
             results["modified"].append(path)
         else:
             results["ok"].append(path)
@@ -930,54 +985,97 @@ def verify_manifest(
 
 
 def _write_text_manifest(manifest: Dict) -> str:
-    """Serialise a manifest dict to human-readable text format."""
-    algo = manifest.get("hash_algorithm", "sha256")
+    """Serialise a manifest dict to human-readable text format (single or multi)."""
+    ha = manifest.get("hash_algorithm", "sha256")
+    multi = isinstance(ha, list)
+    algos = sorted(ha) if multi else [ha]
     lines = [
         "rednb-verify manifest",
         f"version: {manifest.get('version', VERSION)}",
         f"schema_version: {manifest.get('schema_version', MANIFEST_SCHEMA_VERSION)}",
         f"created: {manifest['created']}",
         f"date: {manifest['date']}",
-        f"hash_algorithm: {algo}",
-        f"merkle_hash: {manifest.get('merkle_hash', algo)}",
+        f"hash_algorithm: {', '.join(algos) if multi else ha}",
         f"mode: {manifest.get('mode', 'full-tree')}",
-        f"merkle_root: {manifest.get('merkle_root', '')}",
     ]
+    if not multi:
+        lines.insert(7, f"merkle_hash: {manifest.get('merkle_hash', ha)}")
     if manifest.get("exclude"):
         lines.append(f"exclude: {', '.join(manifest['exclude'])}")
     if manifest.get("warnings"):
         lines.append(f"warnings: {', '.join(manifest['warnings'])}")
+    # Merkle roots: single string, or a per-algo block (last header before files).
+    if multi:
+        lines.append("merkle_roots:")
+        for a in algos:
+            lines.append(f"         {a}: {manifest.get('merkle_roots', {}).get(a, '')}")
+    else:
+        lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
     lines += ["", "files:"]
     for i, entry in enumerate(manifest["files"], 1):
         lines.append(f"  {i:>5}. {entry['path']}")
-        lines.append(f"         {algo}: {entry[algo]}")
+        if multi:
+            for a in algos:
+                lines.append(f"         {a}: {entry['hashes'][a]}")
+        else:
+            lines.append(f"         {ha}: {entry[ha]}")
     return "\n".join(lines) + "\n"
 
 
 def _parse_text_manifest(text: str) -> Dict:
-    """Parse a text-format manifest back to a dict (same shape as JSON manifest)."""
+    """Parse a text-format manifest back to a dict (single or multi mode)."""
     import re as _re
-    manifest: Dict = {"files": []}
-    in_files = False
-    current_path: Optional[str] = None
+    manifest: Dict = {}
+    raw_files: List[Dict] = []      # [{"path":p, "_hashes":{algo:hash}}]
+    merkle_roots: Dict[str, str] = {}
+    section = "header"              # header → merkle_roots → files
+    current: Optional[Dict] = None
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("rednb-verify manifest"):
             continue
         if stripped == "files:":
-            in_files = True
+            section = "files"
             continue
-        if not in_files:
+        if stripped == "merkle_roots:":
+            section = "merkle_roots"
+            continue
+        if section == "header":
             if ": " in stripped:
                 key, _, val = stripped.partition(": ")
                 manifest[key.strip()] = val.strip()
-        else:
+        elif section == "merkle_roots":
+            if ": " in stripped:
+                a, _, root = stripped.partition(": ")
+                merkle_roots[a.strip()] = root.strip()
+        else:  # files
             m = _re.match(r"\d+\.\s+(.+)", stripped)
             if m:
-                current_path = m.group(1).strip()
-            elif ": " in stripped and current_path is not None:
-                algo, _, h = stripped.partition(": ")
-                manifest["files"].append({"path": current_path, algo.strip(): h.strip()})
+                current = {"path": m.group(1).strip(), "_hashes": {}}
+                raw_files.append(current)
+            elif ": " in stripped and current is not None:
+                a, _, h = stripped.partition(": ")
+                current["_hashes"][a.strip()] = h.strip()
+
+    # hash_algorithm: comma-separated → multi (list); single string otherwise.
+    ha = manifest.get("hash_algorithm", "sha256")
+    if isinstance(ha, str) and "," in ha:
+        algos = [a.strip() for a in ha.split(",") if a.strip()]
+        manifest["hash_algorithm"] = sorted(algos)
+        multi = True
+    else:
+        multi = False
+
+    files_out: List[Dict] = []
+    for rf in raw_files:
+        if multi:
+            files_out.append({"path": rf["path"], "hashes": rf["_hashes"]})
+        else:
+            files_out.append({"path": rf["path"], **rf["_hashes"]})
+    manifest["files"] = files_out
+    if multi:
+        manifest["merkle_roots"] = merkle_roots
+
     # exclude / warnings stored as comma-separated strings — convert to lists
     for _list_key in ("exclude", "warnings"):
         if _list_key in manifest and isinstance(manifest[_list_key], str):
@@ -1314,8 +1412,9 @@ supported hash algorithms:
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
                         help="Verification report format: txt (default) or json")
-    parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO",
-                        help="Hash algorithm for files (default: sha256)")
+    parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO[,ALGO...]",
+                        help="Hash algorithm(s) for files (default: sha256). Comma-separate "
+                             "for multi-hashing, e.g. sha256,blake2b")
     parser.add_argument("--hash-list", action="store_true",
                         help="Print available hash algorithms and exit")
     parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
@@ -1443,11 +1542,18 @@ supported hash algorithms:
     # --hash-list: print available algorithms and exit (no notebook_dir needed)
     if args.hash_list:
         print("Available hash algorithms:")
-        for algo in sorted(hashlib.algorithms_guaranteed):
+        for algo in sorted(AVAILABLE_HASHES):
             if algo in _VARIABLE_LENGTH_ALGOS:
                 print(f"  {algo}:<length>   (e.g. --hash {algo}:32)")
             else:
                 print(f"  {algo}")
+        # Mention optional algos that aren't installed
+        missing = [a for a in _OPTIONAL_PIP if a not in AVAILABLE_HASHES]
+        if missing:
+            print("\nOptional (not installed):")
+            for a in missing:
+                print(f"  {a}   (pip install {_OPTIONAL_PIP[a]})")
+        print("\nCombine with commas for multi-hashing, e.g. --hash sha256,blake2b")
         sys.exit(0)
 
     # notebook_dir: fall back to saved config "dir" when none given (Feature 1)
@@ -1474,26 +1580,25 @@ supported hash algorithms:
         else Path(os.path.expanduser("~/.ssh"))
     )
 
-    args.merkle_algo = args.merkle_algo or args.hash_algo
+    # --hash may carry multiple comma-separated algos (multi-hashing).
+    hash_algos = [a.strip() for a in args.hash_algo.split(",") if a.strip()]
+    if not hash_algos:
+        _err("--hash requires at least one algorithm.")
+        sys.exit(2)
+    for spec in hash_algos:
+        _validate_algo_spec_or_exit(spec, "--hash")
+    args.hash_algos = hash_algos
 
-    for label, spec in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
-        algo_name, algo_len = _parse_algo_spec(spec)
-        try:
-            h = hashlib.new(algo_name)
-        except ValueError:
-            _err(f"Unsupported algorithm for {label}: {spec!r}")
-            sys.exit(2)
-        if algo_name in _VARIABLE_LENGTH_ALGOS and algo_len is None:
-            _err(f"{algo_name} requires a length: use {label} {algo_name}:32")
-            sys.exit(2)
-        if algo_name not in _VARIABLE_LENGTH_ALGOS and algo_len is not None:
-            _err(f"{algo_name} does not support a length parameter (remove :{algo_len})")
-            sys.exit(2)
-        try:
-            _hexdigest(h, algo_len)
-        except TypeError as exc:
-            _err(f"Algorithm error for {label} {spec!r}: {exc}")
-            sys.exit(2)
+    args.merkle_algo = args.merkle_algo or hash_algos[0]
+    _validate_algo_spec_or_exit(args.merkle_algo, "--hash-merkle")
+
+    # Multi mode must include at least one strong hash (md5/sha1 not trusted alone).
+    multi = len(hash_algos) > 1
+    strong = [a for a in hash_algos if _parse_algo_spec(a)[0] not in _WEAK_ALGOS]
+    if multi and not strong:
+        _err("Multi-hashing needs at least one strong algorithm "
+             "alongside md5/sha1 (e.g. --hash sha256,md5).")
+        sys.exit(2)
 
     # Parse --sig
     sig_paths: List[Path] = (
@@ -1697,8 +1802,24 @@ supported hash algorithms:
     else:
         _mode_label = "full-tree"
     _vprint(f"Hashing ({_mode_label}): {args.notebook_dir}")
+
+    # Weak-hash-alone policy (single weak algo) — prompt unless -y/quiet (D2).
+    weak_specs = [a for a in args.hash_algos if _parse_algo_spec(a)[0] in _WEAK_ALGOS]
+    if weak_specs and not multi:
+        if not _quiet:
+            _warn(f"Weak hash in use alone: {', '.join(weak_specs)} — "
+                  "not collision-resistant.")
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    _err("Refusing to use a weak hash alone without confirmation "
+                         "(re-run with -y, or choose a strong hash).")
+                    sys.exit(2)
+                if input("Proceed with a weak hash? [y/N]: ").strip().lower() != "y":
+                    _info("Aborted.")
+                    sys.exit(2)
+
     manifest = generate_manifest(
-        args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo,
+        args.notebook_dir, args.month_only, args.hash_algos, args.merkle_algo,
         exclude=exclude,
         per_day=args.per_day,
         jobs=jobs,
