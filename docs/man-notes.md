@@ -464,6 +464,67 @@ Split Arguments table into two sections:
 
 ---
 
+## Review decisions (C/D/G) — finalized before implementation
+
+### C1. Trust check uses the VERIFIED key, not `signed_by`
+The trust comparison MUST use the fingerprint extracted from the actual
+cryptographic signature verification (`gpg --verify --status-fd`, or the SHA256
+fingerprint of the SSH pubkey that `ssh-keygen -Y verify` validated against).
+The manifest `signed_by` field is attacker-controllable text → it is a DISPLAY
+HINT ONLY, never the basis of a trust decision.
+
+### C2. Signing refactored into resolve-then-sign
+Key identity is resolved BEFORE the manifest is written:
+1. Resolve all signing identities (GPG fpr — including extracting it from a
+   `--gpg-k` keyfile via a pre-import pass; SSH pubkey fingerprint).
+2. Write `signed_by` into the manifest dict.
+3. Serialize + write the manifest file.
+4. Sign the finished file (GPG and/or SSH) over the bytes that already contain
+   `signed_by`, so every signature covers the full identity claim.
+
+### C3. `--resign` does NOT modify the manifest
+`--resign` adds detached signature(s) only; it never rewrites the manifest
+(which would invalidate any existing signatures). Therefore `--resign` does NOT
+update `signed_by` — that field reflects only the original signer(s). A
+resigner's identity lives in their detached signature file. (Option (a).)
+
+### D1. Verify-time trust failure → exit 1
+`--trust high` + manifest validly signed by an untrusted key during `--verify`
+→ exit **1** (verification found a problem) with a security-tier message.
+Exit 3 remains reserved for SIGNING refusal only.
+
+### D2. Confirmation prompts → `-y`/`--yes`
+- Interactive TTY + weak-hash-alone + non-quiet → print warning, prompt y/N
+- `-y`/`--yes` → print warning, proceed without prompting (automation-friendly)
+- Non-TTY + no `-y` + non-quiet → print warning, abort exit 2 (never hang, never
+  silently proceed)
+- `--quiet` → proceed silently (warning still recorded in manifest `warnings`)
+- `-y` also auto-confirms the GPG/SSH signing prompts.
+
+### D3. Fingerprint normalization for trust comparison
+- GPG: uppercase, strip all spaces, before both store and compare.
+- SSH: keep `SHA256:<base64>` verbatim (case-sensitive); compare exactly.
+
+### G-fills (filled gaps, no open question)
+- **G1. Text manifest multi-mode:** header `hash_algorithm: blake2b, sha256`
+  (comma-joined, alphabetical); parser splits on comma. Per-file: multiple
+  indented `algo: hash` lines grouped into a `hashes` dict. `merkle_roots` and
+  `merkle_root_concat` get their own header lines. Round-trip must be lossless.
+- **G2. `schema_version` header line** in text manifests; read by the
+  three-direction check.
+- **G3. `--config-out` alone** prints config as loaded from disk (`{}` if none),
+  NOT argparse defaults.
+- **G4. Empty notebook, multi mode:** `merkle_roots` = `{algo: "", ...}`.
+- **G5. `--set-cf` splits on FIRST colon only** (`str.partition(":")`); preserves
+  Windows drive colons in `dir:C:\path`.
+- **G6. `warnings` field at verify** shown as cosmetic tier (creation-time record).
+
+### New flags summary (this release)
+`--trust {high,low}`, `--schema-ignore`, `--hash-merkle-concatenate [ALGO]`,
+`--set-cf`, `--set-cf-run`, `--add-trust`, `--config-out`, `-y`/`--yes`.
+
+---
+
 ## Open items / deferred
 
 - Config schema versioning: deferred (format still moving). When added, treat
