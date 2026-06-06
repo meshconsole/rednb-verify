@@ -275,6 +275,61 @@ def hash_file(path: Path, algo_spec: str) -> str:
     return _hexdigest(h, length)
 
 
+# Optional hash backends beyond hashlib's guaranteed set. Each entry maps an
+# algorithm NAME to a zero-arg constructor returning an object with
+# .update(bytes) and .hexdigest(). Populated once at import time.
+AVAILABLE_HASHES: Dict[str, object] = {}
+for _algo in hashlib.algorithms_guaranteed:
+    # bind _algo per-iteration via default arg
+    AVAILABLE_HASHES[_algo] = (lambda a: (lambda: hashlib.new(a)))(_algo)
+try:
+    import blake3 as _blake3_mod
+    AVAILABLE_HASHES["blake3"] = _blake3_mod.blake3
+except ImportError:
+    pass
+try:
+    import xxhash as _xxhash_mod
+    AVAILABLE_HASHES["xxh3"] = _xxhash_mod.xxh3_128
+except ImportError:
+    pass
+
+# Known optional algorithms and the pip package that provides each.
+_OPTIONAL_PIP = {"blake3": "blake3", "xxh3": "xxhash"}
+
+
+def _new_hasher(name: str):
+    """Return a fresh hasher for an algorithm name, or None if unavailable."""
+    ctor = AVAILABLE_HASHES.get(name)
+    return ctor() if ctor is not None else None
+
+
+def hash_file_multi(path: Path, specs: List[str]) -> Dict[str, str]:
+    """Hash a file with N algorithms in a SINGLE read pass.
+
+    Returns {spec: hexdigest} keyed by the original spec string
+    (e.g. 'sha256', 'shake_128:32'). Caller is responsible for having
+    validated the specs.
+    """
+    parsed = [(spec, *_parse_algo_spec(spec)) for spec in specs]
+    hashers = {spec: _new_hasher(name) for spec, name, _ in parsed}
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            for h in hashers.values():
+                h.update(chunk)
+    return {spec: _hexdigest(hashers[spec], length) for spec, _, length in parsed}
+
+
+def hash_bytes_multi(data: bytes, specs: List[str]) -> Dict[str, str]:
+    """Hash an in-memory byte string with N algorithms. Returns {spec: hexdigest}."""
+    out: Dict[str, str] = {}
+    for spec in specs:
+        name, length = _parse_algo_spec(spec)
+        h = _new_hasher(name)
+        h.update(data)
+        out[spec] = _hexdigest(h, length)
+    return out
+
+
 def is_month_file(path: Path) -> bool:
     if path.suffix != ".txt":
         return False
