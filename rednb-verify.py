@@ -841,6 +841,17 @@ def collect_files_per_day(
     return dict(sorted(files.items()))
 
 
+def _concat_merkle_root(files: Dict[str, Dict[str, str]], algos: List[str],
+                        concat_algo: str) -> str:
+    """Merkle root where each leaf is the per-file concatenation (alphabetical
+    by algo) of all file-hash bytes, combined with concat_algo."""
+    leaves = []
+    for p in files:
+        blob = b"".join(bytes.fromhex(files[p][a]) for a in sorted(algos))
+        leaves.append(blob.hex())
+    return merkle_root(leaves, concat_algo)
+
+
 def generate_manifest(
     notebook: Path,
     month_only: bool,
@@ -849,6 +860,8 @@ def generate_manifest(
     exclude: Optional[List[str]] = None,
     per_day: bool = False,
     jobs: int = 1,
+    merkle_select: Optional[List[str]] = None,
+    concat_algo: Optional[str] = None,
 ) -> Dict:
     algos = sorted(algos)          # alphabetical ordering throughout (man notes)
     multi = len(algos) > 1
@@ -909,15 +922,25 @@ def generate_manifest(
             {"path": p, "hashes": {a: files[p][a] for a in algos}}
             for p in files
         ]
-        # one Merkle tree per algorithm: leaves = that algo's file hashes
+        # Field order: concatenated tree before individual trees (man notes).
+        if concat_algo:
+            manifest["merkle_root_concat"] = {
+                concat_algo: _concat_merkle_root(files, algos, concat_algo)
+            }
+        # Individual per-algo trees: selected subset, or all algos by default.
+        tree_algos = sorted(merkle_select) if merkle_select else algos
         manifest["merkle_roots"] = {
-            a: merkle_root([files[p][a] for p in files], a) for a in algos
+            a: merkle_root([files[p][a] for p in files], a) for a in tree_algos
         }
     else:
         algo = algos[0]
         manifest["hash_algorithm"] = algo
         manifest["merkle_hash"] = merkle_algo
         manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
+        if concat_algo:
+            manifest["merkle_root_concat"] = {
+                concat_algo: _concat_merkle_root(files, algos, concat_algo)
+            }
         manifest["merkle_root"] = merkle_root(
             [files[p][algo] for p in files], merkle_algo
         )
@@ -1004,11 +1027,14 @@ def _write_text_manifest(manifest: Dict) -> str:
         lines.append(f"exclude: {', '.join(manifest['exclude'])}")
     if manifest.get("warnings"):
         lines.append(f"warnings: {', '.join(manifest['warnings'])}")
-    # Merkle roots: single string, or a per-algo block (last header before files).
+    # Concatenated tree first (man notes), then individual trees / single root.
+    if manifest.get("merkle_root_concat"):
+        ca, croot = next(iter(manifest["merkle_root_concat"].items()))
+        lines.append(f"merkle_root_concat: {ca} {croot}")
     if multi:
         lines.append("merkle_roots:")
-        for a in algos:
-            lines.append(f"         {a}: {manifest.get('merkle_roots', {}).get(a, '')}")
+        for a in sorted(manifest.get("merkle_roots", {})):
+            lines.append(f"         {a}: {manifest['merkle_roots'][a]}")
     else:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
     lines += ["", "files:"]
@@ -1065,6 +1091,14 @@ def _parse_text_manifest(text: str) -> Dict:
         multi = True
     else:
         multi = False
+
+    # merkle_root_concat stored as "algo root" → {algo: root}
+    if isinstance(manifest.get("merkle_root_concat"), str):
+        parts = manifest["merkle_root_concat"].split(None, 1)
+        if len(parts) == 2:
+            manifest["merkle_root_concat"] = {parts[0]: parts[1]}
+        else:
+            del manifest["merkle_root_concat"]
 
     files_out: List[Dict] = []
     for rf in raw_files:
@@ -1418,7 +1452,14 @@ supported hash algorithms:
     parser.add_argument("--hash-list", action="store_true",
                         help="Print available hash algorithms and exit")
     parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
-                        help="Hash algorithm for Merkle tree (default: same as --hash)")
+                        metavar="ALGO[,ALGO...]",
+                        help="Merkle tree algorithm(s). Single mode: tree combiner "
+                             "(default: same as --hash). Multi mode: selects which "
+                             "per-algo trees to build (subset of --hash; default: all).")
+    parser.add_argument("--hash-merkle-concatenate", nargs="?", const="sha256",
+                        default=None, dest="merkle_concat", metavar="ALGO",
+                        help="Build one Merkle tree whose leaves are the per-file "
+                             "concatenation of all file hashes (default combiner: sha256).")
     parser.add_argument("--gpg", nargs="?", const="", default=None, metavar="FINGERPRINT",
                         help="Sign with GPG; optionally specify key fingerprint (skips menu)")
     parser.add_argument("--gpg-k", type=Path, default=None, metavar="FILE",
@@ -1589,9 +1630,6 @@ supported hash algorithms:
         _validate_algo_spec_or_exit(spec, "--hash")
     args.hash_algos = hash_algos
 
-    args.merkle_algo = args.merkle_algo or hash_algos[0]
-    _validate_algo_spec_or_exit(args.merkle_algo, "--hash-merkle")
-
     # Multi mode must include at least one strong hash (md5/sha1 not trusted alone).
     multi = len(hash_algos) > 1
     strong = [a for a in hash_algos if _parse_algo_spec(a)[0] not in _WEAK_ALGOS]
@@ -1599,6 +1637,27 @@ supported hash algorithms:
         _err("Multi-hashing needs at least one strong algorithm "
              "alongside md5/sha1 (e.g. --hash sha256,md5).")
         sys.exit(2)
+
+    # --hash-merkle: single mode = tree combiner; multi mode = tree selection.
+    args.merkle_select = None
+    if multi:
+        if args.merkle_algo:
+            sel = [a.strip() for a in args.merkle_algo.split(",") if a.strip()]
+            bad = [a for a in sel if a not in hash_algos]
+            if bad:
+                _err(f"--hash-merkle {', '.join(bad)} not in --hash set "
+                     f"({', '.join(hash_algos)}). In multi mode --hash-merkle "
+                     "selects which file-hash trees to build.")
+                sys.exit(2)
+            args.merkle_select = sel
+        args.merkle_algo = hash_algos[0]   # unused in multi; kept non-None
+    else:
+        args.merkle_algo = args.merkle_algo or hash_algos[0]
+        _validate_algo_spec_or_exit(args.merkle_algo, "--hash-merkle")
+
+    # --hash-merkle-concatenate: validate combiner algo if requested.
+    if args.merkle_concat:
+        _validate_algo_spec_or_exit(args.merkle_concat, "--hash-merkle-concatenate")
 
     # Parse --sig
     sig_paths: List[Path] = (
@@ -1823,6 +1882,8 @@ supported hash algorithms:
         exclude=exclude,
         per_day=args.per_day,
         jobs=jobs,
+        merkle_select=args.merkle_select,
+        concat_algo=args.merkle_concat,
     )
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
