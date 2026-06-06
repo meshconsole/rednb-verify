@@ -118,7 +118,14 @@ def _ok(msg: str) -> None:
 
 
 def _warn(msg: str) -> None:
-    print(f"{_tag('WARN')} {msg}")
+    """Cosmetic-tier warning: suppressed by --quiet."""
+    if not _quiet:
+        print(f"{_tag('WARN')} {msg}")
+
+
+def _warn_security(msg: str) -> None:
+    """Security-tier warning: ALWAYS printed, ALWAYS to stderr, ignores --quiet."""
+    print(f"{_tag('WARN', stream=sys.stderr)} {msg}", file=sys.stderr)
 
 
 def _err(msg: str) -> None:
@@ -139,6 +146,78 @@ def load_config(path: Path = CONFIG_PATH) -> Dict:
             print(f"{_tag('WARN', stream=sys.stderr)} Could not load config {path}: {exc}",
                   file=sys.stderr)
     return {}
+
+
+def save_config(config: Dict, path: Path = CONFIG_PATH) -> None:
+    """Write the config dict to disk as pretty JSON, creating parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=4, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+
+
+def _normalize_gpg_fpr(fpr: str) -> str:
+    """GPG fingerprints compared case-insensitively, spaces stripped (D3)."""
+    return fpr.replace(" ", "").upper()
+
+
+# --set-cf / --add-trust field → trust list key
+_CF_TRUST_FIELDS = {"trust-gpg": "gpg", "trust-ssh": "ssh"}
+
+
+def _parse_cf_token(token: str) -> tuple:
+    """Parse 'field:value[,value...]' → (field, [values]).
+
+    Splits on the FIRST colon only (G5), so dir:C:\\path keeps its drive colon.
+    Returns (field, None) if no colon is present.
+    """
+    field, sep, rest = token.partition(":")
+    if not sep:
+        return field.strip(), None
+    values = [v.strip() for v in rest.split(",") if v.strip()]
+    return field.strip(), values
+
+
+def apply_set_cf(config: Dict, tokens: List[str]) -> None:
+    """Apply --set-cf tokens to config in place (REPLACE semantics)."""
+    for token in tokens:
+        field, values = _parse_cf_token(token)
+        if values is None:
+            _err(f"--set-cf expects field:value, got: {token!r}")
+            sys.exit(2)
+        if field in _CF_TRUST_FIELDS:
+            kind = _CF_TRUST_FIELDS[field]
+            if kind == "gpg":
+                values = [_normalize_gpg_fpr(v) for v in values]
+            config.setdefault("trust", {})[kind] = list(dict.fromkeys(values))
+        elif field == "trust-level":
+            level = (values[0].lower() if values else "")
+            if level not in ("high", "low"):
+                _err(f"trust-level must be 'high' or 'low', got: {values!r}")
+                sys.exit(2)
+            config["trust_level"] = level
+        elif field == "dir":
+            config["dir"] = values[0]  # single path; last wins if repeated
+        else:
+            _err(f"Unknown --set-cf field: {field!r} "
+                 "(expected trust-gpg, trust-ssh, trust-level, dir)")
+            sys.exit(2)
+
+
+def apply_add_trust(config: Dict, tokens: List[str]) -> None:
+    """Apply --add-trust tokens to config in place (APPEND + de-dupe, order kept)."""
+    for token in tokens:
+        field, values = _parse_cf_token(token)
+        if values is None:
+            _err(f"--add-trust expects field:value, got: {token!r}")
+            sys.exit(2)
+        if field not in _CF_TRUST_FIELDS:
+            _err(f"--add-trust only supports trust-gpg / trust-ssh, got: {field!r}")
+            sys.exit(2)
+        kind = _CF_TRUST_FIELDS[field]
+        if kind == "gpg":
+            values = [_normalize_gpg_fpr(v) for v in values]
+        existing = config.get("trust", {}).get(kind, [])
+        config.setdefault("trust", {})[kind] = list(dict.fromkeys(existing + values))
 
 
 # ---------- Utilities ----------
@@ -1142,6 +1221,26 @@ supported hash algorithms:
                         help="Ignore ~/.config/rednb-verify/config.json for this run")
     parser.add_argument("--config", type=Path, metavar="FILE",
                         help="Load a specific config file instead of the default")
+    # --- Config management (Feature 1) ---
+    parser.add_argument("--set-cf", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="set_cf",
+                        help="Set a config field and exit (trust-gpg, trust-ssh, "
+                             "trust-level, dir). Repeatable. Replaces the field.")
+    parser.add_argument("--set-cf-run", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="set_cf_run",
+                        help="Like --set-cf but continue running after writing config.")
+    parser.add_argument("--add-trust", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="add_trust",
+                        help="Append fingerprints to a trust list (trust-gpg / trust-ssh), "
+                             "de-duplicated. Repeatable.")
+    parser.add_argument("--config-out", action="store_true", dest="config_out",
+                        help="Print the resulting config as JSON (after --set-cf/--add-trust).")
+    parser.add_argument("--trust", choices=("high", "low"), default=None,
+                        help="Signing trust level: high (only pinned keys) or low (default).")
+    parser.add_argument("--schema-ignore", action="store_true", dest="schema_ignore",
+                        help="Verify a manifest with a newer schema version anyway (risky).")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Assume yes to confirmation prompts (automation-friendly).")
 
     # Apply config file as default layer (CLI args override)
     cfg: Dict = {}
@@ -1176,6 +1275,25 @@ supported hash algorithms:
         _err("--quiet and --verbose are mutually exclusive.")
         sys.exit(2)
 
+    # ---- Config management (Feature 1): mutate config, optionally write & exit ----
+    _set_tokens = (args.set_cf or []) + (args.set_cf_run or [])
+    _add_tokens = args.add_trust or []
+    _mutates_config = bool(_set_tokens or _add_tokens)
+    if _mutates_config:
+        if _no_config:
+            _err("Cannot modify config while --no-config/--no-cf is set.")
+            sys.exit(2)
+        apply_set_cf(config, _set_tokens)
+        apply_add_trust(config, _add_tokens)
+        save_config(config, _config_path)
+        _ok(f"Config updated: {_config_path}")
+    if args.config_out:
+        # In-memory config after any mutation (G3: disk state if no mutation).
+        print(json.dumps(config, indent=4, ensure_ascii=False))
+    # --set-cf / --add-trust are write-only: exit unless --set-cf-run was used.
+    if (_mutates_config or args.config_out) and not args.set_cf_run:
+        sys.exit(0)
+
     # Notify user that a config file is in effect
     if _config_active:
         _info(f"Using config: {_config_path}")
@@ -1198,9 +1316,14 @@ supported hash algorithms:
                 print(f"  {algo}")
         sys.exit(0)
 
-    # notebook_dir required except for --resign and --hash-list
+    # notebook_dir: fall back to saved config "dir" when none given (Feature 1)
     if args.notebook_dir is None and not args.resign:
-        parser.error("notebook_dir is required")
+        saved_dir = config.get("dir")
+        if saved_dir:
+            args.notebook_dir = Path(os.path.expanduser(saved_dir))
+            _info(f"Using saved directory: {args.notebook_dir}")
+        else:
+            parser.error("notebook_dir is required")
 
     # --gpg-k implies --gpg
     if args.gpg_k is not None and args.gpg is None:
