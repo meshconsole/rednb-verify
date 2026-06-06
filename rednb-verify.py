@@ -687,21 +687,217 @@ def ssh_verify_manifest(
         warnings.append("SSH signature verified using a non-standard filename.")
     allowed_path = _write_allowed_signers(pub_path)
     try:
-        subprocess.run(
-            ["ssh-keygen", "-Y", "verify",
-             "-f", str(allowed_path),
-             "-I", SSH_SIGNER_IDENTITY,
-             "-n", SSH_NAMESPACE,
-             "-s", str(sig_path),
-             str(manifest_path)],
-            cwd=manifest_path.parent, check=True,
-            capture_output=True, text=True,
-        )
+        # `ssh-keygen -Y verify` reads the signed data from STDIN (not a
+        # positional argument), so feed the manifest file on stdin.
+        with manifest_path.open("rb") as data_in:
+            subprocess.run(
+                ["ssh-keygen", "-Y", "verify",
+                 "-f", str(allowed_path),
+                 "-I", SSH_SIGNER_IDENTITY,
+                 "-n", SSH_NAMESPACE,
+                 "-s", str(sig_path)],
+                stdin=data_in, cwd=manifest_path.parent, check=True,
+                capture_output=True, text=True,
+            )
     except subprocess.CalledProcessError:
         return SshVerifyResult("FAIL", "SSH signature verification failed.", warnings)
     finally:
         Path(allowed_path).unlink(missing_ok=True)
     return SshVerifyResult("OK", "SSH signature verified.", warnings)
+
+
+def ssh_key_fingerprint(pub_path: Path) -> Optional[str]:
+    """Return the SHA256:... fingerprint of an SSH public key, or None."""
+    if not ssh_keygen_available():
+        return None
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-lf", str(pub_path)],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    for token in result.stdout.split():
+        if token.startswith("SHA256:"):
+            return token
+    return None
+
+
+def gpg_verified_fingerprint(manifest: Path, signature: Path) -> Optional[str]:
+    """Return the primary-key fingerprint that produced a VALID gpg signature.
+
+    Uses --status-fd so the result is the cryptographically verified signer,
+    not anything self-declared (defends against key substitution, C1).
+    """
+    try:
+        result = subprocess.run(
+            ["gpg", "--verify", "--status-fd", "1",
+             str(signature.resolve()), str(manifest.resolve())],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        # [GNUPG:] VALIDSIG <fpr> <date> ...
+        if len(parts) >= 3 and parts[0] == "[GNUPG:]" and parts[1] == "VALIDSIG":
+            return _normalize_gpg_fpr(parts[2])
+    return None
+
+
+def gpg_fingerprint_from_keyfile(key_file: Path) -> Optional[str]:
+    """Import an armored GPG key into a temp homedir and return its fingerprint."""
+    tmp_home = Path(tempfile.mkdtemp(prefix="rednb-gpgfpr-"))
+    try:
+        os.chmod(tmp_home, 0o700)
+        subprocess.run(
+            ["gpg", "--homedir", str(tmp_home), "--import", str(key_file.resolve())],
+            check=True, capture_output=True,
+        )
+        result = subprocess.run(
+            ["gpg", "--homedir", str(tmp_home), "--list-secret-keys", "--with-colons"],
+            check=True, capture_output=True, text=True,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if parts[0] == "fpr":
+                return _normalize_gpg_fpr(parts[9])
+    except subprocess.CalledProcessError:
+        return None
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
+    return None
+
+
+# ---------- Trust ----------
+
+def resolve_trust_level(cli_trust: Optional[str], config: Dict) -> str:
+    """CLI --trust overrides config trust_level; default 'low'."""
+    return cli_trust or config.get("trust_level") or "low"
+
+
+def is_key_trusted(kind: str, fpr: str, config: Dict) -> bool:
+    """kind = 'gpg' | 'ssh'. GPG compared normalized; SSH compared verbatim (D3)."""
+    trusted = config.get("trust", {}).get(kind, [])
+    if kind == "gpg":
+        norm = _normalize_gpg_fpr(fpr)
+        return any(_normalize_gpg_fpr(t) == norm for t in trusted)
+    return fpr in trusted
+
+
+def trust_gate_signing(kind: str, fpr: Optional[str], trust_level: str,
+                       config: Dict) -> bool:
+    """Enforce trust policy before signing. Returns True to proceed.
+
+    high + untrusted → refuse (exit 3). low → always proceed, notify.
+    """
+    label = kind.upper()
+    if fpr is None:
+        # Can't determine the key's fingerprint.
+        if trust_level == "high":
+            _err(f"Cannot determine {label} key fingerprint — refusing to sign "
+                 "(--trust high).")
+            sys.exit(3)
+        _warn_security(f"Could not determine {label} key fingerprint; signing anyway "
+                       "(--trust low).")
+        return True
+    trusted = is_key_trusted(kind, fpr, config)
+    if trust_level == "high":
+        if not trusted:
+            _err(f"Untrusted {label} key {fpr} — refusing to sign (--trust high).")
+            sys.exit(3)
+        return True
+    # low
+    if trusted:
+        _info(f"{label} signing key is trusted: {fpr}")
+    else:
+        _warn_security(f"Signing with UNTRUSTED {label} key: {fpr}")
+    return True
+
+
+def trust_gate_verify(kind: str, fpr: Optional[str], trust_level: str,
+                      config: Dict) -> bool:
+    """At verify time, check the VERIFIED key against the trust list (C1).
+
+    Returns True if acceptable. Under --trust high, an untrusted/unknown signer
+    returns False (caller treats verification as failed → exit 1).
+    """
+    label = kind.upper()
+    if trust_level != "high":
+        return True
+    if fpr is None:
+        _warn_security(f"Could not extract {label} signer fingerprint to check trust.")
+        return False
+    if is_key_trusted(kind, fpr, config):
+        return True
+    _warn_security(f"VERIFIED {label} signature from UNTRUSTED key {fpr} "
+                   "(--trust high) — possible key substitution.")
+    return False
+
+
+# ---------- Randomart (fingerprint visualisation) ----------
+
+_RANDOMART_CHARS = " .o+=*BOX@%&#/^SE"  # 17 chars; 15=S (start), 16=E (end)
+
+
+def fingerprint_randomart(data: bytes, title: str = "") -> str:
+    """Drunken-Bishop ASCII art over raw bytes (Dirk Loss algorithm)."""
+    w, h = 17, 9
+    grid = [[0] * w for _ in range(h)]
+    x, y = w // 2, h // 2
+    for byte in data:
+        for shift in (0, 2, 4, 6):
+            move = (byte >> shift) & 3
+            x += -1 if move in (0, 2) else 1
+            y += -1 if move in (0, 1) else 1
+            x = max(0, min(w - 1, x))
+            y = max(0, min(h - 1, y))
+            grid[y][x] += 1
+    start = (h // 2, w // 2)
+    grid[start[0]][start[1]] = 15   # 'S'
+    grid[y][x] = 16                 # 'E'
+    top = f"+--[{title}]".ljust(w + 1, "-") + "+"
+    out = [top[: w + 2]]
+    for row in grid:
+        out.append("|" + "".join(_RANDOMART_CHARS[min(v, 16)] for v in row) + "|")
+    out.append("+" + "-" * w + "+")
+    return "\n".join(out)
+
+
+def show_randomart_ssh(pub_path: Path) -> None:
+    """Print SSH key randomart: native ssh-keygen -lv if available, else custom."""
+    if _quiet:
+        return
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-lv", "-f", str(pub_path)],
+            capture_output=True, text=True, check=True,
+        )
+        print(result.stdout.rstrip())
+        return
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    fpr = ssh_key_fingerprint(pub_path)
+    if fpr:
+        # Strip 'SHA256:' and base64-decode to bytes for the art.
+        import base64
+        b64 = fpr.split(":", 1)[1]
+        try:
+            raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+        except Exception:
+            raw = fpr.encode()
+        print(fingerprint_randomart(raw, "SSH"))
+
+
+def show_randomart_gpg(fpr: str) -> None:
+    """Print GPG fingerprint randomart (custom Drunken Bishop over fpr bytes)."""
+    if _quiet or not fpr:
+        return
+    try:
+        raw = bytes.fromhex(fpr)
+    except ValueError:
+        raw = fpr.encode()
+    print(fingerprint_randomart(raw, "GPG"))
 
 
 # ---------- Manifest ----------
@@ -1027,6 +1223,11 @@ def _write_text_manifest(manifest: Dict) -> str:
         lines.append(f"exclude: {', '.join(manifest['exclude'])}")
     if manifest.get("warnings"):
         lines.append(f"warnings: {', '.join(manifest['warnings'])}")
+    sb = manifest.get("signed_by", {})
+    if sb.get("gpg"):
+        lines.append(f"signed_by_gpg: {sb['gpg']}")
+    if sb.get("ssh"):
+        lines.append(f"signed_by_ssh: {sb['ssh']}")
     # Concatenated tree first (man notes), then individual trees / single root.
     if manifest.get("merkle_root_concat"):
         ca, croot = next(iter(manifest["merkle_root_concat"].items()))
@@ -1114,6 +1315,16 @@ def _parse_text_manifest(text: str) -> Dict:
     for _list_key in ("exclude", "warnings"):
         if _list_key in manifest and isinstance(manifest[_list_key], str):
             manifest[_list_key] = [e.strip() for e in manifest[_list_key].split(",") if e.strip()]
+    # signed_by reconstructed from signed_by_gpg / signed_by_ssh header lines
+    sb: Dict[str, str] = {}
+    _g = manifest.pop("signed_by_gpg", None)
+    _s = manifest.pop("signed_by_ssh", None)
+    if _g:
+        sb["gpg"] = _g
+    if _s:
+        sb["ssh"] = _s
+    if sb:
+        manifest["signed_by"] = sb
     # schema_version is numeric
     if "schema_version" in manifest:
         try:
@@ -1242,93 +1453,101 @@ How would you like to sign this manifest?
     return 4
 
 
-def _sign_with_gpg(
-    manifest_path: Path,
+def _confirm_sign(warning_box: str, prompt: str, yes: bool) -> bool:
+    """Show the non-repudiation warning and confirm. -y / --quiet auto-confirm."""
+    if _quiet or yes:
+        return True
+    print(warning_box)
+    return input(prompt).strip().lower() == "y"
+
+
+def resolve_gpg_signer(
     key_fpr: Optional[str],
     key_file: Optional[Path],
-) -> None:
-    """Sign with GPG. key_file uses armored export; key_fpr pre-selects keyring key."""
+    trust_level: str,
+    config: Dict,
+    yes: bool,
+) -> Optional[str]:
+    """Resolve a GPG signing fingerprint: randomart → trust gate → confirm.
+
+    Returns the fingerprint to sign with, or None if unavailable/cancelled.
+    May exit(3) under --trust high with an untrusted key.
+    """
     if not gpg_available():
         _warn("GPG not available — GPG signing skipped.")
-        return
+        return None
 
-    # --- Key file path (temp homedir, no keyring pollution) ---
     if key_file:
-        if not _quiet:
-            print(NON_REPUDIATION_WARNING)
-            if input("Sign with GPG key file? [y/N]: ").strip().lower() != "y":
-                _info("GPG signing cancelled.")
-                return
-        if _gpg_sign_with_keyfile(manifest_path, key_file):
-            _ok("Manifest signed with GPG.")
-        else:
-            _warn("GPG signing failed.")
-        return
-
-    # --- Keyring path ---
-    try:
-        keys = list_secret_keys()
-    except subprocess.CalledProcessError:
-        _warn("Could not list GPG keys.")
-        return
-    if not keys:
-        _warn("No GPG secret keys found — GPG signing skipped.")
-        return
-
-    if key_fpr:
-        fpr = key_fpr
-        if not _quiet:
-            print(NON_REPUDIATION_WARNING)
-            if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-                _info("GPG signing cancelled.")
-                return
-    elif _quiet:
-        if len(keys) == 1:
-            fpr = keys[0]["fingerprint"]
-        else:
-            _err("--quiet with --gpg requires a fingerprint when multiple keys exist.")
-            _err(f"        Use: --gpg {keys[0]['fingerprint']}")
-            sys.exit(2)
+        fpr = gpg_fingerprint_from_keyfile(key_file)
+        if not fpr:
+            _warn("Could not read GPG key file — GPG signing skipped.")
+            return None
     else:
-        print(NON_REPUDIATION_WARNING)
-        if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-            _info("GPG signing cancelled.")
-            return
-        fpr = choose_gpg_key(keys)
-        if fpr is None:
-            _info("GPG signing cancelled.")
-            return
+        try:
+            keys = list_secret_keys()
+        except subprocess.CalledProcessError:
+            _warn("Could not list GPG keys.")
+            return None
+        if not keys:
+            _warn("No GPG secret keys found — GPG signing skipped.")
+            return None
+        if key_fpr:
+            fpr = _normalize_gpg_fpr(key_fpr)
+        elif _quiet or yes:
+            if len(keys) == 1:
+                fpr = _normalize_gpg_fpr(keys[0]["fingerprint"])
+            else:
+                _err("--quiet/-y with --gpg needs a fingerprint when multiple keys exist.")
+                _err(f"        Use: --gpg {keys[0]['fingerprint']}")
+                sys.exit(2)
+        else:
+            sel = choose_gpg_key(keys)
+            if sel is None:
+                _info("GPG signing cancelled.")
+                return None
+            fpr = _normalize_gpg_fpr(sel)
 
-    if gpg_detach_sign(manifest_path, fpr):
-        _ok("Manifest signed with GPG.")
-    else:
-        _warn("GPG signing failed.")
+    show_randomart_gpg(fpr)
+    trust_gate_signing("gpg", fpr, trust_level, config)   # may exit(3)
+    if not _confirm_sign(NON_REPUDIATION_WARNING,
+                         "Sign this manifest with GPG? [y/N]: ", yes):
+        _info("GPG signing cancelled.")
+        return None
+    return fpr
 
 
-def _sign_with_ssh(
-    manifest_path: Path,
-    sig_path: Path,
+def resolve_ssh_signer(
     ssh_key_path: Path,
     prefer_fido: bool,
     keyname: Optional[str],
-) -> None:
-    """Sign manifest with SSH."""
+    trust_level: str,
+    config: Dict,
+    yes: bool,
+) -> Optional[SshKeyCandidate]:
+    """Resolve an SSH signing key: randomart → trust gate → confirm."""
     if not ssh_keygen_available():
         _warn("ssh-keygen not available — SSH signing skipped.")
-        return
-    signer = select_ssh_key(ssh_key_path, require_private=True, prefer_fido=prefer_fido, keyname=keyname)
+        return None
+    signer = select_ssh_key(ssh_key_path, require_private=True,
+                            prefer_fido=prefer_fido, keyname=keyname)
     if signer is None or signer.priv_path is None:
         _warn("No suitable SSH key found for signing.")
-        return
-    if not _quiet:
-        print(SSH_NON_REPUDIATION_WARNING)
-        if input("Sign this manifest with SSH? [y/N]: ").strip().lower() != "y":
-            _info("SSH signing cancelled.")
-            return
-    if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
-        _ok(f"SSH signature created: {sig_path.name}")
-    else:
-        _warn("SSH signing failed.")
+        return None
+    fpr = ssh_key_fingerprint(signer.pub_path)
+    show_randomart_ssh(signer.pub_path)
+    trust_gate_signing("ssh", fpr, trust_level, config)   # may exit(3)
+    if not _confirm_sign(SSH_NON_REPUDIATION_WARNING,
+                         "Sign this manifest with SSH? [y/N]: ", yes):
+        _info("SSH signing cancelled.")
+        return None
+    return signer
+
+
+def do_gpg_sign(manifest_path: Path, fpr: str, key_file: Optional[Path]) -> bool:
+    """Perform the GPG signature (keyfile via temp homedir, else keyring)."""
+    if key_file:
+        return _gpg_sign_with_keyfile(manifest_path, key_file)
+    return gpg_detach_sign(manifest_path, fpr)
 
 
 def main():
@@ -1614,6 +1833,15 @@ supported hash algorithms:
     if args.quiet and args.gpg is None and args.ssh is None:
         args.no_sign = True
 
+    # Resolve effective trust level (CLI > config > "low") and warn if mis-set.
+    trust_level = resolve_trust_level(args.trust, config)
+    if trust_level == "high":
+        _trust = config.get("trust", {})
+        if not _trust.get("gpg") and not _trust.get("ssh"):
+            _warn_security("Trust level is HIGH but no keys are pinned. "
+                           "All signing will be refused. "
+                           "Use --add-trust or --set-cf to pin fingerprints.")
+
     # Resolve SSH key location from --ssh argument (None → default ~/.ssh)
     ssh_key_path = (
         Path(os.path.expanduser(args.ssh))
@@ -1717,11 +1945,24 @@ supported hash algorithms:
             (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
             manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
         )
+        # C3: --resign never rewrites the manifest (would break existing sigs),
+        # so signed_by is not updated here.
         _ok(f"Re-signing: {manifest_path.name}")
         if want_gpg:
-            _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
+            fpr = resolve_gpg_signer(args.gpg or None, args.gpg_k, trust_level, config, args.yes)
+            if fpr:
+                if do_gpg_sign(manifest_path, fpr, args.gpg_k):
+                    _ok("Manifest signed with GPG.")
+                else:
+                    _warn("GPG signing failed.")
         if want_ssh:
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
+            signer = resolve_ssh_signer(ssh_key_path, prefer_fido, keyname,
+                                        trust_level, config, args.yes)
+            if signer:
+                if ssh_sign_manifest(manifest_path, signer.priv_path, ssh_sig_out):
+                    _ok(f"SSH signature created: {ssh_sig_out.name}")
+                else:
+                    _warn("SSH signing failed.")
         return
 
     # ------------------------------------------------------------------ #
@@ -1800,6 +2041,9 @@ supported hash algorithms:
             if args.ssh_verify and not ssh_sigs:
                 ssh_sigs = [auto_ssh]  # will report missing below
 
+        trust_failed = False  # C1: untrusted verified signer under --trust high
+        sig_invalid = False   # a present signature failed to verify
+
         # GPG verification
         if not gpg_sigs:
             _warn("Manifest not GPG-signed.")
@@ -1812,8 +2056,14 @@ supported hash algorithms:
                 else:
                     if gpg_verify(manifest_path, gpg_sig):
                         _ok(f"GPG signature verified: {gpg_sig.name}")
+                        v_fpr = gpg_verified_fingerprint(manifest_path, gpg_sig)
+                        if v_fpr:
+                            show_randomart_gpg(v_fpr)
+                        if not trust_gate_verify("gpg", v_fpr, trust_level, config):
+                            trust_failed = True
                     else:
                         _warn(f"GPG signature invalid: {gpg_sig.name}")
+                        sig_invalid = True
 
         # SSH verification
         for ssh_sig in ssh_sigs:
@@ -1836,13 +2086,24 @@ supported hash algorithms:
             )
             if result.status == "OK":
                 _ok(result.message)
+                show_randomart_ssh(signer.pub_path)
+                v_fpr = ssh_key_fingerprint(signer.pub_path)
+                if not trust_gate_verify("ssh", v_fpr, trust_level, config):
+                    trust_failed = True
             else:
                 _qprint(f"{_tag(result.status)} {result.message}")
+                sig_invalid = True
             for w in result.warnings:
                 _warn(w)
 
         if any(k != "ok" and results[k] for k in results):
             _warn("Verification completed with issues.")
+            sys.exit(1)
+        if sig_invalid:
+            _warn("Verification failed: a signature did not validate.")
+            sys.exit(1)
+        if trust_failed:
+            _warn("Verification failed trust check (untrusted signer).")
             sys.exit(1)
 
         _ok("Verification successful.")
@@ -1889,13 +2150,6 @@ supported hash algorithms:
     ext = ".json" if manifest_fmt == "json" else ".txt"
     manifest_name = f"hashes-{manifest['created']}{ext}"
     manifest_path = out_dir / manifest_name
-    if manifest_fmt == "json":
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    else:
-        manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
-    _ok(f"Manifest created: {manifest_path}")
 
     # SSH sig output path: from --sig if a .sshsig path given, else default
     ssh_sig_out = next(
@@ -1903,26 +2157,63 @@ supported hash algorithms:
         manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
     )
 
-    # ---- Signing ----
+    # ---- Decide signing methods ----
+    do_gpg = do_ssh = False
+    if args.no_sign:
+        pass
+    elif want_gpg or want_ssh:
+        do_gpg, do_ssh = want_gpg, want_ssh
+    else:
+        choice = _prompt_signing_menu()
+        do_gpg, do_ssh = choice in (1, 3), choice in (2, 3)
+
+    # ---- Resolve identities BEFORE writing (so signatures cover signed_by, C2) ----
+    gpg_fpr: Optional[str] = None
+    ssh_signer: Optional[SshKeyCandidate] = None
+    if do_gpg:
+        gpg_fpr = resolve_gpg_signer(args.gpg or None, args.gpg_k,
+                                     trust_level, config, args.yes)
+    if do_ssh:
+        ssh_signer = resolve_ssh_signer(ssh_key_path, prefer_fido, keyname,
+                                        trust_level, config, args.yes)
+
+    # ---- signed_by (C1: a display hint; trust at verify uses the verified key) ----
+    signed_by: Dict[str, str] = {}
+    if gpg_fpr:
+        signed_by["gpg"] = gpg_fpr
+    if ssh_signer:
+        _sfpr = ssh_key_fingerprint(ssh_signer.pub_path)
+        if _sfpr:
+            signed_by["ssh"] = _sfpr
+    if signed_by:
+        manifest["signed_by"] = signed_by
+    else:
+        manifest.setdefault("warnings", [])
+        if WARN_UNSIGNED not in manifest["warnings"]:
+            manifest["warnings"].append(WARN_UNSIGNED)
+
+    # ---- Write the manifest (now contains signed_by / UNSIGNED) ----
+    if manifest_fmt == "json":
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    else:
+        manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
+    _ok(f"Manifest created: {manifest_path}")
     if args.no_sign:
         _info("Signing skipped (--no-sign).")
 
-    elif want_gpg and want_ssh:
-        _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
-
-    elif want_gpg:
-        _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
-
-    elif want_ssh:
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
-
-    else:
-        sign_choice = _prompt_signing_menu()
-        if sign_choice in (1, 3):
-            _sign_with_gpg(manifest_path, key_fpr=None, key_file=None)
-        if sign_choice in (2, 3):
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
+    # ---- Sign the finished file ----
+    if gpg_fpr:
+        if do_gpg_sign(manifest_path, gpg_fpr, args.gpg_k):
+            _ok("Manifest signed with GPG.")
+        else:
+            _warn("GPG signing failed.")
+    if ssh_signer:
+        if ssh_sign_manifest(manifest_path, ssh_signer.priv_path, ssh_sig_out):
+            _ok(f"SSH signature created: {ssh_sig_out.name}")
+        else:
+            _warn("SSH signing failed.")
 
 
 if __name__ == "__main__":
