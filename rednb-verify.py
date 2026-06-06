@@ -46,7 +46,6 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -136,23 +135,6 @@ def _warn_security(msg: str) -> None:
 
 def _err(msg: str) -> None:
     print(f"{_tag('ERROR', stream=sys.stderr)} {msg}", file=sys.stderr)
-
-
-def check_sig_writable(sig_path: Path) -> None:
-    """Security-tier warning if a signature file is group/world-writable.
-
-    POSIX-only. On Windows, st_mode does not reflect real NTFS ACLs (every file
-    looks group/world-writable), so the check is skipped to avoid false alarms —
-    proper ACL inspection would require a non-stdlib dependency (pywin32).
-    """
-    if os.name == "nt":
-        return
-    try:
-        mode = sig_path.stat().st_mode
-    except OSError:
-        return
-    if mode & (stat.S_IWGRP | stat.S_IWOTH):
-        _warn_security(f"Sig file is group/world-writable: {sig_path}")
 
 
 # ---------- Config ----------
@@ -1092,7 +1074,6 @@ def _sign_with_gpg(
                 return
         if _gpg_sign_with_keyfile(manifest_path, key_file):
             _ok("Manifest signed with GPG.")
-            check_sig_writable(manifest_path.parent / f"{manifest_path.name}.asc")
         else:
             _warn("GPG signing failed.")
         return
@@ -1133,7 +1114,6 @@ def _sign_with_gpg(
 
     if gpg_detach_sign(manifest_path, fpr):
         _ok("Manifest signed with GPG.")
-        check_sig_writable(manifest_path.parent / f"{manifest_path.name}.asc")
     else:
         _warn("GPG signing failed.")
 
@@ -1160,7 +1140,6 @@ def _sign_with_ssh(
             return
     if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
         _ok(f"SSH signature created: {sig_path.name}")
-        check_sig_writable(sig_path)
     else:
         _warn("SSH signing failed.")
 
@@ -1614,7 +1593,6 @@ supported hash algorithms:
                 else:
                     if gpg_verify(manifest_path, gpg_sig):
                         _ok(f"GPG signature verified: {gpg_sig.name}")
-                        check_sig_writable(gpg_sig)
                     else:
                         _warn(f"GPG signature invalid: {gpg_sig.name}")
 
@@ -1639,7 +1617,6 @@ supported hash algorithms:
             )
             if result.status == "OK":
                 _ok(result.message)
-                check_sig_writable(ssh_sig)
             else:
                 _qprint(f"{_tag(result.status)} {result.message}")
             for w in result.warnings:
