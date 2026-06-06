@@ -209,7 +209,7 @@ render as `^`. Fixed in implementation with the 17-char string above.
 
 ---
 
-## Feature 4: Multi-hashing
+## Feature 4: Multi-hashing  — ✅ IMPLEMENTED (v0.8.0)
 
 ### Activation
 No new flag. Multi mode activates when `--hash` receives more than one
@@ -290,7 +290,17 @@ Same `hashes: {}` nested object format.
 
 ---
 
-## Feature 4a: Merkle tree in multi mode
+## Feature 4a: Merkle tree in multi mode  — ✅ IMPLEMENTED (v0.8.0)
+
+> Resolution of the spec ambiguity: a per-algo tree for algorithm X uses X's
+> per-file hashes as leaves and X as the combiner, so `--hash-merkle` in multi
+> mode must name a SUBSET of `--hash` algos (you can't build an X tree without
+> X leaf hashes). The "independent sha512 tree" idea from the original notes was
+> incoherent (no leaves) and is rejected with a clear error. The concatenated
+> tree's combiner CAN be any algo, since its leaves are concatenated bytes.
+> Note: verify compares per-file hashes (all-must-match); merkle roots are
+> recorded as a published fingerprint but not re-checked at verify (unchanged
+> from prior behavior).
 
 ### `--hash-merkle` (updated behavior)
 Now accepts N comma-separated algorithms, like `--hash`:
