@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.7.2 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
+**Version:** 0.8.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
 
 ---
 
@@ -73,11 +73,11 @@ python rednb-verify.py --resign hashes-20260528T120000Z.txt --gpg
 rednb-verify.py [options] [notebook_dir]
 ```
 
-### Arguments
+### Normal operation
 
 | Flag | Description |
 |---|---|
-| `notebook_dir` | Path to the RedNotebook journal directory |
+| `notebook_dir` | Path to the RedNotebook journal directory (optional if `dir` is saved in config) |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
 | `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
@@ -86,24 +86,37 @@ rednb-verify.py [options] [notebook_dir]
 | `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
 | `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
 | `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
-| `--hash ALGO[:LEN]` | Hash algorithm for files (default: `sha256`). `shake_128` and `shake_256` require a byte length: `--hash shake_128:32` |
-| `--hash-list` | Print available hash algorithms and exit |
-| `--hash-merkle ALGO` | Hash algorithm for the Merkle tree (default: same as `--hash`) |
+| `--hash ALGO[:LEN][,ALGO...]` | Hash algorithm(s) for files (default: `sha256`). Comma-separate for **multi-hashing** (e.g. `sha256,blake2b`). `shake_128`/`shake_256` require a byte length: `shake_128:32` |
+| `--hash-list` | Print available hash algorithms (incl. optional `blake3`/`xxh3`) and exit |
+| `--hash-merkle ALGO[,...]` | Single mode: Merkle tree combiner (default: same as `--hash`). Multi mode: selects which per-algo trees to build (subset of `--hash`) |
+| `--hash-merkle-concatenate [ALGO]` | Build one Merkle tree whose leaves are the per-file concatenation of all file hashes (default combiner: `sha256`) |
 | `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
 | `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
 | `--ssh [FILE_OR_DIR]` | Sign with SSH key; optionally specify a `.pub` file or directory to scan (default: `~/.ssh`) |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
-| `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`=SSH |
+| `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
 | `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
+| `--trust [high\|low]` | Signing trust level (default: `low`). `high` only allows pinned keys to sign and rejects untrusted signers at verify |
 | `--no-sign` | Skip all signing prompts |
-| `--resign FILE` | Re-sign an existing manifest without re-hashing (requires `--gpg` and/or `--ssh`) |
+| `--resign FILE` | Re-sign an existing manifest without re-hashing or rewriting it (requires `--gpg` and/or `--ssh`) |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
+| `--schema-ignore` | Verify a manifest whose schema is newer than this tool supports (risky) |
 | `-v`, `--verbose` | Print per-file hash timing and detailed progress |
-| `--quiet` | Suppress all non-error output; implies `--no-sign` unless a signing flag is given |
+| `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
+| `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
 | `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
 | `--exclude-from FILE` | File of glob patterns to exclude (one per line; `#` = comment) |
+
+### Config management
+
+| Flag | Description |
+|---|---|
+| `--set-cf FIELD:VALUE` | Set a config field and exit. Fields: `trust-gpg`, `trust-ssh`, `trust-level`, `dir`. Repeatable; **replaces** the field |
+| `--set-cf-run FIELD:VALUE` | Like `--set-cf` but continues running afterward |
+| `--add-trust FIELD:VALUE` | **Append** fingerprints to a trust list (`trust-gpg`/`trust-ssh`), de-duplicated |
+| `--config-out` | Print the resulting config as JSON (after applying `--set-cf`/`--add-trust`) |
 | `--no-config`, `--no-cf` | Ignore `~/.config/rednb-verify/config.json` for this run |
-| `--config FILE` | Load a specific config file instead of the default |
+| `--config FILE` | Load (and write, for `--set-cf`) a specific config file instead of the default |
 
 ### Examples
 
@@ -186,7 +199,7 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.7.1
+version: 0.8.0
 created: 20260528T120000Z
 date: 2026-05-28
 hash_algorithm: sha256
@@ -206,7 +219,7 @@ files:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "created": "20260528T120000Z",
   "date": "2026-05-28",
   "hash_algorithm": "sha256",
@@ -362,8 +375,64 @@ Modified:  0
 | Code | Meaning |
 |---|---|
 | `0` | All checks passed / manifest created successfully |
-| `1` | Verification found issues — modified, missing, or new files |
+| `1` | Verification found issues — modified/missing/new files, an invalid signature, or an untrusted signer under `--trust high` |
 | `2` | Usage or input error — bad arguments, missing files, unsupported algorithm |
+| `3` | Signing refused — untrusted key under `--trust high` |
+
+Exit codes always fire regardless of `--quiet`, and security-relevant warnings (untrusted key, old/unverifiable manifest) are always printed to stderr even in quiet mode. Routine notices (progress, "not signed") are suppressed by `--quiet`.
+
+---
+
+## Multi-Hashing
+
+Pass more than one comma-separated algorithm to `--hash` to record several independent hashes per file:
+
+```bash
+python rednb-verify.py ~/journal --hash sha256,blake2b
+```
+
+Each file is hashed with every algorithm in a single read pass. A file verifies as `ok` **only if every hash matches** — defending against a collision crafted for one algorithm. `md5` and `sha1` may never be used **alone** (you'll be prompted, or it's refused in automation), but they may appear alongside a strong hash.
+
+In multi mode the manifest stores `hash_algorithm` as a list and nests per-file hashes:
+
+```json
+{ "path": "2026-05.txt", "hashes": { "blake2b": "...", "sha256": "..." } }
+```
+
+**Merkle trees in multi mode:**
+- By default one tree is built per algorithm (`merkle_roots`).
+- `--hash-merkle sha256` selects a subset of those trees.
+- `--hash-merkle-concatenate [ALGO]` builds one extra tree whose leaves are the per-file concatenation of all hashes (`merkle_root_concat`).
+
+Optional faster/non-stdlib algorithms (`blake3`, `xxh3`) are used automatically if installed; `--hash-list` shows what's available and the `pip install` for what isn't.
+
+---
+
+## Trust & Signing
+
+`--trust` controls which keys may sign and which signers are accepted at verify:
+
+- **`low`** (default) — any key may sign; a notification is printed when the key isn't pinned.
+- **`high`** — only keys whose fingerprint is pinned in the config trust list may sign (others are refused, **exit 3**), and at verify time a valid signature from an unpinned key **fails** verification (exit 1) — defending against key substitution.
+
+Pin keys with the config-management flags:
+
+```bash
+# Pin a GPG fingerprint and an SSH key fingerprint
+python rednb-verify.py --add-trust trust-gpg:ABCDEF1234567890
+python rednb-verify.py --add-trust "trust-ssh:SHA256:abc123..."
+
+# Make high trust the default, and save a default journal directory
+python rednb-verify.py --set-cf trust-level:high
+python rednb-verify.py --set-cf dir:~/journal
+
+# Preview the resulting config without writing extra runs
+python rednb-verify.py --add-trust trust-gpg:ABCDEF --config-out
+```
+
+Before each signing or verification, the key's **fingerprint randomart** is shown (native `ssh-keygen` art for SSH, a Drunken-Bishop rendering for GPG) so you can eyeball-confirm the key out of band. The verified signer's fingerprint is also recorded in the manifest's `signed_by` field as a hint — but trust decisions always use the *cryptographically verified* key, never that field.
+
+> **Pin the maintainer fingerprint out of band.** To trust this project's own releases, obtain the maintainer's published key fingerprint from a separate channel (the project page) and pin it — don't trust a fingerprint that travels with the manifest.
 
 ---
 
@@ -381,11 +450,19 @@ Modified:  0
     "ssh_key": "~/.ssh/id_ed25519.pub",
     "exclude": ["*.tmp", ".~lock.*"],
     "manifest_age_warn_days": 90,
-    "jobs": 4
+    "jobs": 4,
+    "trust_level": "low",
+    "dir": "~/journal",
+    "trust": {
+        "gpg": ["FINGERPRINT1", "FINGERPRINT2"],
+        "ssh": ["SHA256:abc...", "SHA256:def..."]
+    }
 }
 ```
 
-A notification is printed when a config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file.
+A notification is printed when a config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file. The `--set-cf` / `--add-trust` flags edit this file for you (always the default file unless `--config` redirects). When `dir` is set, `notebook_dir` may be omitted on the command line.
+
+> **Shell quoting:** quotes are only needed when a value contains spaces. Comma-separate multiple values, e.g. `--set-cf trust-gpg:AB12,CD34`. Repeated flags avoid quotes entirely.
 
 ---
 

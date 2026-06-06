@@ -1,43 +1,57 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.7.2
+Version: 0.8.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
 
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
-"-m", "--month-only"       : Hashes only month files
-"-D", "--per-day"          : Hash individual day entries within month files (requires PyYAML)
-"-j", "--jobs N"           : Parallel hashing workers (0 = auto, default: 1)
-"-o", "--output"           : Output directory for manifest (default: journal parent)
-"--verify [FILE|DIR]"      : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
-"--manifest-type txt|json" : Manifest creation format (default: txt)
-"--report txt|json"        : Report format during --verify (default: txt)
-"--hash ALGO[:LEN]"        : Hash algorithm (default: sha256); shake_128/shake_256 require :LEN
-"--hash-list"              : Print available hash algorithms and exit
-"--hash-merkle"            : Hash algorithm for Merkle tree (default: same as --hash)
-"--gpg [FINGERPRINT]"      : Sign with GPG; optional fingerprint pre-selects key (skips menu)
-"--gpg-k FILE"             : GPG armored key file; implies --gpg
-"--ssh [FILE_OR_DIR]"      : Sign with SSH key; optional .pub file or directory to scan (default: ~/.ssh)
-"--ssh-verify"             : Force SSH signature check during --verify
-"--sig FILE[,FILE]"        : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
-"--ssh-fido [NAME]"        : Prefer FIDO2/hardware-backed SSH keys; optional name filter
-"--no-sign"                : Skip all signing
-"--resign MANIFEST"        : Re-sign an existing manifest (requires --gpg and/or --ssh)
-"--warn-age DAYS"          : Warn during verify if manifest is older than N days
-"--verbose / -v"           : Print per-file hash timing and detailed progress
-"--quiet"                  : Suppress non-error output; implies --no-sign unless signing is explicit
-"--exclude PATTERN"        : Exclude files matching glob (repeatable)
-"--exclude-from FILE"      : File of glob patterns to exclude (one per line, # = comment)
-"--no-config / --no-cf"    : Ignore ~/.config/rednb-verify/config.json for this run
-"--config FILE"            : Load a specific config file instead of the default
+
+Normal operation:
+"-m", "--month-only"          : Hashes only month files
+"-D", "--per-day"             : Hash individual day entries within month files (requires PyYAML)
+"-j", "--jobs N"              : Parallel hashing workers (0 = auto, default: 1)
+"-o", "--output"             : Output directory for manifest (default: journal parent)
+"-V", "--version"            : Print version and exit
+"--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
+"--manifest-type txt|json"    : Manifest creation format (default: txt)
+"--report txt|json"           : Report format during --verify (default: txt)
+"--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
+"--hash-list"                 : Print available hash algorithms and exit
+"--hash-merkle ALGO[,...]"    : Merkle algo (single: combiner; multi: select trees)
+"--hash-merkle-concatenate [ALGO]" : One tree over per-file concatenated hashes
+"--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
+"--gpg-k FILE"                : GPG armored key file; implies --gpg
+"--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
+"--ssh-verify"                : Force SSH signature check during --verify
+"--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
+"--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
+"--trust high|low"            : Signing trust level (default: low)
+"--no-sign"                   : Skip all signing
+"--resign MANIFEST"           : Re-sign an existing manifest (requires --gpg and/or --ssh)
+"--warn-age DAYS"             : Warn during verify if manifest is older than N days
+"--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
+"-v", "--verbose"            : Print per-file hash timing and detailed progress
+"--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
+"-y", "--yes"                : Assume yes to confirmation prompts
+"--exclude PATTERN"           : Exclude files matching glob (repeatable)
+"--exclude-from FILE"         : File of glob patterns to exclude (one per line, # = comment)
+
+Config management:
+"--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
+"--set-cf-run FIELD:VALUE"    : Like --set-cf but continue running
+"--add-trust FIELD:VALUE"     : Append fingerprints to a trust list (de-duplicated)
+"--config-out"                : Print the resulting config as JSON
+"--no-config / --no-cf"       : Ignore ~/.config/rednb-verify/config.json for this run
+"--config FILE"               : Load a specific config file instead of the default
 
 Exit codes:
   0  all checks passed / manifest created successfully
-  1  verification found issues (modified, missing, or unexpected files)
+  1  verification found issues (modified/missing/new files, invalid or untrusted signature)
   2  usage or input error (bad arguments, missing files, unsupported algorithm)
+  3  signing refused (untrusted key under --trust high)
 """
 
 import argparse
@@ -1638,8 +1652,9 @@ examples:
 
 exit codes:
   0  all checks passed / manifest created successfully
-  1  verification found issues (modified, missing, or unexpected files)
+  1  verification found issues (modified/missing/new files, invalid or untrusted signature)
   2  usage or input error (bad arguments, missing files, unsupported algorithm)
+  3  signing refused (untrusted key under --trust high)
 
 supported hash algorithms:
   sha256 (default), sha512, sha3_256, sha3_512, blake2b, blake2s ...

@@ -64,7 +64,7 @@ doubt about whether something is security-relevant, it is — use the security t
 
 ---
 
-## Feature 1: Trust pinning config (`--set-cf`, `--add-trust`)
+## Feature 1: Trust pinning config (`--set-cf`, `--add-trust`)  — ✅ IMPLEMENTED (v0.8.0)
 
 ### New flags
 
@@ -124,7 +124,7 @@ Recognized fields:
 
 ---
 
-## Feature 2: Signing trust levels (`--trust`)
+## Feature 2: Signing trust levels (`--trust`)  — ✅ IMPLEMENTED (v0.8.0)
 
 ### New flag
 
@@ -177,7 +177,14 @@ esac
 
 ---
 
-## Feature 3: Fingerprint randomart display
+## Feature 3: Fingerprint randomart display  — ✅ IMPLEMENTED (v0.8.0)
+
+> Implementation notes: SSH uses native `ssh-keygen -lv` when available, else a
+> custom Drunken Bishop over the base64-decoded SHA256 fingerprint. GPG always
+> uses the custom renderer over the hex fingerprint bytes. Shown before the
+> non-repudiation box at signing and after a valid signature at verify. The C1
+> rule holds: the verified key (not `signed_by`) drives trust; randomart is a
+> human-confirmation aid only.
 
 ### Behavior
 - Shown **before** the non-repudiation warning box and signing prompt
@@ -451,7 +458,16 @@ version. Prints a security-tier warning that results may be unreliable.
 
 ---
 
-## README reorganization (from spec)
+## README reorganization (from spec)  — ✅ IMPLEMENTED (v0.8.0)
+
+> Done: flags split into "Normal operation" and "Config management" tables;
+> added Multi-Hashing, Trust & Signing sections; exit code 3 documented;
+> config example extended with trust/dir/trust_level; maintainer-fingerprint
+> out-of-band pinning note; shell-quoting note. Also fixed two pre-existing
+> bugs during implementation: (1) `ssh-keygen -Y verify` reads data from STDIN
+> (was passing the manifest as an ignored positional arg → SSH verification
+> always failed silently); (2) an invalid/failed signature now fails
+> verification (exit 1) instead of reporting success.
 
 Split Arguments table into two sections:
 
