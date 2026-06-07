@@ -1564,6 +1564,16 @@ def do_gpg_sign(manifest_path: Path, fpr: str, key_file: Optional[Path]) -> bool
     return gpg_detach_sign(manifest_path, fpr)
 
 
+class ConciseArgumentParser(argparse.ArgumentParser):
+    """On a usage error, print a short message + hint instead of the full usage
+    block (the industry-standard pattern: `git`, `ls`, `cargo`, …)."""
+
+    def error(self, message: str):
+        _err(message)
+        sys.stderr.write(f"See '{self.prog} --help' for usage.\n")
+        sys.exit(2)
+
+
 def main():
     global _quiet, _verbose
 
@@ -1582,7 +1592,7 @@ def main():
     config = {} if _no_config else load_config(_config_path)
     _config_active = bool(config)
 
-    parser = argparse.ArgumentParser(
+    parser = ConciseArgumentParser(
         description="rednb-verify — RedNotebook integrity and tamper detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
