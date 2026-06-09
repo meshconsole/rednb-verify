@@ -86,6 +86,7 @@ rednb-verify.py [options] [notebook_dir]
 | `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
 | `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
 | `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
+| `--no-bullets` | In a `txt` manifest, don't prefix per-file hash lines with `- ` (Merkle-root lines are never bulleted) |
 | `--hash ALGO[:LEN][,ALGO...]` | Hash algorithm(s) for files (default: `sha256`). Comma-separate for **multi-hashing** (e.g. `sha256,blake2b`). `shake_128`/`shake_256` require a byte length: `shake_128:32` |
 | `--hash-list` | Print available hash algorithms (incl. optional `blake3`/`xxh3`) and exit |
 | `--hash-merkle ALGO[,...]` | Single mode: Merkle tree combiner (default: same as `--hash`). Multi mode: selects which per-algo trees to build (subset of `--hash`) |
@@ -94,6 +95,7 @@ rednb-verify.py [options] [notebook_dir]
 | `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
 | `--ssh [FILE_OR_DIR]` | Sign with SSH key; optionally specify a `.pub` file or directory to scan (default: `~/.ssh`) |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
+| `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
 | `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
 | `--trust [high\|low]` | Signing trust level (default: `low`). `high` only allows pinned keys to sign and rejects untrusted signers at verify |
@@ -105,7 +107,7 @@ rednb-verify.py [options] [notebook_dir]
 | `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
 | `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
 | `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
-| `--exclude-from FILE` | File of glob patterns to exclude (one per line; `#` = comment) |
+| `--exclude-from FILE` | File of glob patterns to exclude — one literal pattern per line. No comment syntax: a journal filename may legitimately start with `#` |
 
 ### Config management
 
@@ -209,10 +211,12 @@ merkle_root: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
 
 files:
       1. 2026-05.txt
-         sha256: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
+         - sha256: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
       2. pexels-photo.jpg
-         sha256: a3f1bc8e0d2741c59930cf5a29e4b87d3e1092f54c8d70a1e3b29d84c7f02e11
+         - sha256: a3f1bc8e0d2741c59930cf5a29e4b87d3e1092f54c8d70a1e3b29d84c7f02e11
 ```
+
+Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines are not. Use `--no-bullets` to omit the bullets.
 
 ### JSON format (`--manifest-type json`)
 
@@ -368,6 +372,25 @@ Modified:  0
 - `modified` — files whose hash has changed
 - `new` — files present in the notebook not tracked by the manifest
 
+### Verdict lines
+
+After writing the report, `--verify` prints a single terminal verdict:
+
+| Line | Meaning | Exit |
+|---|---|---|
+| `[OK] Verification successful` | Hashes intact; the manifest is either authentically signed or honestly declares itself unsigned | `0` |
+| `[FAIL] X Missing, N Modified, Z New/Moved, K/T OK` | One or more files changed (`K/T` = matching/expected files) | `1` |
+| `[FAIL] Manifest failed Signature` | A signature is present but did not validate (tampering) | `1` |
+| `[FAIL] Untrusted signer (--trust high)` | Signature valid, but the signer is not pinned in your trust list | `1` |
+| `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
+| `[WARN] Verification completed with issues` | Hashes intact, but the manifest implies a signature that could not be established | `1` |
+
+**Integrity vs. authenticity.** Plain `--verify` checks *both* that files are unchanged **and** — when the manifest implies it is signed — that a valid signature establishes authenticity. How a manifest verifies depends on what it declares about itself:
+
+- **The manifest declares itself unsigned** (it was created without signing). `--verify` checks integrity only, prints `[WARN] Manifest note: MANIFEST UNSIGNED`, and returns `0` when the hashes match. No signature is expected.
+- **The manifest implies a signature** (it does *not* carry the unsigned marker) but no valid signature is provided. `--verify` prints `[WARN] Verification completed with issues` and returns `1` — the files are intact, but the authenticity the manifest claims could not be confirmed.
+- **You want integrity only, regardless of what the manifest declares.** Add **`--ignore-sig`** to `--verify`. It skips all signature checks and returns `0` when the hashes match — useful when you have the signed manifest but not its signature file, or simply don't care who signed it.
+
 ---
 
 ## Exit Codes
@@ -375,11 +398,11 @@ Modified:  0
 | Code | Meaning |
 |---|---|
 | `0` | All checks passed / manifest created successfully |
-| `1` | Verification found issues — modified/missing/new files, an invalid signature, or an untrusted signer under `--trust high` |
+| `1` | Verification found issues — modified/missing/new files, an invalid signature, an untrusted signer under `--trust high`, a missing signature or algorithm, or authenticity that could not be established (see [Verdict lines](#verdict-lines)) |
 | `2` | Usage or input error — bad arguments, missing files, unsupported algorithm |
 | `3` | Signing refused — untrusted key under `--trust high` |
 
-Exit codes always fire regardless of `--quiet`, and security-relevant warnings (untrusted key, old/unverifiable manifest) are always printed to stderr even in quiet mode. Routine notices (progress, "not signed") are suppressed by `--quiet`.
+Exit codes always fire regardless of `--quiet`, and security-relevant warnings (untrusted key, old/unverifiable manifest) are always printed to stderr even in quiet mode. Routine notices (progress, "signing skipped") are suppressed by `--quiet`.
 
 ---
 
@@ -549,6 +572,7 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 - `--json` output mode (structured JSON on stdout for piping and scripting)
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
 - RedNotebook UI integration
+- **rednb-verify-config** — GUI config editor (desktop app for managing `~/.config/rednb-verify/config.json`, trusted keys, and saved paths without touching the CLI)
 
 ---
 

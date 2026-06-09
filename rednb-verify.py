@@ -18,6 +18,7 @@ Normal operation:
 "--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
 "--report txt|json"           : Report format during --verify (default: txt)
+"--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
 "--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
 "--hash-list"                 : Print available hash algorithms and exit
 "--hash-merkle ALGO[,...]"    : Merkle algo (single: combiner; multi: select trees)
@@ -26,6 +27,7 @@ Normal operation:
 "--gpg-k FILE"                : GPG armored key file; implies --gpg
 "--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
 "--ssh-verify"                : Force SSH signature check during --verify
+"--ignore-sig"                : Verify integrity only; skip all signature checks
 "--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
 "--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
 "--trust high|low"            : Signing trust level (default: low)
@@ -37,7 +39,7 @@ Normal operation:
 "--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
 "-y", "--yes"                : Assume yes to confirmation prompts
 "--exclude PATTERN"           : Exclude files matching glob (repeatable)
-"--exclude-from FILE"         : File of glob patterns to exclude (one per line, # = comment)
+"--exclude-from FILE"         : File of glob patterns to exclude (one literal pattern per line)
 
 Config management:
 "--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
@@ -103,7 +105,8 @@ def _require_yaml():
         import yaml  # type: ignore
         return yaml
     except ImportError:
-        print(f"{_tag('ERROR')} --per-day requires PyYAML:  pip install pyyaml")
+        _err("--per-day needs PyYAML, which is not installed.")
+        _err("        Install it with:  pip install pyyaml")
         sys.exit(2)
 
 
@@ -115,6 +118,7 @@ _ANSI: Dict[str, str] = {
     "INFO":  "\033[33m",   # yellow
     "OK":    "\033[97m",   # bright white
     "WARN":  "\033[91m",   # light red
+    "FAIL":  "\033[91m",   # light red
     "ERROR": "\033[91m",   # light red
 }
 
@@ -1217,8 +1221,13 @@ def verify_manifest(
     return results
 
 
-def _write_text_manifest(manifest: Dict) -> str:
-    """Serialise a manifest dict to human-readable text format (single or multi)."""
+def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
+    """Serialise a manifest dict to human-readable text format (single or multi).
+
+    When ``bullets`` is True (default), per-file hash lines are prefixed with
+    '- ' for readability.  Merkle-root lines are never bulleted (they are
+    summary values, not list items).
+    """
     ha = manifest.get("hash_algorithm", "sha256")
     multi = isinstance(ha, list)
     algos = sorted(ha) if multi else [ha]
@@ -1252,14 +1261,15 @@ def _write_text_manifest(manifest: Dict) -> str:
             lines.append(f"         {a}: {manifest['merkle_roots'][a]}")
     else:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
+    bullet = "- " if bullets else ""
     lines += ["", "files:"]
     for i, entry in enumerate(manifest["files"], 1):
         lines.append(f"  {i:>5}. {entry['path']}")
         if multi:
             for a in algos:
-                lines.append(f"         {a}: {entry['hashes'][a]}")
+                lines.append(f"         {bullet}{a}: {entry['hashes'][a]}")
         else:
-            lines.append(f"         {ha}: {entry[ha]}")
+            lines.append(f"         {bullet}{ha}: {entry[ha]}")
     return "\n".join(lines) + "\n"
 
 
@@ -1294,9 +1304,12 @@ def _parse_text_manifest(text: str) -> Dict:
             if m:
                 current = {"path": m.group(1).strip(), "_hashes": {}}
                 raw_files.append(current)
-            elif ": " in stripped and current is not None:
-                a, _, h = stripped.partition(": ")
-                current["_hashes"][a.strip()] = h.strip()
+            else:
+                # Tolerate an optional '- ' bullet prefix on hash lines.
+                h_line = stripped[2:] if stripped.startswith("- ") else stripped
+                if ": " in h_line and current is not None:
+                    a, _, h = h_line.partition(": ")
+                    current["_hashes"][a.strip()] = h.strip()
 
     # hash_algorithm: comma-separated → multi (list); single string otherwise.
     ha = manifest.get("hash_algorithm", "sha256")
@@ -1690,6 +1703,8 @@ supported hash algorithms:
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
                         help="Verification report format: txt (default) or json")
+    parser.add_argument("--no-bullets", action="store_true", dest="no_bullets",
+                        help="Text manifest: don't prefix per-file hash lines with '- '")
     parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO[,ALGO...]",
                         help="Hash algorithm(s) for files (default: sha256). Comma-separate "
                              "for multi-hashing, e.g. sha256,blake2b")
@@ -1713,6 +1728,9 @@ supported hash algorithms:
                              "to scan (default: ~/.ssh)")
     parser.add_argument("--ssh-verify", action="store_true",
                         help="Force SSH signature check during --verify")
+    parser.add_argument("--ignore-sig", action="store_true", dest="ignore_sig",
+                        help="During --verify, check integrity only and skip all "
+                             "signature checks (returns 0 when hashes match)")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
                         help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
@@ -1730,7 +1748,7 @@ supported hash algorithms:
     parser.add_argument("--exclude", action="append", metavar="PATTERN",
                         help="Exclude files matching glob pattern (repeatable)")
     parser.add_argument("--exclude-from", type=Path, default=None, metavar="FILE",
-                        help="File of glob patterns to exclude (one per line, # = comment)")
+                        help="File of glob patterns to exclude (one literal pattern per line)")
     parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
                         help="Parallel hashing workers (0 = auto, default: 1)")
     parser.add_argument("-D", "--per-day", action="store_true",
@@ -1928,9 +1946,11 @@ supported hash algorithms:
         if not excf.exists():
             _err(f"--exclude-from file not found: {excf}")
             sys.exit(2)
+        # Each non-blank line is a literal glob pattern. No comment syntax:
+        # a journal file may legitimately start with '#'.
         for raw_line in excf.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
-            if line and not line.startswith("#"):
+            if line:
                 exclude.append(line)
         _vprint(f"{_tag('INFO')} Loaded exclusion patterns from {excf.name}")
 
@@ -1977,9 +1997,9 @@ supported hash algorithms:
             fpr = resolve_gpg_signer(args.gpg or None, args.gpg_k, trust_level, config, args.yes)
             if fpr:
                 if do_gpg_sign(manifest_path, fpr, args.gpg_k):
-                    _ok("Manifest signed with GPG.")
+                    _ok("Manifest signed with GPG")
                 else:
-                    _warn("GPG signing failed.")
+                    _warn("GPG signing failed")
         if want_ssh:
             signer = resolve_ssh_signer(ssh_key_path, prefer_fido, keyname,
                                         trust_level, config, args.yes)
@@ -1987,7 +2007,7 @@ supported hash algorithms:
                 if ssh_sign_manifest(manifest_path, signer.priv_path, ssh_sig_out):
                     _ok(f"SSH signature created: {ssh_sig_out.name}")
                 else:
-                    _warn("SSH signing failed.")
+                    _warn("SSH signing failed")
         return
 
     # ------------------------------------------------------------------ #
@@ -2043,95 +2063,142 @@ supported hash algorithms:
             except (KeyError, ValueError):
                 pass
 
+        # ---- Fail fast if the manifest uses an algorithm this build cannot
+        #      compute. Verifying only a subset would give false confidence. ----
+        _ha = manifest.get("hash_algorithm", "sha256")
+        _algos_used = _ha if isinstance(_ha, list) else [_ha]
+        _missing_algos: List[str] = []
+        for _spec in _algos_used:
+            _name = _parse_algo_spec(_spec)[0]
+            if _name not in AVAILABLE_HASHES and _name not in _missing_algos:
+                _missing_algos.append(_name)
+        if _missing_algos:
+            _hint = ", ".join(
+                f"{a} (pip install {_OPTIONAL_PIP[a]})" if a in _OPTIONAL_PIP else a
+                for a in _missing_algos
+            )
+            _qprint(f"{_tag('WARN')} Missing Algorithms: {_hint}")
+            sys.exit(1)
+
         results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
         write_report(results, report_path, manifest_path)
-        _ok(f"Verification report: {report_path}")
+        _info(f"Verification report: {report_path}")
 
-        # Resolve signature files
-        _SSH_EXTS = (".sshsig", ".sig")
-        if sig_paths:
-            gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
-            ssh_sigs = [p for p in sig_paths if p.suffix in _SSH_EXTS]
-            for p in sig_paths:
-                if p.suffix not in (".asc",) + _SSH_EXTS:
-                    _warn(f"Unknown signature type '{p.name}' — skipped (expected .asc or .sshsig).")
-        else:
-            auto_asc = manifest_path.with_suffix(manifest_path.suffix + ".asc")
-            gpg_sigs = [auto_asc] if auto_asc.exists() else []
-            auto_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
-            auto_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
-            ssh_sigs = [p for p in (auto_ssh, auto_sig) if p.exists()]
-            if args.ssh_verify and not ssh_sigs:
-                ssh_sigs = [auto_ssh]  # will report missing below
+        # ---- Integrity tallies ----
+        n_missing = len(results["missing"])
+        n_modified = len(results["modified"])
+        n_new = len(results["new"])
+        n_ok = len(results["ok"])
+        n_expected = n_ok + n_missing + n_modified   # files the manifest expects
+        integrity_failed = bool(n_missing or n_modified or n_new)
 
-        trust_failed = False  # C1: untrusted verified signer under --trust high
-        sig_invalid = False   # a present signature failed to verify
+        # ---- Signature policy ----
+        # A manifest is treated as unsigned only if it carries the UNSIGNED
+        # marker AND names no signer.  Such manifests verify on integrity alone
+        # (exit 0).  A manifest that does NOT declare itself unsigned is assumed
+        # to expect a signature; if none validates, authenticity is unestablished
+        # and verification "completes with issues" (exit 1).
+        # --ignore-sig forces integrity-only checking on any manifest.
+        manifest_unsigned = (WARN_UNSIGNED in manifest.get("warnings", [])
+                             and not manifest.get("signed_by"))
+        check_sigs = not args.ignore_sig                # attempt signature checks?
+        if args.ignore_sig:
+            _warn("Flag --ignore-sig in use")
+        sig_required = check_sigs and (not manifest_unsigned or args.ssh_verify)
 
-        # GPG verification
-        if not gpg_sigs:
-            _warn("Manifest not GPG-signed.")
-        else:
+        trust_failed = False   # C1: untrusted verified signer under --trust high
+        sig_invalid = False    # a signature that IS present failed to validate
+        sig_verified = False   # at least one signature validated successfully
+
+        if check_sigs:
+            # Resolve signature files
+            _SSH_EXTS = (".sshsig", ".sig")
+            if sig_paths:
+                gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
+                ssh_sigs = [p for p in sig_paths if p.suffix in _SSH_EXTS]
+                for p in sig_paths:
+                    if p.suffix not in (".asc",) + _SSH_EXTS:
+                        _warn(f"Unknown signature type '{p.name}' — skipped "
+                              "(expected .asc or .sshsig)")
+            else:
+                auto_asc = manifest_path.with_suffix(manifest_path.suffix + ".asc")
+                gpg_sigs = [auto_asc] if auto_asc.exists() else []
+                auto_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
+                auto_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
+                ssh_sigs = [p for p in (auto_ssh, auto_sig) if p.exists()]
+
+            # GPG verification
             for gpg_sig in gpg_sigs:
                 if not gpg_sig.exists():
                     _warn(f"GPG signature not found: {gpg_sig.name}")
                 elif not gpg_available():
-                    _warn("GPG not available — GPG verification skipped.")
+                    _warn("GPG not available — GPG verification skipped")
                 else:
                     if gpg_verify(manifest_path, gpg_sig):
                         _ok(f"GPG signature verified: {gpg_sig.name}")
+                        sig_verified = True
                         v_fpr = gpg_verified_fingerprint(manifest_path, gpg_sig)
                         if v_fpr:
                             show_randomart_gpg(v_fpr)
                         if not trust_gate_verify("gpg", v_fpr, trust_level, config):
                             trust_failed = True
                     else:
-                        _warn(f"GPG signature invalid: {gpg_sig.name}")
                         sig_invalid = True
 
-        # SSH verification
-        for ssh_sig in ssh_sigs:
-            if not ssh_keygen_available():
-                _warn("ssh-keygen not available — SSH verification skipped.")
-                break
-            if not ssh_sig.exists():
-                _warn(f"SSH signature not found: {ssh_sig.name}")
-                continue
-            signer = select_ssh_key(ssh_key_path, require_private=False,
-                                    prefer_fido=prefer_fido, keyname=keyname)
-            if signer is None:
-                _warn("No suitable SSH key found for verification.")
-                continue
-            canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
-            result = ssh_verify_manifest(
-                manifest_path, ssh_sig, signer.pub_path,
-                multiple_signatures=len(ssh_sigs) > 1,
-                nonstandard_sig=ssh_sig != canonical_ssh,
-            )
-            if result.status == "OK":
-                _ok(result.message)
-                show_randomart_ssh(signer.pub_path)
-                v_fpr = ssh_key_fingerprint(signer.pub_path)
-                if not trust_gate_verify("ssh", v_fpr, trust_level, config):
-                    trust_failed = True
-            else:
-                _qprint(f"{_tag(result.status)} {result.message}")
-                sig_invalid = True
-            for w in result.warnings:
-                _warn(w)
+            # SSH verification
+            for ssh_sig in ssh_sigs:
+                if not ssh_keygen_available():
+                    _warn("ssh-keygen not available — SSH verification skipped")
+                    break
+                if not ssh_sig.exists():
+                    _warn(f"SSH signature not found: {ssh_sig.name}")
+                    continue
+                signer = select_ssh_key(ssh_key_path, require_private=False,
+                                        prefer_fido=prefer_fido, keyname=keyname)
+                if signer is None:
+                    _warn("No suitable SSH key found for verification")
+                    continue
+                canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
+                result = ssh_verify_manifest(
+                    manifest_path, ssh_sig, signer.pub_path,
+                    multiple_signatures=len(ssh_sigs) > 1,
+                    nonstandard_sig=ssh_sig != canonical_ssh,
+                )
+                if result.status == "OK":
+                    _ok(result.message)
+                    sig_verified = True
+                    show_randomart_ssh(signer.pub_path)
+                    v_fpr = ssh_key_fingerprint(signer.pub_path)
+                    if not trust_gate_verify("ssh", v_fpr, trust_level, config):
+                        trust_failed = True
+                else:
+                    sig_invalid = True
+                for w in result.warnings:
+                    _warn(w)
 
-        if any(k != "ok" and results[k] for k in results):
-            _warn("Verification completed with issues.")
-            sys.exit(1)
+        # ------------------------- Terminal verdict ------------------------- #
+        if integrity_failed:
+            _qprint(f"{_tag('FAIL')} {n_missing} Missing, {n_modified} Modified, "
+                    f"{n_new} New/Moved, {n_ok}/{n_expected} OK")
         if sig_invalid:
-            _warn("Verification failed: a signature did not validate.")
-            sys.exit(1)
+            _qprint(f"{_tag('FAIL')} Manifest failed Signature")
         if trust_failed:
-            _warn("Verification failed trust check (untrusted signer).")
+            _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
+
+        if integrity_failed or sig_invalid or trust_failed:
             sys.exit(1)
 
-        _ok("Verification successful.")
+        # A manifest that expects a signature but produced none: hashes are
+        # intact, but authenticity could not be established.
+        if sig_required and not sig_verified:
+            _warn("Verification completed with issues")
+            sys.exit(1)
+
+        # Success.  Unsigned manifests pass on integrity alone — the UNSIGNED
+        # note printed above already flags the absence of a signature.
+        _ok("Verification successful")
         return
 
     # ------------------------------------------------------------------ #
@@ -2223,10 +2290,13 @@ supported hash algorithms:
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     else:
-        manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
-    _ok(f"Manifest created: {manifest_path}")
+        manifest_path.write_text(
+            _write_text_manifest(manifest, bullets=not args.no_bullets),
+            encoding="utf-8",
+        )
     if args.no_sign:
-        _info("Signing skipped (--no-sign).")
+        _info("Signing skipped (--no-sign)")
+    _ok(f"Manifest created: {manifest_path}")
 
     # ---- Sign the finished file ----
     if gpg_fpr:

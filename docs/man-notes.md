@@ -556,3 +556,73 @@ Exit 3 remains reserved for SIGNING refusal only.
 - `--json` output mode
 - Direct FIDO2/CTAP2 integration
 - RedNotebook UI integration
+- **rednb-verify-config** — GUI config editor (separate desktop app over
+  `~/.config/rednb-verify/config.json`)
+
+---
+
+## Verify output & verdict model (v0.8.x UX pass)
+
+A round of usability fixes after first real-world testing.
+
+### Message ordering & style
+- **INFO before the action.** Context notices print *before* the big result,
+  not after — e.g. `[INFO] Signing skipped (--no-sign)` then
+  `[OK] Manifest created: …`. The terminal `[OK]`/`[FAIL]` verdict is the last
+  line on success.
+- **No trailing periods** on short, log-style status lines (matches
+  git/npm/cargo). Multi-sentence guidance keeps its punctuation.
+- **Report line is `[INFO]`, not `[OK]`.** Writing the report file is
+  informational; only the verdict is a success signal.
+
+### Text-manifest bullets (`--no-bullets`)
+- Per-file hash lines are prefixed with `- ` for readability. **Merkle-root
+  lines are never bulleted** (they are summary values, not list items).
+- `--no-bullets` disables the prefix. The text-manifest **parser tolerates an
+  optional `- ` prefix**, so bulleted and non-bulleted manifests both round-trip.
+
+### Verdict & severity model (the core change)
+Plain `--verify` checks **integrity AND authenticity**. Single terminal verdict:
+
+The **manifest's own self-declaration** drives whether a signature is required:
+`manifest_unsigned = (WARN_UNSIGNED in warnings) and not signed_by`.
+
+| Condition | Line | Exit |
+|---|---|---|
+| Hashes OK; manifest unsigned (declared) or signed + valid sig | `[OK] Verification successful` | 0 |
+| File changes | `[FAIL] X Missing, N Modified, Z New/Moved, K/T OK` | 1 |
+| Signature present but invalid | `[FAIL] Manifest failed Signature` | 1 |
+| Valid signature, untrusted signer (`--trust high`) | `[FAIL] Untrusted signer (--trust high)` | 1 |
+| Manifest uses an uncomputable hash | `[WARN] Missing Algorithms: <algo>` | 1 |
+| Manifest implies a sig (no unsigned marker), none validates | `[WARN] Verification completed with issues` | 1 |
+
+- **Self-declaration, not a CLI flag, decides the policy.** A manifest created
+  without signing carries the `MANIFEST UNSIGNED` marker → it verifies on
+  integrity alone and returns 0 (the marker is surfaced once, as the unsigned
+  warning). A manifest that does *not* carry the marker is assumed to expect a
+  signature; if none validates, hashes are intact but authenticity is
+  unestablished → "completed with issues" (exit 1).
+- **`--ignore-sig`** forces integrity-only checking on *any* manifest (exit 0
+  on hash match). This is the explicit override that replaced the old
+  `--verify --no-sign` integrity-only behavior. `--no-sign` no longer affects
+  verify; it is a create-time flag only.
+- **`--ssh-verify`** still forces a signature to be required even on an
+  unsigned-marked manifest (`sig_required = check_sigs and (not manifest_unsigned
+  or args.ssh_verify)`).
+- **Signatures are opportunistically checked even on unsigned manifests.** If a
+  stray valid signature is present it's reported; an *invalid* one still fails
+  (handles the `--resign` case, where C3 leaves the manifest body — and thus its
+  UNSIGNED marker — untouched).
+- **Redundant "not GPG-signed" warning removed.**
+- **Missing Algorithms fails fast**, *before* hashing — verifying only the
+  subset of computable hashes would give false confidence. Includes a
+  `pip install` hint for optional backends (`blake3`, `xxh3`).
+
+### `--exclude-from`: no comment syntax
+- Each non-blank line is a **literal** glob pattern. The `#`-comment convention
+  was dropped: a journal filename can legitimately start with `#`, and silently
+  treating it as a comment would leave that file unprotected.
+
+### pyyaml
+- `--per-day` without PyYAML exits 2 with a friendly stderr message and a
+  `pip install pyyaml` hint (`_require_yaml`).
