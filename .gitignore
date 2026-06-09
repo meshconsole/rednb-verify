@@ -2,3 +2,5 @@
 manifest-*.json
 report-*.txt
 report-*.json
+__pycache__/
+*.pyc

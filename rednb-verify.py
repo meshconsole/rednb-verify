@@ -1,43 +1,59 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.7.2
+Version: 0.8.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
 
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
-"-m", "--month-only"       : Hashes only month files
-"-D", "--per-day"          : Hash individual day entries within month files (requires PyYAML)
-"-j", "--jobs N"           : Parallel hashing workers (0 = auto, default: 1)
-"-o", "--output"           : Output directory for manifest (default: journal parent)
-"--verify [FILE|DIR]"      : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
-"--manifest-type txt|json" : Manifest creation format (default: txt)
-"--report txt|json"        : Report format during --verify (default: txt)
-"--hash ALGO[:LEN]"        : Hash algorithm (default: sha256); shake_128/shake_256 require :LEN
-"--hash-list"              : Print available hash algorithms and exit
-"--hash-merkle"            : Hash algorithm for Merkle tree (default: same as --hash)
-"--gpg [FINGERPRINT]"      : Sign with GPG; optional fingerprint pre-selects key (skips menu)
-"--gpg-k FILE"             : GPG armored key file; implies --gpg
-"--ssh [FILE_OR_DIR]"      : Sign with SSH key; optional .pub file or directory to scan (default: ~/.ssh)
-"--ssh-verify"             : Force SSH signature check during --verify
-"--sig FILE[,FILE]"        : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
-"--ssh-fido [NAME]"        : Prefer FIDO2/hardware-backed SSH keys; optional name filter
-"--no-sign"                : Skip all signing
-"--resign MANIFEST"        : Re-sign an existing manifest (requires --gpg and/or --ssh)
-"--warn-age DAYS"          : Warn during verify if manifest is older than N days
-"--verbose / -v"           : Print per-file hash timing and detailed progress
-"--quiet"                  : Suppress non-error output; implies --no-sign unless signing is explicit
-"--exclude PATTERN"        : Exclude files matching glob (repeatable)
-"--exclude-from FILE"      : File of glob patterns to exclude (one per line, # = comment)
-"--no-config / --no-cf"    : Ignore ~/.config/rednb-verify/config.json for this run
-"--config FILE"            : Load a specific config file instead of the default
+
+Normal operation:
+"-m", "--month-only"          : Hashes only month files
+"-D", "--per-day"             : Hash individual day entries within month files (requires PyYAML)
+"-j", "--jobs N"              : Parallel hashing workers (0 = auto, default: 1)
+"-o", "--output"             : Output directory for manifest (default: journal parent)
+"-V", "--version"            : Print version and exit
+"--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
+"--manifest-type txt|json"    : Manifest creation format (default: txt)
+"--report txt|json"           : Report format during --verify (default: txt)
+"--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
+"--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
+"--hash-list"                 : Print available hash algorithms and exit
+"--hash-merkle ALGO[,...]"    : Merkle algo (single: combiner; multi: select trees)
+"--hash-merkle-concatenate [ALGO]" : One tree over per-file concatenated hashes
+"--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
+"--gpg-k FILE"                : GPG armored key file; implies --gpg
+"--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
+"--ssh-verify"                : Force SSH signature check during --verify
+"--ignore-sig"                : Verify integrity only; skip all signature checks
+"--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
+"--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
+"--trust high|low"            : Signing trust level (default: low)
+"--no-sign"                   : Skip all signing
+"--resign MANIFEST"           : Re-sign an existing manifest (requires --gpg and/or --ssh)
+"--warn-age DAYS"             : Warn during verify if manifest is older than N days
+"--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
+"-v", "--verbose"            : Print per-file hash timing and detailed progress
+"--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
+"-y", "--yes"                : Assume yes to confirmation prompts
+"--exclude PATTERN"           : Exclude files matching glob (repeatable)
+"--exclude-from FILE"         : File of glob patterns to exclude (one literal pattern per line)
+
+Config management:
+"--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
+"--set-cf-run FIELD:VALUE"    : Like --set-cf but continue running
+"--add-trust FIELD:VALUE"     : Append fingerprints to a trust list (de-duplicated)
+"--config-out"                : Print the resulting config as JSON
+"--no-config / --no-cf"       : Ignore ~/.config/rednb-verify/config.json for this run
+"--config FILE"               : Load a specific config file instead of the default
 
 Exit codes:
   0  all checks passed / manifest created successfully
-  1  verification found issues (modified, missing, or unexpected files)
+  1  verification found issues (modified/missing/new files, invalid or untrusted signature)
   2  usage or input error (bad arguments, missing files, unsupported algorithm)
+  3  signing refused (untrusted key under --trust high)
 """
 
 import argparse
@@ -57,9 +73,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
+
+# Manifest structural contract. Separate from VERSION (build identifier).
+# Bump only on a BREAKING structural change (renamed/removed/retyped field),
+# never for an optional addition. Manifests without this field = version 0.
+MANIFEST_SCHEMA_VERSION = 1
 
 # Set by main() before any output
 _quiet: bool = False
@@ -84,7 +105,8 @@ def _require_yaml():
         import yaml  # type: ignore
         return yaml
     except ImportError:
-        print(f"{_tag('ERROR')} --per-day requires PyYAML:  pip install pyyaml")
+        _err("--per-day needs PyYAML, which is not installed.")
+        _err("        Install it with:  pip install pyyaml")
         sys.exit(2)
 
 
@@ -96,6 +118,7 @@ _ANSI: Dict[str, str] = {
     "INFO":  "\033[33m",   # yellow
     "OK":    "\033[97m",   # bright white
     "WARN":  "\033[91m",   # light red
+    "FAIL":  "\033[91m",   # light red
     "ERROR": "\033[91m",   # light red
 }
 
@@ -118,7 +141,14 @@ def _ok(msg: str) -> None:
 
 
 def _warn(msg: str) -> None:
-    print(f"{_tag('WARN')} {msg}")
+    """Cosmetic-tier warning: suppressed by --quiet."""
+    if not _quiet:
+        print(f"{_tag('WARN')} {msg}")
+
+
+def _warn_security(msg: str) -> None:
+    """Security-tier warning: ALWAYS printed, ALWAYS to stderr, ignores --quiet."""
+    print(f"{_tag('WARN', stream=sys.stderr)} {msg}", file=sys.stderr)
 
 
 def _err(msg: str) -> None:
@@ -141,10 +171,92 @@ def load_config(path: Path = CONFIG_PATH) -> Dict:
     return {}
 
 
+def save_config(config: Dict, path: Path = CONFIG_PATH) -> None:
+    """Write the config dict to disk as pretty JSON, creating parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=4, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+
+
+def _normalize_gpg_fpr(fpr: str) -> str:
+    """GPG fingerprints compared case-insensitively, spaces stripped (D3)."""
+    return fpr.replace(" ", "").upper()
+
+
+# --set-cf / --add-trust field → trust list key
+_CF_TRUST_FIELDS = {"trust-gpg": "gpg", "trust-ssh": "ssh"}
+
+
+def _parse_cf_token(token: str) -> tuple:
+    """Parse 'field:value[,value...]' → (field, [values]).
+
+    Splits on the FIRST colon only (G5), so dir:C:\\path keeps its drive colon.
+    Returns (field, None) if no colon is present.
+    """
+    field, sep, rest = token.partition(":")
+    if not sep:
+        return field.strip(), None
+    values = [v.strip() for v in rest.split(",") if v.strip()]
+    return field.strip(), values
+
+
+def apply_set_cf(config: Dict, tokens: List[str]) -> None:
+    """Apply --set-cf tokens to config in place (REPLACE semantics)."""
+    for token in tokens:
+        field, values = _parse_cf_token(token)
+        if values is None:
+            _err(f"--set-cf expects field:value, got: {token!r}")
+            sys.exit(2)
+        if field in _CF_TRUST_FIELDS:
+            kind = _CF_TRUST_FIELDS[field]
+            if kind == "gpg":
+                values = [_normalize_gpg_fpr(v) for v in values]
+            config.setdefault("trust", {})[kind] = list(dict.fromkeys(values))
+        elif field == "trust-level":
+            level = (values[0].lower() if values else "")
+            if level not in ("high", "low"):
+                _err(f"trust-level must be 'high' or 'low', got: {values!r}")
+                sys.exit(2)
+            config["trust_level"] = level
+        elif field == "dir":
+            config["dir"] = values[0]  # single path; last wins if repeated
+        else:
+            _err(f"Unknown --set-cf field: {field!r} "
+                 "(expected trust-gpg, trust-ssh, trust-level, dir)")
+            sys.exit(2)
+
+
+def apply_add_trust(config: Dict, tokens: List[str]) -> None:
+    """Apply --add-trust tokens to config in place (APPEND + de-dupe, order kept)."""
+    for token in tokens:
+        field, values = _parse_cf_token(token)
+        if values is None:
+            _err(f"--add-trust expects field:value, got: {token!r}")
+            sys.exit(2)
+        if field not in _CF_TRUST_FIELDS:
+            _err(f"--add-trust only supports trust-gpg / trust-ssh, got: {field!r}")
+            sys.exit(2)
+        kind = _CF_TRUST_FIELDS[field]
+        if kind == "gpg":
+            values = [_normalize_gpg_fpr(v) for v in values]
+        existing = config.get("trust", {}).get(kind, [])
+        config.setdefault("trust", {})[kind] = list(dict.fromkeys(existing + values))
+
+
 # ---------- Utilities ----------
 
 # Algorithms whose digest() / hexdigest() require an explicit byte-length argument.
 _VARIABLE_LENGTH_ALGOS = {"shake_128", "shake_256"}
+
+# Cryptographically broken hashes — unsafe as the SOLE integrity hash.
+_WEAK_ALGOS = {"md5", "sha1"}
+
+# Canonical manifest warning strings (stored in the manifest "warnings" field).
+WARN_WEAK_HASH = "WEAK HASHING ALGORITHM(S) IN USE ALONE"
+WARN_UNSIGNED = "MANIFEST UNSIGNED"
+WARN_EXCLUDED = "FILES EXCLUDED FROM MANIFEST"
+WARN_NO_FILES = "NO FILES FOUND IN NOTEBOOK DIRECTORY"
+WARN_NO_DAYS = "NO DAY ENTRIES FOUND"
 
 
 def _parse_algo_spec(spec: str) -> tuple:
@@ -167,6 +279,34 @@ def _hexdigest(h, length: Optional[int]) -> str:
     return h.hexdigest(length) if length is not None else h.hexdigest()
 
 
+def _validate_algo_spec_or_exit(spec: str, label: str) -> tuple:
+    """Validate one algo spec against the registry; exit(2) with a clear message.
+
+    Returns (name, length) on success. Note: AVAILABLE_HASHES is defined just
+    below hash_file, so this is only called from main() after module load.
+    """
+    name, length = _parse_algo_spec(spec)
+    if name not in AVAILABLE_HASHES:
+        if name in _OPTIONAL_PIP:
+            _err(f"{label} {name!r} needs an optional package: "
+                 f"pip install {_OPTIONAL_PIP[name]}")
+        else:
+            _err(f"Unsupported algorithm for {label}: {spec!r}")
+        sys.exit(2)
+    if name in _VARIABLE_LENGTH_ALGOS and length is None:
+        _err(f"{name} requires a length: use {label} {name}:32")
+        sys.exit(2)
+    if name not in _VARIABLE_LENGTH_ALGOS and length is not None:
+        _err(f"{name} does not support a length parameter (remove :{length})")
+        sys.exit(2)
+    try:
+        _hexdigest(_new_hasher(name), length)
+    except TypeError as exc:
+        _err(f"Algorithm error for {label} {spec!r}: {exc}")
+        sys.exit(2)
+    return name, length
+
+
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -179,6 +319,61 @@ def hash_file(path: Path, algo_spec: str) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return _hexdigest(h, length)
+
+
+# Optional hash backends beyond hashlib's guaranteed set. Each entry maps an
+# algorithm NAME to a zero-arg constructor returning an object with
+# .update(bytes) and .hexdigest(). Populated once at import time.
+AVAILABLE_HASHES: Dict[str, object] = {}
+for _algo in hashlib.algorithms_guaranteed:
+    # bind _algo per-iteration via default arg
+    AVAILABLE_HASHES[_algo] = (lambda a: (lambda: hashlib.new(a)))(_algo)
+try:
+    import blake3 as _blake3_mod
+    AVAILABLE_HASHES["blake3"] = _blake3_mod.blake3
+except ImportError:
+    pass
+try:
+    import xxhash as _xxhash_mod
+    AVAILABLE_HASHES["xxh3"] = _xxhash_mod.xxh3_128
+except ImportError:
+    pass
+
+# Known optional algorithms and the pip package that provides each.
+_OPTIONAL_PIP = {"blake3": "blake3", "xxh3": "xxhash"}
+
+
+def _new_hasher(name: str):
+    """Return a fresh hasher for an algorithm name, or None if unavailable."""
+    ctor = AVAILABLE_HASHES.get(name)
+    return ctor() if ctor is not None else None
+
+
+def hash_file_multi(path: Path, specs: List[str]) -> Dict[str, str]:
+    """Hash a file with N algorithms in a SINGLE read pass.
+
+    Returns {spec: hexdigest} keyed by the original spec string
+    (e.g. 'sha256', 'shake_128:32'). Caller is responsible for having
+    validated the specs.
+    """
+    parsed = [(spec, *_parse_algo_spec(spec)) for spec in specs]
+    hashers = {spec: _new_hasher(name) for spec, name, _ in parsed}
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            for h in hashers.values():
+                h.update(chunk)
+    return {spec: _hexdigest(hashers[spec], length) for spec, _, length in parsed}
+
+
+def hash_bytes_multi(data: bytes, specs: List[str]) -> Dict[str, str]:
+    """Hash an in-memory byte string with N algorithms. Returns {spec: hexdigest}."""
+    out: Dict[str, str] = {}
+    for spec in specs:
+        name, length = _parse_algo_spec(spec)
+        h = _new_hasher(name)
+        h.update(data)
+        out[spec] = _hexdigest(h, length)
+    return out
 
 
 def is_month_file(path: Path) -> bool:
@@ -510,16 +705,18 @@ def ssh_verify_manifest(
         warnings.append("SSH signature verified using a non-standard filename.")
     allowed_path = _write_allowed_signers(pub_path)
     try:
-        subprocess.run(
-            ["ssh-keygen", "-Y", "verify",
-             "-f", str(allowed_path),
-             "-I", SSH_SIGNER_IDENTITY,
-             "-n", SSH_NAMESPACE,
-             "-s", str(sig_path),
-             str(manifest_path)],
-            cwd=manifest_path.parent, check=True,
-            capture_output=True, text=True,
-        )
+        # `ssh-keygen -Y verify` reads the signed data from STDIN (not a
+        # positional argument), so feed the manifest file on stdin.
+        with manifest_path.open("rb") as data_in:
+            subprocess.run(
+                ["ssh-keygen", "-Y", "verify",
+                 "-f", str(allowed_path),
+                 "-I", SSH_SIGNER_IDENTITY,
+                 "-n", SSH_NAMESPACE,
+                 "-s", str(sig_path)],
+                stdin=data_in, cwd=manifest_path.parent, check=True,
+                capture_output=True, text=True,
+            )
     except subprocess.CalledProcessError:
         return SshVerifyResult("FAIL", "SSH signature verification failed.", warnings)
     finally:
@@ -527,15 +724,214 @@ def ssh_verify_manifest(
     return SshVerifyResult("OK", "SSH signature verified.", warnings)
 
 
+def ssh_key_fingerprint(pub_path: Path) -> Optional[str]:
+    """Return the SHA256:... fingerprint of an SSH public key, or None."""
+    if not ssh_keygen_available():
+        return None
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-lf", str(pub_path)],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    for token in result.stdout.split():
+        if token.startswith("SHA256:"):
+            return token
+    return None
+
+
+def gpg_verified_fingerprint(manifest: Path, signature: Path) -> Optional[str]:
+    """Return the primary-key fingerprint that produced a VALID gpg signature.
+
+    Uses --status-fd so the result is the cryptographically verified signer,
+    not anything self-declared (defends against key substitution, C1).
+    """
+    try:
+        result = subprocess.run(
+            ["gpg", "--verify", "--status-fd", "1",
+             str(signature.resolve()), str(manifest.resolve())],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        # [GNUPG:] VALIDSIG <fpr> <date> ...
+        if len(parts) >= 3 and parts[0] == "[GNUPG:]" and parts[1] == "VALIDSIG":
+            return _normalize_gpg_fpr(parts[2])
+    return None
+
+
+def gpg_fingerprint_from_keyfile(key_file: Path) -> Optional[str]:
+    """Import an armored GPG key into a temp homedir and return its fingerprint."""
+    tmp_home = Path(tempfile.mkdtemp(prefix="rednb-gpgfpr-"))
+    try:
+        os.chmod(tmp_home, 0o700)
+        subprocess.run(
+            ["gpg", "--homedir", str(tmp_home), "--import", str(key_file.resolve())],
+            check=True, capture_output=True,
+        )
+        result = subprocess.run(
+            ["gpg", "--homedir", str(tmp_home), "--list-secret-keys", "--with-colons"],
+            check=True, capture_output=True, text=True,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if parts[0] == "fpr":
+                return _normalize_gpg_fpr(parts[9])
+    except subprocess.CalledProcessError:
+        return None
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
+    return None
+
+
+# ---------- Trust ----------
+
+def resolve_trust_level(cli_trust: Optional[str], config: Dict) -> str:
+    """CLI --trust overrides config trust_level; default 'low'."""
+    return cli_trust or config.get("trust_level") or "low"
+
+
+def is_key_trusted(kind: str, fpr: str, config: Dict) -> bool:
+    """kind = 'gpg' | 'ssh'. GPG compared normalized; SSH compared verbatim (D3)."""
+    trusted = config.get("trust", {}).get(kind, [])
+    if kind == "gpg":
+        norm = _normalize_gpg_fpr(fpr)
+        return any(_normalize_gpg_fpr(t) == norm for t in trusted)
+    return fpr in trusted
+
+
+def trust_gate_signing(kind: str, fpr: Optional[str], trust_level: str,
+                       config: Dict) -> bool:
+    """Enforce trust policy before signing. Returns True to proceed.
+
+    high + untrusted → refuse (exit 3). low → always proceed, notify.
+    """
+    label = kind.upper()
+    if fpr is None:
+        # Can't determine the key's fingerprint.
+        if trust_level == "high":
+            _err(f"Cannot determine {label} key fingerprint — refusing to sign "
+                 "(--trust high).")
+            sys.exit(3)
+        _warn_security(f"Could not determine {label} key fingerprint; signing anyway "
+                       "(--trust low).")
+        return True
+    trusted = is_key_trusted(kind, fpr, config)
+    if trust_level == "high":
+        if not trusted:
+            _err(f"Untrusted {label} key {fpr} — refusing to sign (--trust high).")
+            sys.exit(3)
+        return True
+    # low
+    if trusted:
+        _info(f"{label} signing key is trusted: {fpr}")
+    else:
+        _warn_security(f"Signing with UNTRUSTED {label} key: {fpr}")
+    return True
+
+
+def trust_gate_verify(kind: str, fpr: Optional[str], trust_level: str,
+                      config: Dict) -> bool:
+    """At verify time, check the VERIFIED key against the trust list (C1).
+
+    Returns True if acceptable. Under --trust high, an untrusted/unknown signer
+    returns False (caller treats verification as failed → exit 1).
+    """
+    label = kind.upper()
+    if trust_level != "high":
+        return True
+    if fpr is None:
+        _warn_security(f"Could not extract {label} signer fingerprint to check trust.")
+        return False
+    if is_key_trusted(kind, fpr, config):
+        return True
+    _warn_security(f"VERIFIED {label} signature from UNTRUSTED key {fpr} "
+                   "(--trust high) — possible key substitution.")
+    return False
+
+
+# ---------- Randomart (fingerprint visualisation) ----------
+
+_RANDOMART_CHARS = " .o+=*BOX@%&#/^SE"  # 17 chars; 15=S (start), 16=E (end)
+
+
+def fingerprint_randomart(data: bytes, title: str = "") -> str:
+    """Drunken-Bishop ASCII art over raw bytes (Dirk Loss algorithm)."""
+    w, h = 17, 9
+    grid = [[0] * w for _ in range(h)]
+    x, y = w // 2, h // 2
+    for byte in data:
+        for shift in (0, 2, 4, 6):
+            move = (byte >> shift) & 3
+            x += -1 if move in (0, 2) else 1
+            y += -1 if move in (0, 1) else 1
+            x = max(0, min(w - 1, x))
+            y = max(0, min(h - 1, y))
+            grid[y][x] += 1
+    start = (h // 2, w // 2)
+    grid[start[0]][start[1]] = 15   # 'S'
+    grid[y][x] = 16                 # 'E'
+    top = f"+--[{title}]".ljust(w + 1, "-") + "+"
+    out = [top[: w + 2]]
+    for row in grid:
+        out.append("|" + "".join(_RANDOMART_CHARS[min(v, 16)] for v in row) + "|")
+    out.append("+" + "-" * w + "+")
+    return "\n".join(out)
+
+
+def show_randomart_ssh(pub_path: Path) -> None:
+    """Print SSH key randomart: native ssh-keygen -lv if available, else custom."""
+    if _quiet:
+        return
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-lv", "-f", str(pub_path)],
+            capture_output=True, text=True, check=True,
+        )
+        print(result.stdout.rstrip())
+        return
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    fpr = ssh_key_fingerprint(pub_path)
+    if fpr:
+        # Strip 'SHA256:' and base64-decode to bytes for the art.
+        import base64
+        b64 = fpr.split(":", 1)[1]
+        try:
+            raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+        except Exception:
+            raw = fpr.encode()
+        print(fingerprint_randomart(raw, "SSH"))
+
+
+def show_randomart_gpg(fpr: str) -> None:
+    """Print GPG fingerprint randomart (custom Drunken Bishop over fpr bytes)."""
+    if _quiet or not fpr:
+        return
+    try:
+        raw = bytes.fromhex(fpr)
+    except ValueError:
+        raw = fpr.encode()
+    print(fingerprint_randomart(raw, "GPG"))
+
+
 # ---------- Manifest ----------
 
 def collect_files(
     base: Path,
     month_only: bool,
-    algo: str,
+    algos: List[str],
     exclude: Optional[List[str]] = None,
     jobs: int = 1,
-) -> Dict[str, str]:
+) -> Dict[str, Dict[str, str]]:
+    """Hash files under base with one or more algorithms.
+
+    Returns {rel_path: {spec: hexdigest}}. Each file is hashed with every spec
+    in a single read pass (multi mode); a single-spec list yields a one-key dict.
+    """
     exclude = exclude or []
 
     # Gather candidate paths first (always sequential — os.walk is not thread-safe)
@@ -551,25 +947,21 @@ def collect_files(
                 continue
             paths_to_hash.append((path, rel_str))
 
-    files: Dict[str, str] = {}
+    files: Dict[str, Dict[str, str]] = {}
 
     if jobs == 1:
-        # Sequential — original behavior
         for path, rel_str in paths_to_hash:
+            t0 = time.perf_counter()
+            files[rel_str] = hash_file_multi(path, algos)
             if _verbose:
-                t0 = time.perf_counter()
-                files[rel_str] = hash_file(path, algo)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
-            else:
-                files[rel_str] = hash_file(path, algo)
     else:
-        # Parallel — print as each file completes when verbose
         _lock = threading.Lock()
 
         def _hash_one(path: Path, rel_str: str) -> tuple:
             t0 = time.perf_counter()
-            h = hash_file(path, algo)
+            h = hash_file_multi(path, algos)
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 with _lock:
@@ -588,15 +980,16 @@ def collect_files(
 
 def collect_files_per_day(
     base: Path,
-    algo: str,
+    algos: List[str],
     exclude: Optional[List[str]] = None,
     jobs: int = 1,
-) -> Dict[str, str]:
+) -> Dict[str, Dict[str, str]]:
     """Hash individual day entries within RedNotebook YYYY-MM.txt month files.
 
     Each entry is identified by path ``YYYY-MM/DD`` (e.g. ``2026-05/14``).
     Day content is serialised to canonical JSON before hashing so that all
-    fields (text, tags, custom categories) are captured.
+    fields (text, tags, custom categories) are captured. Returns
+    {day_key: {spec: hexdigest}} — multi-hashed like collect_files.
 
     Requires PyYAML (``pip install pyyaml``).
     """
@@ -623,9 +1016,7 @@ def collect_files_per_day(
             day_key = f"{year_month}/{day_num:02d}"
             entries.append((day_key, content[day_num]))
 
-    files: Dict[str, str] = {}
-
-    _algo, _length = _parse_algo_spec(algo)
+    files: Dict[str, Dict[str, str]] = {}
 
     def _hash_day(day_key: str, day_data) -> tuple:
         # Canonicalise: dicts → sorted JSON; plain strings kept as-is
@@ -634,86 +1025,144 @@ def collect_files_per_day(
         else:
             canonical = str(day_data) if day_data is not None else ""
         t0 = time.perf_counter()
-        h = hashlib.new(_algo, canonical.encode("utf-8"))
-        digest = _hexdigest(h, _length)
+        digests = hash_bytes_multi(canonical.encode("utf-8"), algos)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        return day_key, digest, elapsed_ms
+        return day_key, digests, elapsed_ms
 
     if jobs == 1:
         for day_key, day_data in entries:
-            key, h, elapsed_ms = _hash_day(day_key, day_data)
-            files[key] = h
+            key, digests, elapsed_ms = _hash_day(day_key, day_data)
+            files[key] = digests
             if _verbose:
                 _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
     else:
         _lock = threading.Lock()
 
         def _hash_day_parallel(day_key: str, day_data) -> tuple:
-            key, h, elapsed_ms = _hash_day(day_key, day_data)
+            key, digests, elapsed_ms = _hash_day(day_key, day_data)
             if _verbose:
                 with _lock:
                     _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
-            return key, h
+            return key, digests
 
         max_workers = jobs if jobs > 0 else None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_hash_day_parallel, k, d): k for k, d in entries}
             for future in as_completed(futures):
-                key, h = future.result()
-                files[key] = h
+                key, digests = future.result()
+                files[key] = digests
 
     return dict(sorted(files.items()))
+
+
+def _concat_merkle_root(files: Dict[str, Dict[str, str]], algos: List[str],
+                        concat_algo: str) -> str:
+    """Merkle root where each leaf is the per-file concatenation (alphabetical
+    by algo) of all file-hash bytes, combined with concat_algo."""
+    leaves = []
+    for p in files:
+        blob = b"".join(bytes.fromhex(files[p][a]) for a in sorted(algos))
+        leaves.append(blob.hex())
+    return merkle_root(leaves, concat_algo)
 
 
 def generate_manifest(
     notebook: Path,
     month_only: bool,
-    algo: str,
+    algos: List[str],
     merkle_algo: str,
     exclude: Optional[List[str]] = None,
     per_day: bool = False,
     jobs: int = 1,
+    merkle_select: Optional[List[str]] = None,
+    concat_algo: Optional[str] = None,
 ) -> Dict:
+    algos = sorted(algos)          # alphabetical ordering throughout (man notes)
+    multi = len(algos) > 1
+    day_count: Optional[int] = None  # None = not a per-day mode
     if per_day and not month_only:
         # per-day/full-tree: individual day entries + all non-month files.
         # Pass the YYYY-MM.txt glob to collect_files so month files are
         # never hashed twice and don't appear in verbose output.
         _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
-        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        day_files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
         other_files = collect_files(
-            notebook, False, algo,
+            notebook, False, algos,
             exclude=list(exclude) + [_MONTH_GLOB],
             jobs=jobs,
         )
         files = dict(sorted({**day_files, **other_files}.items()))
+        day_count = len(day_files)
         mode = "per-day/full-tree"
     elif per_day and month_only:
         # per-day/month-only: individual day entries, no attachments
-        files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
+        day_count = len(files)
         mode = "per-day/month-only"
     elif month_only:
         # month-only: whole YYYY-MM.txt files, no attachments
-        files = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
+        files = collect_files(notebook, True, algos, exclude=exclude, jobs=jobs)
         mode = "month-only"
     else:
         # full-tree: every file as-is
-        files = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
+        files = collect_files(notebook, False, algos, exclude=exclude, jobs=jobs)
         mode = "full-tree"
 
-    hashes = list(files.values())
+    # Collect creation-time warnings (recorded regardless of --quiet).
+    warnings: List[str] = []
+    weak_present = any(_parse_algo_spec(a)[0] in _WEAK_ALGOS for a in algos)
+    if weak_present and not multi:        # weak hash used ALONE
+        warnings.append(WARN_WEAK_HASH)
+    if exclude:
+        warnings.append(WARN_EXCLUDED)
+    if not files:
+        warnings.append(WARN_NO_FILES)
+    if day_count == 0:
+        warnings.append(WARN_NO_DAYS)
+
     manifest: Dict = {
         "tool": "rednb-verify",
         "version": VERSION,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "created": utc_timestamp(),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "hash_algorithm": algo,
-        "merkle_hash": merkle_algo,
         "mode": mode,
-        "files": [{"path": p, algo: h} for p, h in files.items()],
-        "merkle_root": merkle_root(hashes, merkle_algo),
     }
+
+    if multi:
+        # files entry: {path, hashes: {algo: hex, ... alphabetical}}
+        manifest["hash_algorithm"] = algos
+        manifest["files"] = [
+            {"path": p, "hashes": {a: files[p][a] for a in algos}}
+            for p in files
+        ]
+        # Field order: concatenated tree before individual trees (man notes).
+        if concat_algo:
+            manifest["merkle_root_concat"] = {
+                concat_algo: _concat_merkle_root(files, algos, concat_algo)
+            }
+        # Individual per-algo trees: selected subset, or all algos by default.
+        tree_algos = sorted(merkle_select) if merkle_select else algos
+        manifest["merkle_roots"] = {
+            a: merkle_root([files[p][a] for p in files], a) for a in tree_algos
+        }
+    else:
+        algo = algos[0]
+        manifest["hash_algorithm"] = algo
+        manifest["merkle_hash"] = merkle_algo
+        manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
+        if concat_algo:
+            manifest["merkle_root_concat"] = {
+                concat_algo: _concat_merkle_root(files, algos, concat_algo)
+            }
+        manifest["merkle_root"] = merkle_root(
+            [files[p][algo] for p in files], merkle_algo
+        )
+
     if exclude:
         manifest["exclude"] = exclude
+    if warnings:
+        manifest["warnings"] = warnings
     return manifest
 
 
@@ -726,33 +1175,43 @@ def verify_manifest(
     jobs: int = 1,
 ) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"ok": [], "missing": [], "modified": [], "new": []}
-    algo = manifest.get("hash_algorithm", "sha256")
-    expected = {f["path"]: f[algo] for f in manifest["files"]}
+    ha = manifest.get("hash_algorithm", "sha256")
+    multi = isinstance(ha, list)
+    algos = sorted(ha) if multi else [ha]
+
+    # Normalise expected to {path: {algo: hash}} for both single and multi.
+    if multi:
+        expected = {f["path"]: dict(f["hashes"]) for f in manifest["files"]}
+    else:
+        expected = {f["path"]: {ha: f[ha]} for f in manifest["files"]}
+
     exclude = list(manifest.get("exclude", []))
     if extra_exclude:
         exclude.extend(extra_exclude)
     mode = manifest.get("mode", "full-tree")
     _MONTH_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9].txt"
     if mode == "per-day/full-tree":
-        day_files = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        day_files = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
         other_files = collect_files(
-            notebook, False, algo,
+            notebook, False, algos,
             exclude=list(exclude) + [_MONTH_GLOB],
             jobs=jobs,
         )
         actual = dict(sorted({**day_files, **other_files}.items()))
     elif mode in ("per-day", "per-day/month-only"):
         # "per-day" kept for backward compatibility with v0.6.0 manifests
-        actual = collect_files_per_day(notebook, algo, exclude=exclude, jobs=jobs)
+        actual = collect_files_per_day(notebook, algos, exclude=exclude, jobs=jobs)
     elif mode in ("month-files", "month-only"):
         # "month-files" kept for backward compatibility with pre-v0.6.0 manifests
-        actual = collect_files(notebook, True, algo, exclude=exclude, jobs=jobs)
+        actual = collect_files(notebook, True, algos, exclude=exclude, jobs=jobs)
     else:
-        actual = collect_files(notebook, False, algo, exclude=exclude, jobs=jobs)
-    for path, h in expected.items():
+        actual = collect_files(notebook, False, algos, exclude=exclude, jobs=jobs)
+
+    # actual is {path: {algo: hash}}. A file is ok only if EVERY hash matches.
+    for path, exp in expected.items():
         if path not in actual:
             results["missing"].append(path)
-        elif actual[path] != h:
+        elif actual[path] != exp:
             results["modified"].append(path)
         else:
             results["ok"].append(path)
@@ -762,55 +1221,143 @@ def verify_manifest(
     return results
 
 
-def _write_text_manifest(manifest: Dict) -> str:
-    """Serialise a manifest dict to human-readable text format."""
-    algo = manifest.get("hash_algorithm", "sha256")
+def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
+    """Serialise a manifest dict to human-readable text format (single or multi).
+
+    When ``bullets`` is True (default), per-file hash lines are prefixed with
+    '- ' for readability.  Merkle-root lines are never bulleted (they are
+    summary values, not list items).
+    """
+    ha = manifest.get("hash_algorithm", "sha256")
+    multi = isinstance(ha, list)
+    algos = sorted(ha) if multi else [ha]
     lines = [
         "rednb-verify manifest",
         f"version: {manifest.get('version', VERSION)}",
+        f"schema_version: {manifest.get('schema_version', MANIFEST_SCHEMA_VERSION)}",
         f"created: {manifest['created']}",
         f"date: {manifest['date']}",
-        f"hash_algorithm: {algo}",
-        f"merkle_hash: {manifest.get('merkle_hash', algo)}",
+        f"hash_algorithm: {', '.join(algos) if multi else ha}",
         f"mode: {manifest.get('mode', 'full-tree')}",
-        f"merkle_root: {manifest.get('merkle_root', '')}",
     ]
+    if not multi:
+        lines.insert(7, f"merkle_hash: {manifest.get('merkle_hash', ha)}")
     if manifest.get("exclude"):
         lines.append(f"exclude: {', '.join(manifest['exclude'])}")
+    if manifest.get("warnings"):
+        lines.append(f"warnings: {', '.join(manifest['warnings'])}")
+    sb = manifest.get("signed_by", {})
+    if sb.get("gpg"):
+        lines.append(f"signed_by_gpg: {sb['gpg']}")
+    if sb.get("ssh"):
+        lines.append(f"signed_by_ssh: {sb['ssh']}")
+    # Concatenated tree first (man notes), then individual trees / single root.
+    if manifest.get("merkle_root_concat"):
+        ca, croot = next(iter(manifest["merkle_root_concat"].items()))
+        lines.append(f"merkle_root_concat: {ca} {croot}")
+    if multi:
+        lines.append("merkle_roots:")
+        for a in sorted(manifest.get("merkle_roots", {})):
+            lines.append(f"         {a}: {manifest['merkle_roots'][a]}")
+    else:
+        lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
+    bullet = "- " if bullets else ""
     lines += ["", "files:"]
     for i, entry in enumerate(manifest["files"], 1):
         lines.append(f"  {i:>5}. {entry['path']}")
-        lines.append(f"         {algo}: {entry[algo]}")
+        if multi:
+            for a in algos:
+                lines.append(f"         {bullet}{a}: {entry['hashes'][a]}")
+        else:
+            lines.append(f"         {bullet}{ha}: {entry[ha]}")
     return "\n".join(lines) + "\n"
 
 
 def _parse_text_manifest(text: str) -> Dict:
-    """Parse a text-format manifest back to a dict (same shape as JSON manifest)."""
+    """Parse a text-format manifest back to a dict (single or multi mode)."""
     import re as _re
-    manifest: Dict = {"files": []}
-    in_files = False
-    current_path: Optional[str] = None
+    manifest: Dict = {}
+    raw_files: List[Dict] = []      # [{"path":p, "_hashes":{algo:hash}}]
+    merkle_roots: Dict[str, str] = {}
+    section = "header"              # header → merkle_roots → files
+    current: Optional[Dict] = None
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("rednb-verify manifest"):
             continue
         if stripped == "files:":
-            in_files = True
+            section = "files"
             continue
-        if not in_files:
+        if stripped == "merkle_roots:":
+            section = "merkle_roots"
+            continue
+        if section == "header":
             if ": " in stripped:
                 key, _, val = stripped.partition(": ")
                 manifest[key.strip()] = val.strip()
-        else:
+        elif section == "merkle_roots":
+            if ": " in stripped:
+                a, _, root = stripped.partition(": ")
+                merkle_roots[a.strip()] = root.strip()
+        else:  # files
             m = _re.match(r"\d+\.\s+(.+)", stripped)
             if m:
-                current_path = m.group(1).strip()
-            elif ": " in stripped and current_path is not None:
-                algo, _, h = stripped.partition(": ")
-                manifest["files"].append({"path": current_path, algo.strip(): h.strip()})
-    # exclude is stored as comma-separated string — convert to list
-    if "exclude" in manifest and isinstance(manifest["exclude"], str):
-        manifest["exclude"] = [e.strip() for e in manifest["exclude"].split(",") if e.strip()]
+                current = {"path": m.group(1).strip(), "_hashes": {}}
+                raw_files.append(current)
+            else:
+                # Tolerate an optional '- ' bullet prefix on hash lines.
+                h_line = stripped[2:] if stripped.startswith("- ") else stripped
+                if ": " in h_line and current is not None:
+                    a, _, h = h_line.partition(": ")
+                    current["_hashes"][a.strip()] = h.strip()
+
+    # hash_algorithm: comma-separated → multi (list); single string otherwise.
+    ha = manifest.get("hash_algorithm", "sha256")
+    if isinstance(ha, str) and "," in ha:
+        algos = [a.strip() for a in ha.split(",") if a.strip()]
+        manifest["hash_algorithm"] = sorted(algos)
+        multi = True
+    else:
+        multi = False
+
+    # merkle_root_concat stored as "algo root" → {algo: root}
+    if isinstance(manifest.get("merkle_root_concat"), str):
+        parts = manifest["merkle_root_concat"].split(None, 1)
+        if len(parts) == 2:
+            manifest["merkle_root_concat"] = {parts[0]: parts[1]}
+        else:
+            del manifest["merkle_root_concat"]
+
+    files_out: List[Dict] = []
+    for rf in raw_files:
+        if multi:
+            files_out.append({"path": rf["path"], "hashes": rf["_hashes"]})
+        else:
+            files_out.append({"path": rf["path"], **rf["_hashes"]})
+    manifest["files"] = files_out
+    if multi:
+        manifest["merkle_roots"] = merkle_roots
+
+    # exclude / warnings stored as comma-separated strings — convert to lists
+    for _list_key in ("exclude", "warnings"):
+        if _list_key in manifest and isinstance(manifest[_list_key], str):
+            manifest[_list_key] = [e.strip() for e in manifest[_list_key].split(",") if e.strip()]
+    # signed_by reconstructed from signed_by_gpg / signed_by_ssh header lines
+    sb: Dict[str, str] = {}
+    _g = manifest.pop("signed_by_gpg", None)
+    _s = manifest.pop("signed_by_ssh", None)
+    if _g:
+        sb["gpg"] = _g
+    if _s:
+        sb["ssh"] = _s
+    if sb:
+        manifest["signed_by"] = sb
+    # schema_version is numeric
+    if "schema_version" in manifest:
+        try:
+            manifest["schema_version"] = int(manifest["schema_version"])
+        except (TypeError, ValueError):
+            pass
     return manifest
 
 
@@ -820,6 +1367,42 @@ def _load_manifest(path: Path) -> Dict:
     if path.suffix.lower() == ".json":
         return json.loads(text)
     return _parse_text_manifest(text)
+
+
+def check_manifest_schema(manifest: Dict, schema_ignore: bool, yes: bool) -> None:
+    """Three-direction schema_version check at verify time.
+
+    equal  → proceed
+    lower  → security warning + best-effort + interactive prompt (quiet auto-continues)
+    higher → refuse + exit 2, unless --schema-ignore
+    """
+    found = manifest.get("schema_version", 0)
+    try:
+        found = int(found)
+    except (TypeError, ValueError):
+        found = 0
+
+    if found == MANIFEST_SCHEMA_VERSION:
+        return
+
+    if found > MANIFEST_SCHEMA_VERSION:
+        if not schema_ignore:
+            _err(f"Manifest schema version {found} is newer than this tool "
+                 f"supports (max: {MANIFEST_SCHEMA_VERSION}).")
+            _err("        Upgrade rednb-verify, or re-run with --schema-ignore "
+                 "to attempt anyway.")
+            sys.exit(2)
+        _warn_security(f"--schema-ignore: verifying schema {found} with a tool that "
+                       f"supports {MANIFEST_SCHEMA_VERSION} — results may be unreliable.")
+        return
+
+    # found < current (old manifest, includes absent = 0)
+    _warn_security(f"Old manifest format (schema {found}); trust cannot be "
+                   "fully evaluated. Hash and signature checks still apply.")
+    if not _quiet and not yes and sys.stdin.isatty():
+        if input("Continue verifying this old manifest? [y/N]: ").strip().lower() != "y":
+            _info("Verification cancelled.")
+            sys.exit(0)
 
 
 def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path: Path) -> None:
@@ -897,93 +1480,111 @@ How would you like to sign this manifest?
     return 4
 
 
-def _sign_with_gpg(
-    manifest_path: Path,
+def _confirm_sign(warning_box: str, prompt: str, yes: bool) -> bool:
+    """Show the non-repudiation warning and confirm. -y / --quiet auto-confirm."""
+    if _quiet or yes:
+        return True
+    print(warning_box)
+    return input(prompt).strip().lower() == "y"
+
+
+def resolve_gpg_signer(
     key_fpr: Optional[str],
     key_file: Optional[Path],
-) -> None:
-    """Sign with GPG. key_file uses armored export; key_fpr pre-selects keyring key."""
+    trust_level: str,
+    config: Dict,
+    yes: bool,
+) -> Optional[str]:
+    """Resolve a GPG signing fingerprint: randomart → trust gate → confirm.
+
+    Returns the fingerprint to sign with, or None if unavailable/cancelled.
+    May exit(3) under --trust high with an untrusted key.
+    """
     if not gpg_available():
         _warn("GPG not available — GPG signing skipped.")
-        return
+        return None
 
-    # --- Key file path (temp homedir, no keyring pollution) ---
     if key_file:
-        if not _quiet:
-            print(NON_REPUDIATION_WARNING)
-            if input("Sign with GPG key file? [y/N]: ").strip().lower() != "y":
-                _info("GPG signing cancelled.")
-                return
-        if _gpg_sign_with_keyfile(manifest_path, key_file):
-            _ok("Manifest signed with GPG.")
-        else:
-            _warn("GPG signing failed.")
-        return
-
-    # --- Keyring path ---
-    try:
-        keys = list_secret_keys()
-    except subprocess.CalledProcessError:
-        _warn("Could not list GPG keys.")
-        return
-    if not keys:
-        _warn("No GPG secret keys found — GPG signing skipped.")
-        return
-
-    if key_fpr:
-        fpr = key_fpr
-        if not _quiet:
-            print(NON_REPUDIATION_WARNING)
-            if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-                _info("GPG signing cancelled.")
-                return
-    elif _quiet:
-        if len(keys) == 1:
-            fpr = keys[0]["fingerprint"]
-        else:
-            _err("--quiet with --gpg requires a fingerprint when multiple keys exist.")
-            _err(f"        Use: --gpg {keys[0]['fingerprint']}")
-            sys.exit(2)
+        fpr = gpg_fingerprint_from_keyfile(key_file)
+        if not fpr:
+            _warn("Could not read GPG key file — GPG signing skipped.")
+            return None
     else:
-        print(NON_REPUDIATION_WARNING)
-        if input("Sign this manifest with GPG? [y/N]: ").strip().lower() != "y":
-            _info("GPG signing cancelled.")
-            return
-        fpr = choose_gpg_key(keys)
-        if fpr is None:
-            _info("GPG signing cancelled.")
-            return
+        try:
+            keys = list_secret_keys()
+        except subprocess.CalledProcessError:
+            _warn("Could not list GPG keys.")
+            return None
+        if not keys:
+            _warn("No GPG secret keys found — GPG signing skipped.")
+            return None
+        if key_fpr:
+            fpr = _normalize_gpg_fpr(key_fpr)
+        elif _quiet or yes:
+            if len(keys) == 1:
+                fpr = _normalize_gpg_fpr(keys[0]["fingerprint"])
+            else:
+                _err("--quiet/-y with --gpg needs a fingerprint when multiple keys exist.")
+                _err(f"        Use: --gpg {keys[0]['fingerprint']}")
+                sys.exit(2)
+        else:
+            sel = choose_gpg_key(keys)
+            if sel is None:
+                _info("GPG signing cancelled.")
+                return None
+            fpr = _normalize_gpg_fpr(sel)
 
-    if gpg_detach_sign(manifest_path, fpr):
-        _ok("Manifest signed with GPG.")
-    else:
-        _warn("GPG signing failed.")
+    show_randomart_gpg(fpr)
+    trust_gate_signing("gpg", fpr, trust_level, config)   # may exit(3)
+    if not _confirm_sign(NON_REPUDIATION_WARNING,
+                         "Sign this manifest with GPG? [y/N]: ", yes):
+        _info("GPG signing cancelled.")
+        return None
+    return fpr
 
 
-def _sign_with_ssh(
-    manifest_path: Path,
-    sig_path: Path,
+def resolve_ssh_signer(
     ssh_key_path: Path,
     prefer_fido: bool,
     keyname: Optional[str],
-) -> None:
-    """Sign manifest with SSH."""
+    trust_level: str,
+    config: Dict,
+    yes: bool,
+) -> Optional[SshKeyCandidate]:
+    """Resolve an SSH signing key: randomart → trust gate → confirm."""
     if not ssh_keygen_available():
         _warn("ssh-keygen not available — SSH signing skipped.")
-        return
-    signer = select_ssh_key(ssh_key_path, require_private=True, prefer_fido=prefer_fido, keyname=keyname)
+        return None
+    signer = select_ssh_key(ssh_key_path, require_private=True,
+                            prefer_fido=prefer_fido, keyname=keyname)
     if signer is None or signer.priv_path is None:
         _warn("No suitable SSH key found for signing.")
-        return
-    if not _quiet:
-        print(SSH_NON_REPUDIATION_WARNING)
-        if input("Sign this manifest with SSH? [y/N]: ").strip().lower() != "y":
-            _info("SSH signing cancelled.")
-            return
-    if ssh_sign_manifest(manifest_path, signer.priv_path, sig_path):
-        _ok(f"SSH signature created: {sig_path.name}")
-    else:
-        _warn("SSH signing failed.")
+        return None
+    fpr = ssh_key_fingerprint(signer.pub_path)
+    show_randomart_ssh(signer.pub_path)
+    trust_gate_signing("ssh", fpr, trust_level, config)   # may exit(3)
+    if not _confirm_sign(SSH_NON_REPUDIATION_WARNING,
+                         "Sign this manifest with SSH? [y/N]: ", yes):
+        _info("SSH signing cancelled.")
+        return None
+    return signer
+
+
+def do_gpg_sign(manifest_path: Path, fpr: str, key_file: Optional[Path]) -> bool:
+    """Perform the GPG signature (keyfile via temp homedir, else keyring)."""
+    if key_file:
+        return _gpg_sign_with_keyfile(manifest_path, key_file)
+    return gpg_detach_sign(manifest_path, fpr)
+
+
+class ConciseArgumentParser(argparse.ArgumentParser):
+    """On a usage error, print a short message + hint instead of the full usage
+    block (the industry-standard pattern: `git`, `ls`, `cargo`, …)."""
+
+    def error(self, message: str):
+        _err(message)
+        sys.stderr.write(f"See '{self.prog} --help' for usage.\n")
+        sys.exit(2)
 
 
 def main():
@@ -1004,7 +1605,7 @@ def main():
     config = {} if _no_config else load_config(_config_path)
     _config_active = bool(config)
 
-    parser = argparse.ArgumentParser(
+    parser = ConciseArgumentParser(
         description="rednb-verify — RedNotebook integrity and tamper detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -1074,8 +1675,9 @@ examples:
 
 exit codes:
   0  all checks passed / manifest created successfully
-  1  verification found issues (modified, missing, or unexpected files)
+  1  verification found issues (modified/missing/new files, invalid or untrusted signature)
   2  usage or input error (bad arguments, missing files, unsupported algorithm)
+  3  signing refused (untrusted key under --trust high)
 
 supported hash algorithms:
   sha256 (default), sha512, sha3_256, sha3_512, blake2b, blake2s ...
@@ -1101,12 +1703,22 @@ supported hash algorithms:
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
                         help="Verification report format: txt (default) or json")
-    parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO",
-                        help="Hash algorithm for files (default: sha256)")
+    parser.add_argument("--no-bullets", action="store_true", dest="no_bullets",
+                        help="Text manifest: don't prefix per-file hash lines with '- '")
+    parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO[,ALGO...]",
+                        help="Hash algorithm(s) for files (default: sha256). Comma-separate "
+                             "for multi-hashing, e.g. sha256,blake2b")
     parser.add_argument("--hash-list", action="store_true",
                         help="Print available hash algorithms and exit")
     parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
-                        help="Hash algorithm for Merkle tree (default: same as --hash)")
+                        metavar="ALGO[,ALGO...]",
+                        help="Merkle tree algorithm(s). Single mode: tree combiner "
+                             "(default: same as --hash). Multi mode: selects which "
+                             "per-algo trees to build (subset of --hash; default: all).")
+    parser.add_argument("--hash-merkle-concatenate", nargs="?", const="sha256",
+                        default=None, dest="merkle_concat", metavar="ALGO",
+                        help="Build one Merkle tree whose leaves are the per-file "
+                             "concatenation of all file hashes (default combiner: sha256).")
     parser.add_argument("--gpg", nargs="?", const="", default=None, metavar="FINGERPRINT",
                         help="Sign with GPG; optionally specify key fingerprint (skips menu)")
     parser.add_argument("--gpg-k", type=Path, default=None, metavar="FILE",
@@ -1116,6 +1728,9 @@ supported hash algorithms:
                              "to scan (default: ~/.ssh)")
     parser.add_argument("--ssh-verify", action="store_true",
                         help="Force SSH signature check during --verify")
+    parser.add_argument("--ignore-sig", action="store_true", dest="ignore_sig",
+                        help="During --verify, check integrity only and skip all "
+                             "signature checks (returns 0 when hashes match)")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
                         help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
@@ -1133,7 +1748,7 @@ supported hash algorithms:
     parser.add_argument("--exclude", action="append", metavar="PATTERN",
                         help="Exclude files matching glob pattern (repeatable)")
     parser.add_argument("--exclude-from", type=Path, default=None, metavar="FILE",
-                        help="File of glob patterns to exclude (one per line, # = comment)")
+                        help="File of glob patterns to exclude (one literal pattern per line)")
     parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
                         help="Parallel hashing workers (0 = auto, default: 1)")
     parser.add_argument("-D", "--per-day", action="store_true",
@@ -1142,6 +1757,26 @@ supported hash algorithms:
                         help="Ignore ~/.config/rednb-verify/config.json for this run")
     parser.add_argument("--config", type=Path, metavar="FILE",
                         help="Load a specific config file instead of the default")
+    # --- Config management (Feature 1) ---
+    parser.add_argument("--set-cf", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="set_cf",
+                        help="Set a config field and exit (trust-gpg, trust-ssh, "
+                             "trust-level, dir). Repeatable. Replaces the field.")
+    parser.add_argument("--set-cf-run", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="set_cf_run",
+                        help="Like --set-cf but continue running after writing config.")
+    parser.add_argument("--add-trust", action="append", default=None, metavar="FIELD:VALUE",
+                        dest="add_trust",
+                        help="Append fingerprints to a trust list (trust-gpg / trust-ssh), "
+                             "de-duplicated. Repeatable.")
+    parser.add_argument("--config-out", action="store_true", dest="config_out",
+                        help="Print the resulting config as JSON (after --set-cf/--add-trust).")
+    parser.add_argument("--trust", choices=("high", "low"), default=None,
+                        help="Signing trust level: high (only pinned keys) or low (default).")
+    parser.add_argument("--schema-ignore", action="store_true", dest="schema_ignore",
+                        help="Verify a manifest with a newer schema version anyway (risky).")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Assume yes to confirmation prompts (automation-friendly).")
 
     # Apply config file as default layer (CLI args override)
     cfg: Dict = {}
@@ -1176,6 +1811,25 @@ supported hash algorithms:
         _err("--quiet and --verbose are mutually exclusive.")
         sys.exit(2)
 
+    # ---- Config management (Feature 1): mutate config, optionally write & exit ----
+    _set_tokens = (args.set_cf or []) + (args.set_cf_run or [])
+    _add_tokens = args.add_trust or []
+    _mutates_config = bool(_set_tokens or _add_tokens)
+    if _mutates_config:
+        if _no_config:
+            _err("Cannot modify config while --no-config/--no-cf is set.")
+            sys.exit(2)
+        apply_set_cf(config, _set_tokens)
+        apply_add_trust(config, _add_tokens)
+        save_config(config, _config_path)
+        _ok(f"Config updated: {_config_path}")
+    if args.config_out:
+        # In-memory config after any mutation (G3: disk state if no mutation).
+        print(json.dumps(config, indent=4, ensure_ascii=False))
+    # --set-cf / --add-trust are write-only: exit unless --set-cf-run was used.
+    if (_mutates_config or args.config_out) and not args.set_cf_run:
+        sys.exit(0)
+
     # Notify user that a config file is in effect
     if _config_active:
         _info(f"Using config: {_config_path}")
@@ -1191,16 +1845,28 @@ supported hash algorithms:
     # --hash-list: print available algorithms and exit (no notebook_dir needed)
     if args.hash_list:
         print("Available hash algorithms:")
-        for algo in sorted(hashlib.algorithms_guaranteed):
+        for algo in sorted(AVAILABLE_HASHES):
             if algo in _VARIABLE_LENGTH_ALGOS:
                 print(f"  {algo}:<length>   (e.g. --hash {algo}:32)")
             else:
                 print(f"  {algo}")
+        # Mention optional algos that aren't installed
+        missing = [a for a in _OPTIONAL_PIP if a not in AVAILABLE_HASHES]
+        if missing:
+            print("\nOptional (not installed):")
+            for a in missing:
+                print(f"  {a}   (pip install {_OPTIONAL_PIP[a]})")
+        print("\nCombine with commas for multi-hashing, e.g. --hash sha256,blake2b")
         sys.exit(0)
 
-    # notebook_dir required except for --resign and --hash-list
+    # notebook_dir: fall back to saved config "dir" when none given (Feature 1)
     if args.notebook_dir is None and not args.resign:
-        parser.error("notebook_dir is required")
+        saved_dir = config.get("dir")
+        if saved_dir:
+            args.notebook_dir = Path(os.path.expanduser(saved_dir))
+            _info(f"Using saved directory: {args.notebook_dir}")
+        else:
+            parser.error("notebook_dir is required")
 
     # --gpg-k implies --gpg
     if args.gpg_k is not None and args.gpg is None:
@@ -1210,6 +1876,15 @@ supported hash algorithms:
     if args.quiet and args.gpg is None and args.ssh is None:
         args.no_sign = True
 
+    # Resolve effective trust level (CLI > config > "low") and warn if mis-set.
+    trust_level = resolve_trust_level(args.trust, config)
+    if trust_level == "high":
+        _trust = config.get("trust", {})
+        if not _trust.get("gpg") and not _trust.get("ssh"):
+            _warn_security("Trust level is HIGH but no keys are pinned. "
+                           "All signing will be refused. "
+                           "Use --add-trust or --set-cf to pin fingerprints.")
+
     # Resolve SSH key location from --ssh argument (None → default ~/.ssh)
     ssh_key_path = (
         Path(os.path.expanduser(args.ssh))
@@ -1217,26 +1892,43 @@ supported hash algorithms:
         else Path(os.path.expanduser("~/.ssh"))
     )
 
-    args.merkle_algo = args.merkle_algo or args.hash_algo
+    # --hash may carry multiple comma-separated algos (multi-hashing).
+    hash_algos = [a.strip() for a in args.hash_algo.split(",") if a.strip()]
+    if not hash_algos:
+        _err("--hash requires at least one algorithm.")
+        sys.exit(2)
+    for spec in hash_algos:
+        _validate_algo_spec_or_exit(spec, "--hash")
+    args.hash_algos = hash_algos
 
-    for label, spec in [("--hash", args.hash_algo), ("--hash-merkle", args.merkle_algo)]:
-        algo_name, algo_len = _parse_algo_spec(spec)
-        try:
-            h = hashlib.new(algo_name)
-        except ValueError:
-            _err(f"Unsupported algorithm for {label}: {spec!r}")
-            sys.exit(2)
-        if algo_name in _VARIABLE_LENGTH_ALGOS and algo_len is None:
-            _err(f"{algo_name} requires a length: use {label} {algo_name}:32")
-            sys.exit(2)
-        if algo_name not in _VARIABLE_LENGTH_ALGOS and algo_len is not None:
-            _err(f"{algo_name} does not support a length parameter (remove :{algo_len})")
-            sys.exit(2)
-        try:
-            _hexdigest(h, algo_len)
-        except TypeError as exc:
-            _err(f"Algorithm error for {label} {spec!r}: {exc}")
-            sys.exit(2)
+    # Multi mode must include at least one strong hash (md5/sha1 not trusted alone).
+    multi = len(hash_algos) > 1
+    strong = [a for a in hash_algos if _parse_algo_spec(a)[0] not in _WEAK_ALGOS]
+    if multi and not strong:
+        _err("Multi-hashing needs at least one strong algorithm "
+             "alongside md5/sha1 (e.g. --hash sha256,md5).")
+        sys.exit(2)
+
+    # --hash-merkle: single mode = tree combiner; multi mode = tree selection.
+    args.merkle_select = None
+    if multi:
+        if args.merkle_algo:
+            sel = [a.strip() for a in args.merkle_algo.split(",") if a.strip()]
+            bad = [a for a in sel if a not in hash_algos]
+            if bad:
+                _err(f"--hash-merkle {', '.join(bad)} not in --hash set "
+                     f"({', '.join(hash_algos)}). In multi mode --hash-merkle "
+                     "selects which file-hash trees to build.")
+                sys.exit(2)
+            args.merkle_select = sel
+        args.merkle_algo = hash_algos[0]   # unused in multi; kept non-None
+    else:
+        args.merkle_algo = args.merkle_algo or hash_algos[0]
+        _validate_algo_spec_or_exit(args.merkle_algo, "--hash-merkle")
+
+    # --hash-merkle-concatenate: validate combiner algo if requested.
+    if args.merkle_concat:
+        _validate_algo_spec_or_exit(args.merkle_concat, "--hash-merkle-concatenate")
 
     # Parse --sig
     sig_paths: List[Path] = (
@@ -1254,9 +1946,11 @@ supported hash algorithms:
         if not excf.exists():
             _err(f"--exclude-from file not found: {excf}")
             sys.exit(2)
+        # Each non-blank line is a literal glob pattern. No comment syntax:
+        # a journal file may legitimately start with '#'.
         for raw_line in excf.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
-            if line and not line.startswith("#"):
+            if line:
                 exclude.append(line)
         _vprint(f"{_tag('INFO')} Loaded exclusion patterns from {excf.name}")
 
@@ -1296,11 +1990,24 @@ supported hash algorithms:
             (p for p in sig_paths if p.suffix in (".sshsig", ".sig")),
             manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
         )
+        # C3: --resign never rewrites the manifest (would break existing sigs),
+        # so signed_by is not updated here.
         _ok(f"Re-signing: {manifest_path.name}")
         if want_gpg:
-            _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
+            fpr = resolve_gpg_signer(args.gpg or None, args.gpg_k, trust_level, config, args.yes)
+            if fpr:
+                if do_gpg_sign(manifest_path, fpr, args.gpg_k):
+                    _ok("Manifest signed with GPG")
+                else:
+                    _warn("GPG signing failed")
         if want_ssh:
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
+            signer = resolve_ssh_signer(ssh_key_path, prefer_fido, keyname,
+                                        trust_level, config, args.yes)
+            if signer:
+                if ssh_sign_manifest(manifest_path, signer.priv_path, ssh_sig_out):
+                    _ok(f"SSH signature created: {ssh_sig_out.name}")
+                else:
+                    _warn("SSH signing failed")
         return
 
     # ------------------------------------------------------------------ #
@@ -1334,6 +2041,13 @@ supported hash algorithms:
             _err(f"Could not read manifest: {exc}")
             sys.exit(2)
 
+        # Schema version gate (three-direction check)
+        check_manifest_schema(manifest, args.schema_ignore, args.yes)
+
+        # Surface creation-time warnings recorded in the manifest (cosmetic, G6)
+        for w in manifest.get("warnings", []):
+            _warn(f"Manifest note: {w}")
+
         # Manifest age warning
         if args.warn_age is not None:
             try:
@@ -1349,75 +2063,142 @@ supported hash algorithms:
             except (KeyError, ValueError):
                 pass
 
+        # ---- Fail fast if the manifest uses an algorithm this build cannot
+        #      compute. Verifying only a subset would give false confidence. ----
+        _ha = manifest.get("hash_algorithm", "sha256")
+        _algos_used = _ha if isinstance(_ha, list) else [_ha]
+        _missing_algos: List[str] = []
+        for _spec in _algos_used:
+            _name = _parse_algo_spec(_spec)[0]
+            if _name not in AVAILABLE_HASHES and _name not in _missing_algos:
+                _missing_algos.append(_name)
+        if _missing_algos:
+            _hint = ", ".join(
+                f"{a} (pip install {_OPTIONAL_PIP[a]})" if a in _OPTIONAL_PIP else a
+                for a in _missing_algos
+            )
+            _qprint(f"{_tag('WARN')} Missing Algorithms: {_hint}")
+            sys.exit(1)
+
         results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
 
         report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
         write_report(results, report_path, manifest_path)
-        _ok(f"Verification report: {report_path}")
+        _info(f"Verification report: {report_path}")
 
-        # Resolve signature files
-        _SSH_EXTS = (".sshsig", ".sig")
-        if sig_paths:
-            gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
-            ssh_sigs = [p for p in sig_paths if p.suffix in _SSH_EXTS]
-            for p in sig_paths:
-                if p.suffix not in (".asc",) + _SSH_EXTS:
-                    _warn(f"Unknown signature type '{p.name}' — skipped (expected .asc or .sshsig).")
-        else:
-            auto_asc = manifest_path.with_suffix(manifest_path.suffix + ".asc")
-            gpg_sigs = [auto_asc] if auto_asc.exists() else []
-            auto_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
-            auto_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
-            ssh_sigs = [p for p in (auto_ssh, auto_sig) if p.exists()]
-            if args.ssh_verify and not ssh_sigs:
-                ssh_sigs = [auto_ssh]  # will report missing below
+        # ---- Integrity tallies ----
+        n_missing = len(results["missing"])
+        n_modified = len(results["modified"])
+        n_new = len(results["new"])
+        n_ok = len(results["ok"])
+        n_expected = n_ok + n_missing + n_modified   # files the manifest expects
+        integrity_failed = bool(n_missing or n_modified or n_new)
 
-        # GPG verification
-        if not gpg_sigs:
-            _warn("Manifest not GPG-signed.")
-        else:
+        # ---- Signature policy ----
+        # A manifest is treated as unsigned only if it carries the UNSIGNED
+        # marker AND names no signer.  Such manifests verify on integrity alone
+        # (exit 0).  A manifest that does NOT declare itself unsigned is assumed
+        # to expect a signature; if none validates, authenticity is unestablished
+        # and verification "completes with issues" (exit 1).
+        # --ignore-sig forces integrity-only checking on any manifest.
+        manifest_unsigned = (WARN_UNSIGNED in manifest.get("warnings", [])
+                             and not manifest.get("signed_by"))
+        check_sigs = not args.ignore_sig                # attempt signature checks?
+        if args.ignore_sig:
+            _warn("Flag --ignore-sig in use")
+        sig_required = check_sigs and (not manifest_unsigned or args.ssh_verify)
+
+        trust_failed = False   # C1: untrusted verified signer under --trust high
+        sig_invalid = False    # a signature that IS present failed to validate
+        sig_verified = False   # at least one signature validated successfully
+
+        if check_sigs:
+            # Resolve signature files
+            _SSH_EXTS = (".sshsig", ".sig")
+            if sig_paths:
+                gpg_sigs = [p for p in sig_paths if p.suffix == ".asc"]
+                ssh_sigs = [p for p in sig_paths if p.suffix in _SSH_EXTS]
+                for p in sig_paths:
+                    if p.suffix not in (".asc",) + _SSH_EXTS:
+                        _warn(f"Unknown signature type '{p.name}' — skipped "
+                              "(expected .asc or .sshsig)")
+            else:
+                auto_asc = manifest_path.with_suffix(manifest_path.suffix + ".asc")
+                gpg_sigs = [auto_asc] if auto_asc.exists() else []
+                auto_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
+                auto_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
+                ssh_sigs = [p for p in (auto_ssh, auto_sig) if p.exists()]
+
+            # GPG verification
             for gpg_sig in gpg_sigs:
                 if not gpg_sig.exists():
                     _warn(f"GPG signature not found: {gpg_sig.name}")
                 elif not gpg_available():
-                    _warn("GPG not available — GPG verification skipped.")
+                    _warn("GPG not available — GPG verification skipped")
                 else:
                     if gpg_verify(manifest_path, gpg_sig):
                         _ok(f"GPG signature verified: {gpg_sig.name}")
+                        sig_verified = True
+                        v_fpr = gpg_verified_fingerprint(manifest_path, gpg_sig)
+                        if v_fpr:
+                            show_randomart_gpg(v_fpr)
+                        if not trust_gate_verify("gpg", v_fpr, trust_level, config):
+                            trust_failed = True
                     else:
-                        _warn(f"GPG signature invalid: {gpg_sig.name}")
+                        sig_invalid = True
 
-        # SSH verification
-        for ssh_sig in ssh_sigs:
-            if not ssh_keygen_available():
-                _warn("ssh-keygen not available — SSH verification skipped.")
-                break
-            if not ssh_sig.exists():
-                _warn(f"SSH signature not found: {ssh_sig.name}")
-                continue
-            signer = select_ssh_key(ssh_key_path, require_private=False,
-                                    prefer_fido=prefer_fido, keyname=keyname)
-            if signer is None:
-                _warn("No suitable SSH key found for verification.")
-                continue
-            canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
-            result = ssh_verify_manifest(
-                manifest_path, ssh_sig, signer.pub_path,
-                multiple_signatures=len(ssh_sigs) > 1,
-                nonstandard_sig=ssh_sig != canonical_ssh,
-            )
-            if result.status == "OK":
-                _ok(result.message)
-            else:
-                _qprint(f"{_tag(result.status)} {result.message}")
-            for w in result.warnings:
-                _warn(w)
+            # SSH verification
+            for ssh_sig in ssh_sigs:
+                if not ssh_keygen_available():
+                    _warn("ssh-keygen not available — SSH verification skipped")
+                    break
+                if not ssh_sig.exists():
+                    _warn(f"SSH signature not found: {ssh_sig.name}")
+                    continue
+                signer = select_ssh_key(ssh_key_path, require_private=False,
+                                        prefer_fido=prefer_fido, keyname=keyname)
+                if signer is None:
+                    _warn("No suitable SSH key found for verification")
+                    continue
+                canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
+                result = ssh_verify_manifest(
+                    manifest_path, ssh_sig, signer.pub_path,
+                    multiple_signatures=len(ssh_sigs) > 1,
+                    nonstandard_sig=ssh_sig != canonical_ssh,
+                )
+                if result.status == "OK":
+                    _ok(result.message)
+                    sig_verified = True
+                    show_randomart_ssh(signer.pub_path)
+                    v_fpr = ssh_key_fingerprint(signer.pub_path)
+                    if not trust_gate_verify("ssh", v_fpr, trust_level, config):
+                        trust_failed = True
+                else:
+                    sig_invalid = True
+                for w in result.warnings:
+                    _warn(w)
 
-        if any(k != "ok" and results[k] for k in results):
-            _warn("Verification completed with issues.")
+        # ------------------------- Terminal verdict ------------------------- #
+        if integrity_failed:
+            _qprint(f"{_tag('FAIL')} {n_missing} Missing, {n_modified} Modified, "
+                    f"{n_new} New/Moved, {n_ok}/{n_expected} OK")
+        if sig_invalid:
+            _qprint(f"{_tag('FAIL')} Manifest failed Signature")
+        if trust_failed:
+            _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
+
+        if integrity_failed or sig_invalid or trust_failed:
             sys.exit(1)
 
-        _ok("Verification successful.")
+        # A manifest that expects a signature but produced none: hashes are
+        # intact, but authenticity could not be established.
+        if sig_required and not sig_verified:
+            _warn("Verification completed with issues")
+            sys.exit(1)
+
+        # Success.  Unsigned manifests pass on integrity alone — the UNSIGNED
+        # note printed above already flags the absence of a signature.
+        _ok("Verification successful")
         return
 
     # ------------------------------------------------------------------ #
@@ -1433,23 +2214,34 @@ supported hash algorithms:
     else:
         _mode_label = "full-tree"
     _vprint(f"Hashing ({_mode_label}): {args.notebook_dir}")
+
+    # Weak-hash-alone policy (single weak algo) — prompt unless -y/quiet (D2).
+    weak_specs = [a for a in args.hash_algos if _parse_algo_spec(a)[0] in _WEAK_ALGOS]
+    if weak_specs and not multi:
+        if not _quiet:
+            _warn(f"Weak hash in use alone: {', '.join(weak_specs)} — "
+                  "not collision-resistant.")
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    _err("Refusing to use a weak hash alone without confirmation "
+                         "(re-run with -y, or choose a strong hash).")
+                    sys.exit(2)
+                if input("Proceed with a weak hash? [y/N]: ").strip().lower() != "y":
+                    _info("Aborted.")
+                    sys.exit(2)
+
     manifest = generate_manifest(
-        args.notebook_dir, args.month_only, args.hash_algo, args.merkle_algo,
+        args.notebook_dir, args.month_only, args.hash_algos, args.merkle_algo,
         exclude=exclude,
         per_day=args.per_day,
         jobs=jobs,
+        merkle_select=args.merkle_select,
+        concat_algo=args.merkle_concat,
     )
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
     manifest_name = f"hashes-{manifest['created']}{ext}"
     manifest_path = out_dir / manifest_name
-    if manifest_fmt == "json":
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    else:
-        manifest_path.write_text(_write_text_manifest(manifest), encoding="utf-8")
-    _ok(f"Manifest created: {manifest_path}")
 
     # SSH sig output path: from --sig if a .sshsig path given, else default
     ssh_sig_out = next(
@@ -1457,26 +2249,66 @@ supported hash algorithms:
         manifest_path.with_suffix(manifest_path.suffix + ".sshsig"),
     )
 
-    # ---- Signing ----
+    # ---- Decide signing methods ----
+    do_gpg = do_ssh = False
     if args.no_sign:
-        _info("Signing skipped (--no-sign).")
-
-    elif want_gpg and want_ssh:
-        _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
-
-    elif want_gpg:
-        _sign_with_gpg(manifest_path, key_fpr=args.gpg or None, key_file=args.gpg_k)
-
-    elif want_ssh:
-        _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
-
+        pass
+    elif want_gpg or want_ssh:
+        do_gpg, do_ssh = want_gpg, want_ssh
     else:
-        sign_choice = _prompt_signing_menu()
-        if sign_choice in (1, 3):
-            _sign_with_gpg(manifest_path, key_fpr=None, key_file=None)
-        if sign_choice in (2, 3):
-            _sign_with_ssh(manifest_path, ssh_sig_out, ssh_key_path, prefer_fido, keyname)
+        choice = _prompt_signing_menu()
+        do_gpg, do_ssh = choice in (1, 3), choice in (2, 3)
+
+    # ---- Resolve identities BEFORE writing (so signatures cover signed_by, C2) ----
+    gpg_fpr: Optional[str] = None
+    ssh_signer: Optional[SshKeyCandidate] = None
+    if do_gpg:
+        gpg_fpr = resolve_gpg_signer(args.gpg or None, args.gpg_k,
+                                     trust_level, config, args.yes)
+    if do_ssh:
+        ssh_signer = resolve_ssh_signer(ssh_key_path, prefer_fido, keyname,
+                                        trust_level, config, args.yes)
+
+    # ---- signed_by (C1: a display hint; trust at verify uses the verified key) ----
+    signed_by: Dict[str, str] = {}
+    if gpg_fpr:
+        signed_by["gpg"] = gpg_fpr
+    if ssh_signer:
+        _sfpr = ssh_key_fingerprint(ssh_signer.pub_path)
+        if _sfpr:
+            signed_by["ssh"] = _sfpr
+    if signed_by:
+        manifest["signed_by"] = signed_by
+    else:
+        manifest.setdefault("warnings", [])
+        if WARN_UNSIGNED not in manifest["warnings"]:
+            manifest["warnings"].append(WARN_UNSIGNED)
+
+    # ---- Write the manifest (now contains signed_by / UNSIGNED) ----
+    if manifest_fmt == "json":
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    else:
+        manifest_path.write_text(
+            _write_text_manifest(manifest, bullets=not args.no_bullets),
+            encoding="utf-8",
+        )
+    if args.no_sign:
+        _info("Signing skipped (--no-sign)")
+    _ok(f"Manifest created: {manifest_path}")
+
+    # ---- Sign the finished file ----
+    if gpg_fpr:
+        if do_gpg_sign(manifest_path, gpg_fpr, args.gpg_k):
+            _ok("Manifest signed with GPG.")
+        else:
+            _warn("GPG signing failed.")
+    if ssh_signer:
+        if ssh_sign_manifest(manifest_path, ssh_signer.priv_path, ssh_sig_out):
+            _ok(f"SSH signature created: {ssh_sig_out.name}")
+        else:
+            _warn("SSH signing failed.")
 
 
 if __name__ == "__main__":
