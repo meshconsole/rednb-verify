@@ -1,6 +1,6 @@
 # rednb-verify
 
-**rednb-verify** (short for *rednotebook-verify*) is an integrity and verification tool designed to detect tampering in **RedNotebook** journals.
+**rednb-verify** (short for *rednotebook-verify*) is an integrity and verification tool designed to detect tampering in **RedNotebook** journals or file directories.
 
 It creates cryptographic manifests of notebook entries and optionally signs them with GPG or SSH keys, producing a verifiable snapshot of the notebook at a specific point in time.
 
@@ -67,47 +67,93 @@ python rednb-verify.py --resign hashes-20260528T120000Z.txt --gpg
 
 ---
 
+## What This Tool Is Not
+
+- **Not encryption** — files remain readable; this tool proves whether they changed
+- **Not access control** — anyone with file access can read entries
+- **Not a backup** — integrity verification only
+
+---
+
+## Non-Repudiation Warning ⚠️
+
+**Signing a manifest is a serious cryptographic act.**
+
+By signing, you assert that these files existed in this exact form at or before the signing time. Anyone with your public key can verify this claim.
+
+- You cannot later deny authorship of signed content
+- If your signing key is compromised, past signatures remain valid
+- Sign only on trusted systems
+- Prefer hardware-backed keys (FIDO2 / smart cards)
+
+---
+
 ## Usage
 
 ```
 rednb-verify.py [options] [notebook_dir]
 ```
 
-### Normal operation
+### Manifest creation
+
+Run the tool against a directory to hash its contents and write a manifest. Signing happens at creation time (or later with `--resign`).
 
 | Flag | Description |
 |---|---|
-| `notebook_dir` | Path to the RedNotebook journal directory (optional if `dir` is saved in config) |
+| `notebook_dir` | Path to the RedNotebook journal (or any directory) to hash (optional if `dir` is saved in config) |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
 | `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
 | `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
-| `-V`, `--version` | Print version and exit |
-| `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
 | `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
-| `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
 | `--no-bullets` | In a `txt` manifest, don't prefix per-file hash lines with `- ` (Merkle-root lines are never bulleted) |
 | `--hash ALGO[:LEN][,ALGO...]` | Hash algorithm(s) for files (default: `sha256`). Comma-separate for **multi-hashing** (e.g. `sha256,blake2b`). `shake_128`/`shake_256` require a byte length: `shake_128:32` |
 | `--hash-list` | Print available hash algorithms (incl. optional `blake3`/`xxh3`) and exit |
 | `--hash-merkle ALGO[,...]` | Single mode: Merkle tree combiner (default: same as `--hash`). Multi mode: selects which per-algo trees to build (subset of `--hash`) |
 | `--hash-merkle-concatenate [ALGO]` | Build one Merkle tree whose leaves are the per-file concatenation of all file hashes (default combiner: `sha256`) |
+| `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
+| `--exclude-from FILE` | File of glob patterns to exclude — one literal pattern per line. No comment syntax: a journal filename may legitimately start with `#` |
+| `--symlink-targets MODE` | How to record symlink targets: `none` \| `full` \| `hash[:ALGO[:LEN]]` (default: `hash` = sha256 of the target). See [Symlinks](#symlinks) |
+| `--no-symlink-table` | Omit the symlink table (alias for `--symlink-targets none`) |
 | `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
 | `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
 | `--ssh [FILE_OR_DIR]` | Sign with SSH key; optionally specify a `.pub` file or directory to scan (default: `~/.ssh`) |
+| `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
+| `--trust [high\|low]` | Signing trust level (default: `low`). `high` only allows pinned keys to sign — and also rejects untrusted signers at verify |
+| `--no-sign` | Skip all signing prompts |
+| `--resign FILE` | Re-sign an existing manifest without re-hashing or rewriting it (requires `--gpg` and/or `--ssh`) |
+
+### Verification
+
+Check a directory against a previously created manifest.
+
+| Flag | Description |
+|---|---|
+| `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
+| `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
-| `--ssh-fido [NAME]` | Prefer FIDO2/hardware-backed SSH keys; optional name filter |
-| `--trust [high\|low]` | Signing trust level (default: `low`). `high` only allows pinned keys to sign and rejects untrusted signers at verify |
-| `--no-sign` | Skip all signing prompts |
-| `--resign FILE` | Re-sign an existing manifest without re-hashing or rewriting it (requires `--gpg` and/or `--ssh`) |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
 | `--schema-ignore` | Verify a manifest whose schema is newer than this tool supports (risky) |
+
+### Validation
+
+Check a manifest's structure without touching the journal — useful in CI or before relying on a manifest.
+
+| Flag | Description |
+|---|---|
+| `--validate [FILE\|DIR]` | Validate a manifest against the bundled JSON schema and exit. Requires the optional `jsonschema` package. See [Schema & Validation](#schema--validation) |
+
+### Other
+
+| Flag | Description |
+|---|---|
+| `-V`, `--version` | Print version and exit |
 | `-v`, `--verbose` | Print per-file hash timing and detailed progress |
 | `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
 | `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
-| `--exclude PATTERN` | Exclude files matching a glob pattern (repeatable); patterns stored in the manifest |
-| `--exclude-from FILE` | File of glob patterns to exclude — one literal pattern per line. No comment syntax: a journal filename may legitimately start with `#` |
+| `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
 
 ### Config management
 
@@ -189,6 +235,15 @@ python rednb-verify.py ~/journal \
 python rednb-verify.py ~/journal \
   --verify ~/journal/hashes-20260528T120000Z.txt \
   --warn-age 90
+
+# Record symlink targets as cleartext (local/forensic use)
+python rednb-verify.py ~/journal --no-sign --symlink-targets full
+
+# Privacy mode — don't record a symlink table at all
+python rednb-verify.py ~/journal --no-sign --privacy
+
+# Validate a manifest against the JSON schema (needs: pip install jsonschema)
+python rednb-verify.py --validate ~/journal/hashes-20260528T120000Z.json
 ```
 
 ---
@@ -202,12 +257,15 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 ```
 rednb-verify manifest
 version: 0.8.0
+schema_version: 2
 created: 20260528T120000Z
 date: 2026-05-28
 hash_algorithm: sha256
-merkle_hash: sha256
 mode: full-tree
+merkle_hash: sha256
 merkle_root: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
+
+symlinks: (targets: hash:sha256)
 
 files:
       1. 2026-05.txt
@@ -216,7 +274,7 @@ files:
          - sha256: a3f1bc8e0d2741c59930cf5a29e4b87d3e1092f54c8d70a1e3b29d84c7f02e11
 ```
 
-Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines are not. Use `--no-bullets` to omit the bullets.
+Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines are not. Use `--no-bullets` to omit the bullets. The `symlinks:` section lists any symbolic links (empty here) — see [Symlinks](#symlinks).
 
 ### JSON format (`--manifest-type json`)
 
@@ -224,27 +282,35 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 {
   "tool": "rednb-verify",
   "version": "0.8.0",
+  "schema_version": 2,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
+  "mode": "full-tree",
   "hash_algorithm": "sha256",
   "merkle_hash": "sha256",
-  "mode": "full-tree",
   "files": [
     {
       "path": "2026-05.txt",
       "sha256": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf"
     }
   ],
-  "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf"
+  "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf",
+  "symlink_targets": "hash:sha256",
+  "symlinks": []
 }
 ```
 
+The full JSON structure is described by the published schema — see [Schema & Validation](#schema--validation).
+
 **Fields:**
+- `schema_version` — manifest format version (`2`); verifying an older one prints a security warning
 - `hash_algorithm` — algorithm used for individual file hashes; also the field name on each file entry
 - `merkle_hash` — algorithm used to compute the Merkle tree root
+- `merkle_root` — root of the [Merkle tree](#merkle-tree) over the file hashes
 - `date` — creation date in `YYYY-MM-DD` for human readability
 - `created` — full UTC timestamp for machine use
 - `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
+- `symlink_targets` / `symlinks` — symlink recording policy and table (see [Symlinks](#symlinks))
 
 ---
 
@@ -470,6 +536,95 @@ The duplicate-leaf attack no longer works — a four-file set `[alpha, beta, gam
 
 ---
 
+## Symlinks
+
+Symbolic links are a blind spot for a naive integrity tool: a symlinked file is hashed by its *target's* content, so swapping a real file for a link to an identical-content file elsewhere — or quietly repointing a link — leaves the file hash unchanged. rednb-verify follows symlinks (so their content is still hashed) **and** records a separate **symlink table** committing to where each link points.
+
+At verify time this catches what content hashing alone cannot:
+
+- a recorded symlink that vanished or became a regular file (`Sym removed`)
+- a symlink whose target changed (`Sym changed`)
+- a symlink that appeared where the manifest committed to none (`Sym new`)
+
+Any of these fails verification (**exit 1**). The table is recorded even when a notebook has zero symlinks, so a link added later is still detected.
+
+### Recording policy — `--symlink-targets`
+
+The target path itself can be sensitive — it may expose home directories, usernames, or the existence of off-notebook data — and a manifest is meant to be shared and signed. So the default records a **hash** of the target, not the path:
+
+| Mode | What the manifest stores | Use when |
+|---|---|---|
+| `hash` *(default)* | `sha256` of the target — detects changes, reveals nothing | almost always |
+| `hash:ALGO[:LEN]` | same, with a chosen algorithm (e.g. `hash:blake2b`) | you standardise on another hash |
+| `full` | the cleartext target path | local/forensic use where the path is not sensitive |
+| `none` | no table at all | you don't want symlinks recorded |
+
+`--no-symlink-table` is an alias for `--symlink-targets none`, and `--privacy` implies it.
+
+In the manifest, hashed and cleartext entries are distinguished by field:
+
+```json
+"symlink_targets": "hash:sha256",
+"symlinks": [
+  { "path": "journal/old.txt", "target_hash": "9f2c…" }
+]
+```
+
+```json
+"symlink_targets": "full",
+"symlinks": [
+  { "path": "journal/old.txt", "target": "/home/user/archive/2024.txt" }
+]
+```
+
+---
+
+## Schema & Validation
+
+Every JSON manifest conforms to a published **JSON Schema** (Draft 2020-12), shipped in the repo at [`schema/manifest-v2.schema.json`](schema/manifest-v2.schema.json). It lets you catch a malformed or truncated manifest *before* trusting it — handy in CI, or before archiving.
+
+Validate with the built-in flag (requires the optional `jsonschema` package):
+
+```bash
+pip install jsonschema
+
+# Validate a specific manifest
+python rednb-verify.py --validate hashes-20260617T120000Z.json
+
+# Validate the latest manifest in a directory
+python rednb-verify.py --validate ~/journal
+```
+
+Exit codes: `0` valid, `1` schema-invalid (errors are printed with their location), `2` usage error or `jsonschema` not installed.
+
+You can also validate with any standard tool, e.g. [`check-jsonschema`](https://github.com/python-jsonschema/check-jsonschema):
+
+```bash
+check-jsonschema --schemafile schema/manifest-v2.schema.json hashes-*.json
+```
+
+A minimal valid manifest looks like:
+
+```json
+{
+  "tool": "rednb-verify",
+  "version": "0.8.0",
+  "schema_version": 2,
+  "created": "20260617T120000Z",
+  "date": "2026-06-17",
+  "mode": "month-only",
+  "hash_algorithm": "sha256",
+  "files": [
+    { "path": "2026-06.txt", "sha256": "be9d587d…" }
+  ],
+  "merkle_root": "bb1e6ce6…",
+  "symlink_targets": "hash:sha256",
+  "symlinks": []
+}
+```
+
+---
+
 ## Trust & Signing
 
 `--trust` controls which keys may sign and which signers are accepted at verify:
@@ -528,27 +683,6 @@ A notification is printed when a config file is in use. Use `--no-config` / `--n
 
 ---
 
-## What This Tool Is Not
-
-- **Not encryption** — files remain readable; this tool proves whether they changed
-- **Not access control** — anyone with file access can read entries
-- **Not a backup** — integrity verification only
-
----
-
-## Non-Repudiation Warning ⚠️
-
-**Signing a manifest is a serious cryptographic act.**
-
-By signing, you assert that these files existed in this exact form at or before the signing time. Anyone with your public key can verify this claim.
-
-- You cannot later deny authorship of signed content
-- If your signing key is compromised, past signatures remain valid
-- Sign only on trusted systems
-- Prefer hardware-backed keys (FIDO2 / smart cards)
-
----
-
 ## Threat Model
 
 ### Assets Protected
@@ -595,7 +729,7 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 
 ## Design Principles
 
-- Single file, minimal dependencies (stdlib only; PyYAML optional for `--per-day`)
+- Single file, minimal dependencies (stdlib only; PyYAML optional for `--per-day`, jsonschema optional for `--validate`)
 - Deterministic output
 - Explicit trust boundaries
 - No hidden metadata
