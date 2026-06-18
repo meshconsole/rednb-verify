@@ -16,6 +16,7 @@ Normal operation:
 "-o", "--output"             : Output directory for manifest (default: journal parent)
 "-V", "--version"            : Print version and exit
 "--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
+"--validate [FILE|DIR]"       : Validate a manifest against the JSON schema and exit (needs optional jsonschema)
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
 "--report txt|json"           : Report format during --verify (default: txt)
 "--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
@@ -40,6 +41,9 @@ Normal operation:
 "-y", "--yes"                : Assume yes to confirmation prompts
 "--exclude PATTERN"           : Exclude files matching glob (repeatable)
 "--exclude-from FILE"         : File of glob patterns to exclude (one literal pattern per line)
+"--symlink-targets MODE"      : Record symlink targets: none|full|hash[:ALGO[:LEN]] (default: hash = sha256 of target)
+"--no-symlink-table"          : Omit the symlink table (alias for --symlink-targets none)
+"--privacy"                   : Minimise manifest disclosure (currently implies --no-symlink-table)
 
 Config management:
 "--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
@@ -967,6 +971,10 @@ def collect_files(
             path = Path(root) / name
             rel = path.relative_to(base)
             rel_str = rel.as_posix()
+            # Broken symlinks have no content to hash; they are still recorded
+            # in the symlink table. Skipping them here avoids an open() crash.
+            if path.is_symlink() and not path.exists():
+                continue
             if month_only and not is_month_file(path):
                 continue
             if any(fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_str, pat) for pat in exclude):
@@ -1002,6 +1010,76 @@ def collect_files(
                 files[rel_str] = h
 
     return dict(sorted(files.items()))
+
+
+def _hash_target(target: str, algo_spec: str) -> str:
+    """Hash a symlink target string (utf-8) with an 'algo[:length]' spec.
+
+    Used so the manifest can commit to *where* a symlink points without storing
+    the path in cleartext — the target may reveal home directories, usernames,
+    or the existence of off-notebook data, which is sensitive in a shareable,
+    signed artifact.
+    """
+    algo, length = _parse_algo_spec(algo_spec)
+    h = _new_hasher(algo)
+    h.update(target.encode("utf-8"))
+    return _hexdigest(h, length)
+
+
+def collect_symlinks(base: Path, exclude: Optional[List[str]] = None) -> Dict[str, str]:
+    """Return {rel_posix_path: raw_target} for every symlink under base.
+
+    Both file and directory symlinks are reported (os.walk does not descend into
+    symlinked directories, so they would otherwise go unrecorded). The literal
+    link target from os.readlink is returned verbatim — that is the value an
+    attacker changes when repointing a link, so it is what we commit to.
+    """
+    exclude = exclude or []
+    out: Dict[str, str] = {}
+    for root, dirs, filenames in os.walk(base):  # followlinks=False (default)
+        for name in list(dirs) + list(filenames):
+            path = Path(root) / name
+            if not path.is_symlink():
+                continue
+            rel = path.relative_to(base).as_posix()
+            if any(fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel, pat)
+                   for pat in exclude):
+                continue
+            try:
+                out[rel] = os.readlink(path)
+            except OSError:
+                out[rel] = ""
+    return dict(sorted(out.items()))
+
+
+def _build_symlink_table(links: Dict[str, str], policy: str) -> List[Dict[str, str]]:
+    """Turn {path: target} into manifest entries per the symlink policy.
+
+    policy is 'full' (store cleartext target) or 'hash:<algo-spec>' (store a
+    digest of the target). 'none' is handled by the caller (no table at all).
+    """
+    if policy == "full":
+        return [{"path": p, "target": t} for p, t in links.items()]
+    spec = policy.split(":", 1)[1]
+    return [{"path": p, "target_hash": _hash_target(t, spec)} for p, t in links.items()]
+
+
+def _resolve_symlink_policy(args) -> str:
+    """Turn the --symlink-targets / --no-symlink-table / --privacy flags into a
+    canonical policy string: 'none', 'full', or 'hash:<algo-spec>'."""
+    if getattr(args, "no_symlink_table", False) or getattr(args, "privacy", False):
+        return "none"
+    raw = (getattr(args, "symlink_targets", None) or "hash").strip()
+    if raw in ("none", "full"):
+        return raw
+    if raw == "hash":
+        return "hash:sha256"
+    if raw.startswith("hash:"):
+        spec = raw[len("hash:"):]
+        _validate_algo_spec_or_exit(spec, "--symlink-targets")
+        return "hash:" + spec
+    _err(f"--symlink-targets must be none|full|hash[:ALGO[:LEN]], got: {raw!r}")
+    sys.exit(2)
 
 
 def collect_files_per_day(
@@ -1102,6 +1180,7 @@ def generate_manifest(
     jobs: int = 1,
     merkle_select: Optional[List[str]] = None,
     concat_algo: Optional[str] = None,
+    symlink_policy: str = "hash:sha256",
 ) -> Dict:
     algos = sorted(algos)          # alphabetical ordering throughout (man notes)
     multi = len(algos) > 1
@@ -1187,6 +1266,17 @@ def generate_manifest(
 
     if exclude:
         manifest["exclude"] = exclude
+
+    # Symlink table (schema v2). Symlinked files are also content-hashed above;
+    # the table additionally commits to where each link points so a file<->link
+    # swap or a target change is detectable. The table is recorded even when
+    # empty so the manifest commits to "zero symlinks here" — a symlink added
+    # later is then caught as new. 'none' records nothing at all.
+    if symlink_policy != "none":
+        links = collect_symlinks(notebook, exclude=exclude)
+        manifest["symlink_targets"] = symlink_policy
+        manifest["symlinks"] = _build_symlink_table(links, symlink_policy)
+
     if warnings:
         manifest["warnings"] = warnings
     return manifest
@@ -1200,7 +1290,10 @@ def verify_manifest(
     extra_exclude: Optional[List[str]] = None,
     jobs: int = 1,
 ) -> Dict[str, List[str]]:
-    results: Dict[str, List[str]] = {"ok": [], "missing": [], "modified": [], "new": []}
+    results: Dict[str, List[str]] = {
+        "ok": [], "missing": [], "modified": [], "new": [],
+        "symlink_ok": [], "symlink_changed": [], "symlink_missing": [], "symlink_new": [],
+    }
     ha = manifest.get("hash_algorithm", "sha256")
     multi = isinstance(ha, list)
     algos = sorted(ha) if multi else [ha]
@@ -1244,6 +1337,33 @@ def verify_manifest(
     for path in actual:
         if path not in expected:
             results["new"].append(path)
+
+    # ---- Symlink table comparison (schema v2) ----
+    # Detects a recorded symlink that vanished or became a regular file
+    # (symlink_missing), one whose target changed (symlink_changed), and any
+    # symlink present now but not recorded (symlink_new) — e.g. a regular file
+    # swapped for a link. Content checks above can't catch identical-content or
+    # link<->file swaps, so this is where that tamper-evidence lives.
+    policy = manifest.get("symlink_targets")
+    recorded = manifest.get("symlinks")
+    if recorded is not None and policy and policy != "none":
+        current = collect_symlinks(notebook, exclude=exclude)
+        expected_links = {e["path"]: e for e in recorded}
+        use_hash = policy.startswith("hash:")
+        spec = policy.split(":", 1)[1] if use_hash else None
+        for p, entry in expected_links.items():
+            if p not in current:
+                results["symlink_missing"].append(p)
+                continue
+            if use_hash:
+                matches = _hash_target(current[p], spec) == entry.get("target_hash")
+            else:
+                matches = current[p] == entry.get("target")
+            (results["symlink_ok"] if matches else results["symlink_changed"]).append(p)
+        for p in current:
+            if p not in expected_links:
+                results["symlink_new"].append(p)
+
     return results
 
 
@@ -1287,6 +1407,16 @@ def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
             lines.append(f"         {a}: {manifest['merkle_roots'][a]}")
     else:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
+    # Symlink table (schema v2): a numbered "path -> target" list, with the
+    # recording policy noted on the header line so verify knows how to compare.
+    # Written even when empty so the manifest still commits to "zero symlinks".
+    if "symlinks" in manifest:
+        policy = manifest.get("symlink_targets", "hash:sha256")
+        lines += ["", f"symlinks: (targets: {policy})"]
+        for i, entry in enumerate(manifest["symlinks"], 1):
+            tgt = entry.get("target", entry.get("target_hash", ""))
+            lines.append(f"  {i:>5}. {entry['path']} -> {tgt}")
+
     bullet = "- " if bullets else ""
     lines += ["", "files:"]
     for i, entry in enumerate(manifest["files"], 1):
@@ -1305,17 +1435,31 @@ def _parse_text_manifest(text: str) -> Dict:
     manifest: Dict = {}
     raw_files: List[Dict] = []      # [{"path":p, "_hashes":{algo:hash}}]
     merkle_roots: Dict[str, str] = {}
-    section = "header"              # header → merkle_roots → files
+    sym_entries: List[tuple] = []   # [(path, target_or_hash)]
+    sym_policy: Optional[str] = None
+    saw_symlinks = False            # header seen, even if the table is empty
+    section = "header"              # header → merkle_roots → symlinks → files
     current: Optional[Dict] = None
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("rednb-verify manifest"):
+        if stripped.startswith("rednb-verify manifest"):
+            # The "tool" field is implied by this banner in text format;
+            # reconstruct it so the parsed dict matches the JSON schema.
+            manifest["tool"] = "rednb-verify"
+            continue
+        if not stripped:
             continue
         if stripped == "files:":
             section = "files"
             continue
         if stripped == "merkle_roots:":
             section = "merkle_roots"
+            continue
+        if stripped.startswith("symlinks:"):
+            section = "symlinks"
+            saw_symlinks = True
+            m = _re.search(r"targets:\s*([^)]+)", stripped)
+            sym_policy = m.group(1).strip() if m else "hash:sha256"
             continue
         if section == "header":
             if ": " in stripped:
@@ -1325,6 +1469,10 @@ def _parse_text_manifest(text: str) -> Dict:
             if ": " in stripped:
                 a, _, root = stripped.partition(": ")
                 merkle_roots[a.strip()] = root.strip()
+        elif section == "symlinks":
+            m = _re.match(r"\d+\.\s+(.+?)\s+->\s+(.*)$", stripped)
+            if m:
+                sym_entries.append((m.group(1).strip(), m.group(2).strip()))
         else:  # files
             m = _re.match(r"\d+\.\s+(.+)", stripped)
             if m:
@@ -1363,6 +1511,13 @@ def _parse_text_manifest(text: str) -> Dict:
     manifest["files"] = files_out
     if multi:
         manifest["merkle_roots"] = merkle_roots
+
+    # Rebuild the symlink table from the parsed entries (empty table preserved).
+    if saw_symlinks:
+        policy = sym_policy or "hash:sha256"
+        manifest["symlink_targets"] = policy
+        key = "target_hash" if policy.startswith("hash:") else "target"
+        manifest["symlinks"] = [{"path": p, key: t} for p, t in sym_entries]
 
     # exclude / warnings stored as comma-separated strings — convert to lists
     for _list_key in ("exclude", "warnings"):
@@ -1446,11 +1601,84 @@ def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path
         f"{'Missing:':<10} {len(results['missing'])}",
         f"{'Modified:':<10} {len(results['modified'])}",
     ]
-    for label, key in [("OK", "ok"), ("NEW", "new"), ("MISSING", "missing"), ("MODIFIED", "modified")]:
-        if results[key]:
+    # Symlink tallies (schema v2) — only shown when the manifest carried a table.
+    _sym_keys = ("symlink_ok", "symlink_changed", "symlink_missing", "symlink_new")
+    if any(results.get(k) for k in _sym_keys):
+        lines += [
+            "",
+            f"{'Symlinks OK:':<14} {len(results['symlink_ok'])}",
+            f"{'Sym changed:':<14} {len(results['symlink_changed'])}",
+            f"{'Sym removed:':<14} {len(results['symlink_missing'])}",
+            f"{'Sym new:':<14} {len(results['symlink_new'])}",
+        ]
+    sections = [
+        ("OK", "ok"), ("NEW", "new"), ("MISSING", "missing"), ("MODIFIED", "modified"),
+        ("SYMLINK CHANGED", "symlink_changed"),
+        ("SYMLINK REMOVED", "symlink_missing"),
+        ("SYMLINK NEW", "symlink_new"),
+    ]
+    for label, key in sections:
+        if results.get(key):
             numbered = [f"  {i:>5}. {f}" for i, f in enumerate(sorted(results[key]), 1)]
             lines += ["", f"--- {label} ---"] + numbered
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
+    """Resolve a --verify / --validate argument to a manifest file path.
+
+    Accepts an explicit file, a directory to search for the latest manifest, or
+    the '__auto__' sentinel (search the output directory).
+    """
+    if arg == "__auto__":
+        arg = str(out_dir)
+    target = Path(arg)
+    if target.is_dir():
+        candidates = sorted(
+            list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
+        )
+        if not candidates:
+            _err(f"No manifest found in {target}")
+            sys.exit(2)
+        _info(f"Using latest manifest: {candidates[-1].name}")
+        return candidates[-1]
+    target = target.resolve()
+    if not target.exists():
+        _err(f"Manifest not found: {target}")
+        sys.exit(2)
+    return target
+
+
+def validate_manifest_schema(manifest: Dict) -> List[str]:
+    """Validate a manifest dict against the bundled JSON schema.
+
+    Returns a list of human-readable error strings ([] means valid). The
+    'jsonschema' package is an optional dependency — keeping it out of the
+    core requirements preserves the stdlib-only default install — so this
+    exits(2) with install guidance when it is missing.
+    """
+    try:
+        import jsonschema
+    except ImportError:
+        _err("--validate needs the optional 'jsonschema' package: "
+             "pip install jsonschema")
+        sys.exit(2)
+    schema_path = Path(__file__).resolve().parent / "schema" / "manifest-v2.schema.json"
+    if not schema_path.exists():
+        _err(f"Schema file not found: {schema_path}")
+        sys.exit(2)
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _err(f"Could not read schema: {exc}")
+        sys.exit(2)
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.path))
+    out: List[str] = []
+    for e in errors:
+        loc = "/".join(str(p) for p in e.path) or "<root>"
+        out.append(f"{loc}: {e.message}")
+    return out
 
 
 # ---------- CLI ----------
@@ -1801,6 +2029,20 @@ supported hash algorithms:
                         help="Signing trust level: high (only pinned keys) or low (default).")
     parser.add_argument("--schema-ignore", action="store_true", dest="schema_ignore",
                         help="Verify a manifest with a newer schema version anyway (risky).")
+    parser.add_argument("--symlink-targets", default="hash", dest="symlink_targets",
+                        metavar="none|full|hash[:ALGO[:LEN]]",
+                        help="How to record symlink targets (default: hash = sha256 of "
+                             "the target). 'full' stores the cleartext target; 'none' "
+                             "omits the table.")
+    parser.add_argument("--no-symlink-table", action="store_true", dest="no_symlink_table",
+                        help="Omit the symlink table (alias for --symlink-targets none).")
+    parser.add_argument("--privacy", action="store_true",
+                        help="Minimise disclosure in the manifest (currently implies "
+                             "--no-symlink-table).")
+    parser.add_argument("--validate", nargs="?", const="__auto__", default=None,
+                        metavar="MANIFEST_OR_DIR",
+                        help="Validate a manifest against the JSON schema and exit "
+                             "(requires the optional 'jsonschema' package).")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Assume yes to confirmation prompts (automation-friendly).")
 
@@ -1885,8 +2127,9 @@ supported hash algorithms:
         print("\nCombine with commas for multi-hashing, e.g. --hash sha256,blake2b")
         sys.exit(0)
 
-    # notebook_dir: fall back to saved config "dir" when none given (Feature 1)
-    if args.notebook_dir is None and not args.resign:
+    # notebook_dir: fall back to saved config "dir" when none given (Feature 1).
+    # --validate works on a manifest alone, so it doesn't need a notebook dir.
+    if args.notebook_dir is None and not args.resign and args.validate is None:
         saved_dir = config.get("dir")
         if saved_dir:
             args.notebook_dir = Path(os.path.expanduser(saved_dir))
@@ -1989,8 +2232,11 @@ supported hash algorithms:
     # Resolve output directory
     if args.resign:
         out_dir = (args.output or args.resign.resolve().parent).resolve()
-    else:
+    elif args.notebook_dir is not None:
         out_dir = (args.output or args.notebook_dir.resolve().parent).resolve()
+    else:
+        # --validate with no notebook dir: search/anchor at the cwd.
+        out_dir = (args.output or Path.cwd()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     want_gpg = args.gpg is not None
@@ -2034,6 +2280,25 @@ supported hash algorithms:
                     _ok(f"SSH signature created: {ssh_sig_out.name}")
                 else:
                     _warn("SSH signing failed")
+        return
+
+    # ------------------------------------------------------------------ #
+    #  Validate mode (JSON schema check only)                             #
+    # ------------------------------------------------------------------ #
+    if args.validate is not None:
+        manifest_path = _resolve_manifest_path(args.validate, out_dir)
+        try:
+            manifest = _load_manifest(manifest_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _err(f"Could not read manifest: {exc}")
+            sys.exit(2)
+        errors = validate_manifest_schema(manifest)
+        if errors:
+            _err(f"Manifest failed schema validation ({len(errors)} error(s)):")
+            for e in errors:
+                _err(f"  {e}")
+            sys.exit(1)
+        _ok(f"Manifest is schema-valid: {manifest_path.name}")
         return
 
     # ------------------------------------------------------------------ #
@@ -2119,6 +2384,12 @@ supported hash algorithms:
         n_ok = len(results["ok"])
         n_expected = n_ok + n_missing + n_modified   # files the manifest expects
         integrity_failed = bool(n_missing or n_modified or n_new)
+
+        # ---- Symlink tallies (schema v2) ----
+        n_sl_changed = len(results["symlink_changed"])
+        n_sl_missing = len(results["symlink_missing"])
+        n_sl_new = len(results["symlink_new"])
+        symlink_failed = bool(n_sl_changed or n_sl_missing or n_sl_new)
 
         # ---- Signature policy ----
         # A manifest is treated as unsigned only if it carries the UNSIGNED
@@ -2208,12 +2479,15 @@ supported hash algorithms:
         if integrity_failed:
             _qprint(f"{_tag('FAIL')} {n_missing} Missing, {n_modified} Modified, "
                     f"{n_new} New/Moved, {n_ok}/{n_expected} OK")
+        if symlink_failed:
+            _qprint(f"{_tag('FAIL')} Symlinks: {n_sl_changed} Changed, "
+                    f"{n_sl_missing} Removed, {n_sl_new} New")
         if sig_invalid:
             _qprint(f"{_tag('FAIL')} Manifest failed Signature")
         if trust_failed:
             _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
 
-        if integrity_failed or sig_invalid or trust_failed:
+        if integrity_failed or symlink_failed or sig_invalid or trust_failed:
             sys.exit(1)
 
         # A manifest that expects a signature but produced none: hashes are
@@ -2263,6 +2537,7 @@ supported hash algorithms:
         jobs=jobs,
         merkle_select=args.merkle_select,
         concat_algo=args.merkle_concat,
+        symlink_policy=_resolve_symlink_policy(args),
     )
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"

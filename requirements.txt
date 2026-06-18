@@ -4,3 +4,13 @@
 #
 # Optional — install to enable --per-day (per-day journal entry hashing):
 pyyaml>=6.0
+
+# Optional — install to enable --validate (manifest JSON-schema validation):
+jsonschema>=4.0
+
+# Optional — faster/extra hash backends (used automatically if present):
+# blake3
+# xxhash
+
+# Development/testing only:
+# pytest
