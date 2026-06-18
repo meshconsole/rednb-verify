@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.8.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` required only for `--per-day`)
+**Version:** 0.9.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`)
 
 ---
 
@@ -145,16 +145,6 @@ Check a manifest's structure without touching the journal — useful in CI or be
 |---|---|
 | `--validate [FILE\|DIR]` | Validate a manifest against the bundled JSON schema and exit. Requires the optional `jsonschema` package. See [Schema & Validation](#schema--validation) |
 
-### Other
-
-| Flag | Description |
-|---|---|
-| `-V`, `--version` | Print version and exit |
-| `-v`, `--verbose` | Print per-file hash timing and detailed progress |
-| `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
-| `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
-| `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
-
 ### Config management
 
 | Flag | Description |
@@ -246,6 +236,16 @@ python rednb-verify.py ~/journal --no-sign --privacy
 python rednb-verify.py --validate ~/journal/hashes-20260528T120000Z.json
 ```
 
+### Other
+
+| Flag | Description |
+|---|---|
+| `-V`, `--version` | Print version and exit |
+| `-v`, `--verbose` | Print per-file hash timing and detailed progress |
+| `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
+| `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
+| `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
+
 ---
 
 ## Manifest Format
@@ -256,7 +256,7 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.8.0
+version: 0.9.0
 schema_version: 2
 created: 20260528T120000Z
 date: 2026-05-28
@@ -281,7 +281,7 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "schema_version": 2,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
@@ -608,7 +608,7 @@ A minimal valid manifest looks like:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "schema_version": 2,
   "created": "20260617T120000Z",
   "date": "2026-06-17",
