@@ -431,6 +431,45 @@ Optional faster/non-stdlib algorithms (`blake3`, `xxh3`) are used automatically 
 
 ---
 
+## Merkle Tree
+
+Each manifest records a Merkle root — a single hash that commits to the entire set of per-file hashes. It is the value that gets signed and can be republished out of band, so a notebook's integrity can be summarized by one short string.
+
+The tree is built RFC 6962-style, with two defences against an attacker constructing a *different* file set that hashes to the *same* root:
+
+- **Domain separation.** Leaf nodes are hashed with a `0x00` prefix and internal nodes with `0x01`. Without this, a leaf digest and an internal digest are computed identically, so an internal node's two children could be passed off as a single leaf — a second-preimage forgery of the tree's shape.
+- **Odd-node promotion, not duplication.** When a level has an odd number of nodes, the last node is carried up unchanged. Naively *duplicating* it is the [CVE-2012-2459](https://nvd.nist.gov/vuln/detail/CVE-2012-2459) weakness: duplicating the last leaf makes a three-file tree collide with a real four-file tree, so files can be added or removed without changing the root.
+
+### Worked example (sha256)
+
+Three files with contents `alpha`, `beta`, `gamma`. Their sha256 leaf hashes:
+
+```
+alpha  8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8
+beta   f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753
+gamma  be9d587defa1f0c09ef49eb17e206983a5f8f8289e4281860bd0ee5a19592c67
+```
+
+The tree (note `gamma`'s leaf is odd, so it is promoted unchanged):
+
+```
+L_alpha = sha256(0x00 ‖ alpha)            34f04379...a98ee518
+L_beta  = sha256(0x00 ‖ beta)             9f6d34ba...affb21dd
+L_gamma = sha256(0x00 ‖ gamma)            d130c2ca...ae1ebe06
+
+N0      = sha256(0x01 ‖ L_alpha ‖ L_beta) 984d5c63...be46f77c
+          (L_gamma promoted)
+
+root    = sha256(0x01 ‖ N0 ‖ L_gamma)
+        = bb1e6ce657790b193bfea0ec6c4bb2c8377aba31bb09d25cec48668f0fa3b159
+```
+
+The duplicate-leaf attack no longer works — a four-file set `[alpha, beta, gamma, gamma]` produces a **different** root (`c8b59b9e…49c95109`) instead of colliding with the three-file root above. These values are pinned as known-answer vectors in `tests/test_merkle.py`.
+
+> **Schema note.** This construction is part of manifest schema **version 2**. Roots produced by schema-1 manifests (rednb-verify ≤ 0.8.0) used the older, vulnerable construction and will not match; verifying such a manifest prints an old-schema security warning.
+
+---
+
 ## Trust & Signing
 
 `--trust` controls which keys may sign and which signers are accepted at verify:

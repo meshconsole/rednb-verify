@@ -80,7 +80,7 @@ CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 # Manifest structural contract. Separate from VERSION (build identifier).
 # Bump only on a BREAKING structural change (renamed/removed/retyped field),
 # never for an optional addition. Manifests without this field = version 0.
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 # Set by main() before any output
 _quiet: bool = False
@@ -392,17 +392,43 @@ def is_month_file(path: Path) -> bool:
 # ---------- Merkle ----------
 
 def merkle_root(hashes: List[str], algo_spec: str) -> str:
+    """RFC 6962-style Merkle root with domain separation.
+
+    Two hardening measures distinguish this from a naive Merkle tree, both
+    aimed at the same class of attack — making two different file sets collide
+    to the same root:
+
+    * Leaf nodes are hashed with a ``0x00`` prefix and internal nodes with
+      ``0x01``. Without this, a leaf digest and an internal digest are computed
+      identically, so an attacker can present an internal node's two children
+      as if they were a single leaf (a second-preimage forgery of the tree
+      shape).
+    * Odd nodes are promoted to the next level unchanged rather than being
+      duplicated. Duplication is the CVE-2012-2459 weakness: a tree over
+      ``[A, B, C]`` (with C duplicated) yields the same root as a real
+      four-file tree ``[A, B, C, C]``, so files can be silently added or
+      removed without changing the root.
+
+    See the "Merkle tree" section of the README for the worked example.
+    """
     if not hashes:
         return ""
     algo, length = _parse_algo_spec(algo_spec)
-    level = [bytes.fromhex(h) for h in hashes]
+
+    def _node(prefix: bytes, *parts: bytes) -> bytes:
+        h = hashlib.new(algo, prefix + b"".join(parts))
+        return h.digest(length) if length is not None else h.digest()
+
+    # Leaf level: domain-separate every file hash with a 0x00 prefix.
+    level = [_node(b"\x00", bytes.fromhex(h)) for h in hashes]
+    # Internal levels: pair with a 0x01 prefix; promote a trailing odd node.
     while len(level) > 1:
-        next_level = []
-        for i in range(0, len(level), 2):
-            left = level[i]
-            right = level[i + 1] if i + 1 < len(level) else left
-            h = hashlib.new(algo, left + right)
-            next_level.append(h.digest(length) if length is not None else h.digest())
+        next_level = [
+            _node(b"\x01", level[i], level[i + 1])
+            for i in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2 == 1:
+            next_level.append(level[-1])
         level = next_level
     return level[0].hex()
 
