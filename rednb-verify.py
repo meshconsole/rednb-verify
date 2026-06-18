@@ -1235,12 +1235,9 @@ def generate_manifest(
     }
 
     if multi:
-        # files entry: {path, hashes: {algo: hex, ... alphabetical}}
         manifest["hash_algorithm"] = algos
-        manifest["files"] = [
-            {"path": p, "hashes": {a: files[p][a] for a in algos}}
-            for p in files
-        ]
+        # Merkle roots are written before the file list (matches the text
+        # manifest, and puts the summary commitment ahead of the detail).
         # Field order: concatenated tree before individual trees (man notes).
         if concat_algo:
             manifest["merkle_root_concat"] = {
@@ -1251,11 +1248,15 @@ def generate_manifest(
         manifest["merkle_roots"] = {
             a: merkle_root([files[p][a] for p in files], a) for a in tree_algos
         }
+        # files entry: {path, hashes: {algo: hex, ... alphabetical}}
+        manifest["files"] = [
+            {"path": p, "hashes": {a: files[p][a] for a in algos}}
+            for p in files
+        ]
     else:
         algo = algos[0]
         manifest["hash_algorithm"] = algo
         manifest["merkle_hash"] = merkle_algo
-        manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
         if concat_algo:
             manifest["merkle_root_concat"] = {
                 concat_algo: _concat_merkle_root(files, algos, concat_algo)
@@ -1263,6 +1264,7 @@ def generate_manifest(
         manifest["merkle_root"] = merkle_root(
             [files[p][algo] for p in files], merkle_algo
         )
+        manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
 
     if exclude:
         manifest["exclude"] = exclude

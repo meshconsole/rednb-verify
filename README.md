@@ -288,13 +288,13 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
   "mode": "full-tree",
   "hash_algorithm": "sha256",
   "merkle_hash": "sha256",
+  "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf",
   "files": [
     {
       "path": "2026-05.txt",
       "sha256": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf"
     }
   ],
-  "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf",
   "symlink_targets": "hash:sha256",
   "symlinks": []
 }
@@ -614,10 +614,10 @@ A minimal valid manifest looks like:
   "date": "2026-06-17",
   "mode": "month-only",
   "hash_algorithm": "sha256",
+  "merkle_root": "bb1e6ce6…",
   "files": [
     { "path": "2026-06.txt", "sha256": "be9d587d…" }
   ],
-  "merkle_root": "bb1e6ce6…",
   "symlink_targets": "hash:sha256",
   "symlinks": []
 }
