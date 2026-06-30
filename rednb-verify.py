@@ -2797,4 +2797,14 @@ supported hash algorithms:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C at any prompt (or during a long hash run): exit quietly with the
+        # conventional SIGINT code (128 + 2) instead of dumping a traceback.
+        print(f"\n{_tag('INFO', stream=sys.stderr)} Aborted.", file=sys.stderr)
+        sys.exit(130)
+    except EOFError:
+        # stdin closed / non-interactive (e.g. piped) when a prompt needs input.
+        _err("No input available (stdin closed); aborting.")
+        sys.exit(2)
