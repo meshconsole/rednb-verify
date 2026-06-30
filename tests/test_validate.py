@@ -56,3 +56,34 @@ def test_symlink_entry_requires_target_or_hash(tool, tmp_path):
     m["symlinks"] = [{"path": "link.txt"}]  # neither target nor target_hash
     errors = tool.validate_manifest_schema(m)
     assert errors
+
+
+def test_report_schema_validates_clean_report(tool, tmp_path):
+    m = _make_manifest(tool, tmp_path)
+    nb = tmp_path / "nb"
+    r = tool.verify_manifest(m, nb)
+    errors = tool.validate_against_schema(r, "report-v1.schema.json", required=True)
+    assert errors == []
+
+
+def test_schema_for_picks_manifest_vs_report(tool, tmp_path):
+    from pathlib import Path
+    m = _make_manifest(tool, tmp_path)
+    assert tool._schema_for(m, Path("hashes-x.json")).startswith("manifest")
+    report = {"ok": [], "missing": [], "modified": [], "new": []}
+    assert tool._schema_for(report, Path("report-x.json")).startswith("report")
+
+
+def test_validate_not_required_returns_none_without_jsonschema(tool, tmp_path, monkeypatch):
+    # Simulate jsonschema being unavailable: best-effort call returns None.
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "jsonschema":
+            raise ImportError("simulated")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    m = _make_manifest(tool, tmp_path)
+    assert tool.validate_manifest_schema(m, required=False) is None

@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/meshconsole/rednb-verify/schema/manifest-v3.schema.json",
+  "title": "rednb-verify manifest (schema version 3)",
+  "type": "object",
+  "required": ["tool", "schema_version", "created", "date", "mode", "hash_algorithm", "files"],
+  "properties": {
+    "tool": { "const": "rednb-verify" },
+    "version": { "type": "string" },
+    "schema_version": { "type": "integer", "minimum": 2 },
+    "created": {
+      "type": "string",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z$",
+      "description": "UTC creation stamp, e.g. 20260617T120000Z"
+    },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "mode": {
+      "enum": [
+        "full-tree",
+        "month-only",
+        "per-day/full-tree",
+        "per-day/month-only",
+        "per-day",
+        "month-files"
+      ]
+    },
+    "hash_algorithm": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      ]
+    },
+    "merkle_hash": { "type": "string" },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "hashes": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": { "type": "string" }
+          }
+        },
+        "oneOf": [
+          { "required": ["hashes"] },
+          {
+            "allOf": [
+              { "not": { "required": ["hashes"] } },
+              { "minProperties": 2 }
+            ]
+          }
+        ]
+      }
+    },
+    "merkle_root": { "type": "string" },
+    "merkle_roots": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "merkle_root_concat": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "content_root": {
+      "type": "string",
+      "description": "Move-invariant Merkle root over the multiset of file content hashes (schema v3)"
+    },
+    "content_roots": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Per-algorithm move-invariant content roots, multi-hash mode (schema v3)"
+    },
+    "exclude": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "signed_by": {
+      "type": "object",
+      "properties": {
+        "gpg": { "type": "string" },
+        "ssh": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "symlink_targets": {
+      "type": "string",
+      "pattern": "^(none|full|hash:.+)$",
+      "description": "How symlink targets are recorded: 'full', or 'hash:<algo-spec>'"
+    },
+    "symlinks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "target": { "type": "string" },
+          "target_hash": { "type": "string" }
+        },
+        "oneOf": [
+          { "required": ["target"] },
+          { "required": ["target_hash"] }
+        ]
+      }
+    }
+  }
+}

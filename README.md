@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.9.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`)
+**Version:** 0.10.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`)
 
 ---
 
@@ -234,6 +234,9 @@ python rednb-verify.py ~/journal --no-sign --privacy
 
 # Validate a manifest against the JSON schema (needs: pip install jsonschema)
 python rednb-verify.py --validate ~/journal/hashes-20260528T120000Z.json
+
+# Pipe a verification report straight into jq (logs stay on stderr)
+python rednb-verify.py ~/journal --verify --no-sign --json | jq '.modified'
 ```
 
 ### Other
@@ -245,6 +248,7 @@ python rednb-verify.py --validate ~/journal/hashes-20260528T120000Z.json
 | `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
 | `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
 | `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
+| `--json` | Emit the result to **stdout** as one JSON document for piping (manifest on create, report on verify); all logs go to stderr, so `… --json \| jq` works |
 
 ---
 
@@ -256,14 +260,15 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.9.0
-schema_version: 2
+version: 0.10.0
+schema_version: 3
 created: 20260528T120000Z
 date: 2026-05-28
 hash_algorithm: sha256
 mode: full-tree
 merkle_hash: sha256
 merkle_root: fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf
+content_root: 7b1d8c0a4e6f2391c5a0bb9d4e7f10238acf45e6d9b2c1708f3a6e5d4c2b1a09
 
 symlinks: (targets: hash:sha256)
 
@@ -281,14 +286,15 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.9.0",
-  "schema_version": 2,
+  "version": "0.10.0",
+  "schema_version": 3,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
   "mode": "full-tree",
   "hash_algorithm": "sha256",
   "merkle_hash": "sha256",
   "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf",
+  "content_root": "7b1d8c0a4e6f2391c5a0bb9d4e7f10238acf45e6d9b2c1708f3a6e5d4c2b1a09",
   "files": [
     {
       "path": "2026-05.txt",
@@ -303,10 +309,11 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 The full JSON structure is described by the published schema — see [Schema & Validation](#schema--validation).
 
 **Fields:**
-- `schema_version` — manifest format version (`2`); verifying an older one prints a security warning
+- `schema_version` — manifest format version (`3`); verifying an older one prints a security warning
 - `hash_algorithm` — algorithm used for individual file hashes; also the field name on each file entry
 - `merkle_hash` — algorithm used to compute the Merkle tree root
-- `merkle_root` — root of the [Merkle tree](#merkle-tree) over the file hashes
+- `merkle_root` — path-ordered root of the [Merkle tree](#merkle-tree) over the file hashes
+- `content_root` — **move-invariant** root over the *set* of file contents (leaves sorted by hash, not path); lets verify tell relocation from tampering — see [Move detection](#move-detection)
 - `date` — creation date in `YYYY-MM-DD` for human readability
 - `created` — full UTC timestamp for machine use
 - `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
@@ -444,10 +451,13 @@ After writing the report, `--verify` prints a single terminal verdict:
 
 | Line | Meaning | Exit |
 |---|---|---|
-| `[OK] Verification successful` | Hashes intact; the manifest is either authentically signed or honestly declares itself unsigned | `0` |
-| `[FAIL] X Missing, N Modified, Z New/Moved, K/T OK` | One or more files changed (`K/T` = matching/expected files) | `1` |
+| `[PASS] Verification successful` | Hashes intact and in place; the manifest is either authentically signed or honestly declares itself unsigned | `0` |
+| `[OK] Move-invariant/Content Merkle root pass: All files present` | The complete set of file contents is intact (see [Move detection](#move-detection)) | — |
+| `[FAIL] Files moved` | All content is present, but one or more files were relocated/renamed since the manifest | `1` |
+| `[FAIL] X Missing, N Modified, Z New/Moved, K/T OK` | File contents actually changed (added/removed/modified) | `1` |
 | `[FAIL] Manifest failed Signature` | A signature is present but did not validate (tampering) | `1` |
 | `[FAIL] Untrusted signer (--trust high)` | Signature valid, but the signer is not pinned in your trust list | `1` |
+| `[WARN] Symlinks Present` | The manifest records symbolic links — review the symlink table | — |
 | `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
 | `[WARN] Verification completed with issues` | Hashes intact, but the manifest implies a signature that could not be established | `1` |
 
@@ -532,7 +542,21 @@ root    = sha256(0x01 ‖ N0 ‖ L_gamma)
 
 The duplicate-leaf attack no longer works — a four-file set `[alpha, beta, gamma, gamma]` produces a **different** root (`c8b59b9e…49c95109`) instead of colliding with the three-file root above. These values are pinned as known-answer vectors in `tests/test_merkle.py`.
 
-> **Schema note.** This construction is part of manifest schema **version 2**. Roots produced by schema-1 manifests (rednb-verify ≤ 0.8.0) used the older, vulnerable construction and will not match; verifying such a manifest prints an old-schema security warning.
+> **Schema note.** This construction was introduced in manifest schema **version 2**. Roots produced by schema-1 manifests (rednb-verify ≤ 0.8.0) used the older, vulnerable construction and will not match; verifying such a manifest prints an old-schema security warning. Schema **version 3** adds the move-invariant [content root](#move-detection).
+
+---
+
+## Move detection
+
+Alongside the path-ordered `merkle_root`, a schema-v3 manifest stores a **`content_root`** (`content_roots` in multi-hash mode): the same RFC 6962 tree, but with leaves sorted by **hash value** instead of by path. That makes it **move-invariant** — it commits to the *set* of file contents regardless of where each file lives.
+
+At verify time the content root is recomputed from the live files and compared to the stored one, which separates two very different situations:
+
+- **Content root matches, every path matches** → nothing changed → `[PASS] Verification successful`.
+- **Content root matches, but some paths differ** → every byte is still present, files were only **relocated/renamed/swapped** → `[OK] Move-invariant/Content Merkle root pass: All files present` followed by `[FAIL] Files moved` (exit `1`). The report's `MOVED` section pairs each `old/path -> new/path`.
+- **Content root differs** → content was genuinely added, removed, or modified → the usual `[FAIL] … Missing/Modified/New` (exit `1`).
+
+So a reshuffled-but-intact tree is reported as a move rather than alarming tampering, while real content changes still fail. Manifests written before schema v3 have no content root and simply skip this check.
 
 ---
 
@@ -581,26 +605,28 @@ In the manifest, hashed and cleartext entries are distinguished by field:
 
 ## Schema & Validation
 
-Every JSON manifest conforms to a published **JSON Schema** (Draft 2020-12), shipped in the repo at [`schema/manifest-v2.schema.json`](schema/manifest-v2.schema.json). It lets you catch a malformed or truncated manifest *before* trusting it — handy in CI, or before archiving.
+Every JSON manifest conforms to a published **JSON Schema** (Draft 2020-12), shipped at [`schema/manifest-v3.schema.json`](schema/manifest-v3.schema.json); verification reports have their own schema at [`schema/report-v1.schema.json`](schema/report-v1.schema.json). Validation lets you catch a malformed or truncated manifest *before* trusting it — handy in CI, or before archiving.
 
 Validate with the built-in flag (requires the optional `jsonschema` package):
 
 ```bash
 pip install jsonschema
 
-# Validate a specific manifest
+# Validate a specific manifest (or a report — the schema is auto-selected)
 python rednb-verify.py --validate hashes-20260617T120000Z.json
 
 # Validate the latest manifest in a directory
 python rednb-verify.py --validate ~/journal
 ```
 
+A `--verify` run also **auto-validates** the manifest first (best-effort: skipped silently when `jsonschema` isn't installed). This works for text manifests too — they're parsed to the same structure before validation.
+
 Exit codes: `0` valid, `1` schema-invalid (errors are printed with their location), `2` usage error or `jsonschema` not installed.
 
 You can also validate with any standard tool, e.g. [`check-jsonschema`](https://github.com/python-jsonschema/check-jsonschema):
 
 ```bash
-check-jsonschema --schemafile schema/manifest-v2.schema.json hashes-*.json
+check-jsonschema --schemafile schema/manifest-v3.schema.json hashes-*.json
 ```
 
 A minimal valid manifest looks like:
@@ -608,13 +634,14 @@ A minimal valid manifest looks like:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.9.0",
-  "schema_version": 2,
+  "version": "0.10.0",
+  "schema_version": 3,
   "created": "20260617T120000Z",
   "date": "2026-06-17",
   "mode": "month-only",
   "hash_algorithm": "sha256",
   "merkle_root": "bb1e6ce6…",
+  "content_root": "7b1d8c0a…",
   "files": [
     { "path": "2026-06.txt", "sha256": "be9d587d…" }
   ],
