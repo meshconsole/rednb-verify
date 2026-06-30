@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/meshconsole/rednb-verify/schema/report-v1.schema.json",
+  "title": "rednb-verify verification report (--report json)",
+  "type": "object",
+  "required": ["ok", "missing", "modified", "new"],
+  "properties": {
+    "ok": { "type": "array", "items": { "type": "string" } },
+    "missing": { "type": "array", "items": { "type": "string" } },
+    "modified": { "type": "array", "items": { "type": "string" } },
+    "new": { "type": "array", "items": { "type": "string" } },
+    "moved": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Relocated files as 'old/path -> new/path' (schema v3 move detection)"
+    },
+    "content_root_status": {
+      "type": "array",
+      "items": { "enum": ["match", "mismatch"] },
+      "maxItems": 1,
+      "description": "['match'] when the move-invariant content root verifies; [] if absent"
+    },
+    "symlink_ok": { "type": "array", "items": { "type": "string" } },
+    "symlink_changed": { "type": "array", "items": { "type": "string" } },
+    "symlink_missing": { "type": "array", "items": { "type": "string" } },
+    "symlink_new": { "type": "array", "items": { "type": "string" } }
+  }
+}

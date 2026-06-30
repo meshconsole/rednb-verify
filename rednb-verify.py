@@ -84,23 +84,30 @@ CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 # Manifest structural contract. Separate from VERSION (build identifier).
 # Bump only on a BREAKING structural change (renamed/removed/retyped field),
 # never for an optional addition. Manifests without this field = version 0.
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 
 # Set by main() before any output
 _quiet: bool = False
 _verbose: bool = False
+# In --json mode, stdout is reserved for the machine-readable JSON document, so
+# all human/log output is routed to stderr to keep stdout pipe-clean.
+_json_mode: bool = False
+
+
+def _log_stream():
+    return sys.stderr if _json_mode else sys.stdout
 
 
 def _qprint(msg: str) -> None:
     """Print only when not in quiet mode."""
     if not _quiet:
-        print(msg)
+        print(msg, file=_log_stream())
 
 
 def _vprint(msg: str) -> None:
     """Print only in verbose mode (quiet still suppresses it)."""
     if _verbose and not _quiet:
-        print(msg)
+        print(msg, file=_log_stream())
 
 
 def _require_yaml():
@@ -121,6 +128,7 @@ _ANSI_RESET = "\033[0m"
 _ANSI: Dict[str, str] = {
     "INFO":  "\033[33m",   # yellow
     "OK":    "\033[97m",   # bright white
+    "PASS":  "\033[92m",   # bright green
     "WARN":  "\033[91m",   # light red
     "FAIL":  "\033[91m",   # light red
     "ERROR": "\033[91m",   # light red
@@ -137,17 +145,21 @@ def _tag(label: str, *, stream=None) -> str:
 
 
 def _info(msg: str) -> None:
-    _qprint(f"{_tag('INFO')} {msg}")
+    _qprint(f"{_tag('INFO', stream=_log_stream())} {msg}")
 
 
 def _ok(msg: str) -> None:
-    _qprint(f"{_tag('OK')} {msg}")
+    _qprint(f"{_tag('OK', stream=_log_stream())} {msg}")
+
+
+def _pass(msg: str) -> None:
+    _qprint(f"{_tag('PASS', stream=_log_stream())} {msg}")
 
 
 def _warn(msg: str) -> None:
     """Cosmetic-tier warning: suppressed by --quiet."""
     if not _quiet:
-        print(f"{_tag('WARN')} {msg}")
+        print(f"{_tag('WARN', stream=_log_stream())} {msg}", file=_log_stream())
 
 
 def _warn_security(msg: str) -> None:
@@ -1248,6 +1260,13 @@ def generate_manifest(
         manifest["merkle_roots"] = {
             a: merkle_root([files[p][a] for p in files], a) for a in tree_algos
         }
+        # Move-invariant content root: leaves sorted by hash VALUE rather than
+        # path, so the root commits to the *set* of file contents regardless of
+        # where each lives. Lets verify tell "all content present, just moved"
+        # apart from real tampering. (schema v3)
+        manifest["content_roots"] = {
+            a: merkle_root(sorted(files[p][a] for p in files), a) for a in tree_algos
+        }
         # files entry: {path, hashes: {algo: hex, ... alphabetical}}
         manifest["files"] = [
             {"path": p, "hashes": {a: files[p][a] for a in algos}}
@@ -1263,6 +1282,10 @@ def generate_manifest(
             }
         manifest["merkle_root"] = merkle_root(
             [files[p][algo] for p in files], merkle_algo
+        )
+        # Move-invariant content root (leaves sorted by hash value). schema v3.
+        manifest["content_root"] = merkle_root(
+            sorted(files[p][algo] for p in files), merkle_algo
         )
         manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
 
@@ -1366,6 +1389,41 @@ def verify_manifest(
             if p not in expected_links:
                 results["symlink_new"].append(p)
 
+    # ---- Move-invariant content-root verification (schema v3) ----
+    # Recompute the move-invariant root (leaves sorted by hash value) from the
+    # live files and compare to the stored one. A "match" means the exact set of
+    # file contents is intact — any path discrepancy is then a relocation, not
+    # tampering. Manifests without a content root (older schema) skip this.
+    results["moved"] = []
+    results["content_root_status"] = []
+    if not multi and manifest.get("content_root") is not None:
+        m_algo = manifest.get("merkle_hash", ha)
+        actual_root = merkle_root(sorted(actual[p][ha] for p in actual), m_algo)
+        results["content_root_status"] = (
+            ["match"] if actual_root == manifest["content_root"] else ["mismatch"]
+        )
+    elif multi and manifest.get("content_roots") is not None:
+        ok = True
+        for a, stored_root in manifest["content_roots"].items():
+            actual_root = merkle_root(sorted(actual[p][a] for p in actual if a in actual[p]), a)
+            if actual_root != stored_root:
+                ok = False
+                break
+        results["content_root_status"] = ["match"] if ok else ["mismatch"]
+
+    # When the content set matches but paths differ, pair missing↔new entries
+    # by identical content so the report can show what moved where.
+    if results["content_root_status"] == ["match"]:
+        def _sig(d: Dict[str, str]) -> tuple:
+            return tuple(sorted(d.items()))
+        new_by_sig: Dict[tuple, List[str]] = {}
+        for p in results["new"]:
+            new_by_sig.setdefault(_sig(actual[p]), []).append(p)
+        for p in sorted(results["missing"]):
+            cands = new_by_sig.get(_sig(expected[p]))
+            if cands:
+                results["moved"].append(f"{p} -> {cands.pop(0)}")
+
     return results
 
 
@@ -1407,8 +1465,14 @@ def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
         lines.append("merkle_roots:")
         for a in sorted(manifest.get("merkle_roots", {})):
             lines.append(f"         {a}: {manifest['merkle_roots'][a]}")
+        if manifest.get("content_roots"):
+            lines.append("content_roots:")
+            for a in sorted(manifest["content_roots"]):
+                lines.append(f"         {a}: {manifest['content_roots'][a]}")
     else:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
+        if manifest.get("content_root"):
+            lines.append(f"content_root: {manifest['content_root']}")
     # Symlink table (schema v2): a numbered "path -> target" list, with the
     # recording policy noted on the header line so verify knows how to compare.
     # Written even when empty so the manifest still commits to "zero symlinks".
@@ -1437,6 +1501,7 @@ def _parse_text_manifest(text: str) -> Dict:
     manifest: Dict = {}
     raw_files: List[Dict] = []      # [{"path":p, "_hashes":{algo:hash}}]
     merkle_roots: Dict[str, str] = {}
+    content_roots: Dict[str, str] = {}
     sym_entries: List[tuple] = []   # [(path, target_or_hash)]
     sym_policy: Optional[str] = None
     saw_symlinks = False            # header seen, even if the table is empty
@@ -1457,6 +1522,9 @@ def _parse_text_manifest(text: str) -> Dict:
         if stripped == "merkle_roots:":
             section = "merkle_roots"
             continue
+        if stripped == "content_roots:":
+            section = "content_roots"
+            continue
         if stripped.startswith("symlinks:"):
             section = "symlinks"
             saw_symlinks = True
@@ -1471,6 +1539,10 @@ def _parse_text_manifest(text: str) -> Dict:
             if ": " in stripped:
                 a, _, root = stripped.partition(": ")
                 merkle_roots[a.strip()] = root.strip()
+        elif section == "content_roots":
+            if ": " in stripped:
+                a, _, root = stripped.partition(": ")
+                content_roots[a.strip()] = root.strip()
         elif section == "symlinks":
             m = _re.match(r"\d+\.\s+(.+?)\s+->\s+(.*)$", stripped)
             if m:
@@ -1513,6 +1585,8 @@ def _parse_text_manifest(text: str) -> Dict:
     manifest["files"] = files_out
     if multi:
         manifest["merkle_roots"] = merkle_roots
+        if content_roots:
+            manifest["content_roots"] = content_roots
 
     # Rebuild the symlink table from the parsed entries (empty table preserved).
     if saw_symlinks:
@@ -1603,6 +1677,12 @@ def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path
         f"{'Missing:':<10} {len(results['missing'])}",
         f"{'Modified:':<10} {len(results['modified'])}",
     ]
+    # Content-root status + moved files (schema v3).
+    _crs = results.get("content_root_status") or []
+    if _crs:
+        lines.append(f"{'Content root:':<14} {_crs[0]}")
+    if results.get("moved"):
+        lines.append(f"{'Moved:':<14} {len(results['moved'])}")
     # Symlink tallies (schema v2) — only shown when the manifest carried a table.
     _sym_keys = ("symlink_ok", "symlink_changed", "symlink_missing", "symlink_new")
     if any(results.get(k) for k in _sym_keys):
@@ -1615,6 +1695,7 @@ def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path
         ]
     sections = [
         ("OK", "ok"), ("NEW", "new"), ("MISSING", "missing"), ("MODIFIED", "modified"),
+        ("MOVED", "moved"),
         ("SYMLINK CHANGED", "symlink_changed"),
         ("SYMLINK REMOVED", "symlink_missing"),
         ("SYMLINK NEW", "symlink_new"),
@@ -1651,36 +1732,57 @@ def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
     return target
 
 
-def validate_manifest_schema(manifest: Dict) -> List[str]:
-    """Validate a manifest dict against the bundled JSON schema.
+def validate_against_schema(obj: Dict, schema_file: str, *, required: bool = True
+                            ) -> Optional[List[str]]:
+    """Validate an object against a bundled JSON schema.
 
-    Returns a list of human-readable error strings ([] means valid). The
-    'jsonschema' package is an optional dependency — keeping it out of the
-    core requirements preserves the stdlib-only default install — so this
-    exits(2) with install guidance when it is missing.
+    Returns a list of human-readable error strings ([] means valid), or None
+    when the optional 'jsonschema' package is unavailable. With required=True
+    (the explicit --validate path) a missing package exits(2) with install
+    guidance; with required=False (best-effort auto-validate) it returns None
+    so a stdlib-only install never blocks.
     """
     try:
         import jsonschema
     except ImportError:
-        _err("--validate needs the optional 'jsonschema' package: "
-             "pip install jsonschema")
-        sys.exit(2)
-    schema_path = Path(__file__).resolve().parent / "schema" / "manifest-v2.schema.json"
+        if required:
+            _err("--validate needs the optional 'jsonschema' package: "
+                 "pip install jsonschema")
+            sys.exit(2)
+        return None
+    schema_path = Path(__file__).resolve().parent / "schema" / schema_file
     if not schema_path.exists():
-        _err(f"Schema file not found: {schema_path}")
-        sys.exit(2)
+        if required:
+            _err(f"Schema file not found: {schema_path}")
+            sys.exit(2)
+        return None
     try:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        _err(f"Could not read schema: {exc}")
-        sys.exit(2)
+        if required:
+            _err(f"Could not read schema: {exc}")
+            sys.exit(2)
+        return None
     validator = jsonschema.Draft202012Validator(schema)
-    errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.path))
-    out: List[str] = []
-    for e in errors:
-        loc = "/".join(str(p) for p in e.path) or "<root>"
-        out.append(f"{loc}: {e.message}")
-    return out
+    errors = sorted(validator.iter_errors(obj), key=lambda e: list(e.path))
+    return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}" for e in errors]
+
+
+def _schema_for(obj: Dict, path: Path) -> str:
+    """Pick the right schema file for a loaded JSON object (manifest vs report)."""
+    if "tool" in obj or "files" in obj:
+        return "manifest-v3.schema.json"
+    if path.name.startswith("report") or any(
+        k in obj for k in ("ok", "missing", "modified", "new")
+    ):
+        return "report-v1.schema.json"
+    return "manifest-v3.schema.json"
+
+
+def validate_manifest_schema(manifest: Dict, *, required: bool = True
+                             ) -> Optional[List[str]]:
+    """Validate a manifest dict against the current manifest schema."""
+    return validate_against_schema(manifest, "manifest-v3.schema.json", required=required)
 
 
 # ---------- CLI ----------
@@ -1844,7 +1946,7 @@ class ConciseArgumentParser(argparse.ArgumentParser):
 
 
 def main():
-    global _quiet, _verbose
+    global _quiet, _verbose, _json_mode
 
     # Pre-scan argv so --no-config/--no-cf and --config FILE take effect
     # before argparse runs (config must be loaded before set_defaults).
@@ -1959,6 +2061,9 @@ supported hash algorithms:
     parser.add_argument("--report", nargs="?", const="txt", default="txt",
                         metavar="txt|json",
                         help="Verification report format: txt (default) or json")
+    parser.add_argument("--json", action="store_true", dest="json",
+                        help="Emit the result (manifest on create, report on verify) as a "
+                             "single JSON document on stdout for piping; all logs go to stderr")
     parser.add_argument("--no-bullets", action="store_true", dest="no_bullets",
                         help="Text manifest: don't prefix per-file hash lines with '- '")
     parser.add_argument("--hash", default=HASH_ALGO, dest="hash_algo", metavar="ALGO[,ALGO...]",
@@ -2076,6 +2181,7 @@ supported hash algorithms:
     # Activate output modes before any printing
     _quiet = args.quiet
     _verbose = args.verbose
+    _json_mode = args.json
 
     if args.quiet and args.verbose:
         _err("--quiet and --verbose are mutually exclusive.")
@@ -2288,19 +2394,21 @@ supported hash algorithms:
     #  Validate mode (JSON schema check only)                             #
     # ------------------------------------------------------------------ #
     if args.validate is not None:
-        manifest_path = _resolve_manifest_path(args.validate, out_dir)
+        doc_path = _resolve_manifest_path(args.validate, out_dir)
         try:
-            manifest = _load_manifest(manifest_path)
+            doc = _load_manifest(doc_path)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            _err(f"Could not read manifest: {exc}")
+            _err(f"Could not read file: {exc}")
             sys.exit(2)
-        errors = validate_manifest_schema(manifest)
+        schema_file = _schema_for(doc, doc_path)
+        kind = "Report" if schema_file.startswith("report") else "Manifest"
+        errors = validate_against_schema(doc, schema_file, required=True)
         if errors:
-            _err(f"Manifest failed schema validation ({len(errors)} error(s)):")
+            _err(f"{kind} failed schema validation ({len(errors)} error(s)):")
             for e in errors:
                 _err(f"  {e}")
             sys.exit(1)
-        _ok(f"Manifest is schema-valid: {manifest_path.name}")
+        _ok(f"{kind} is schema-valid: {doc_path.name}")
         return
 
     # ------------------------------------------------------------------ #
@@ -2336,6 +2444,14 @@ supported hash algorithms:
 
         # Schema version gate (three-direction check)
         check_manifest_schema(manifest, args.schema_ignore, args.yes)
+
+        # Auto-validate against the JSON schema before verifying — catches a
+        # malformed/truncated manifest early. Best-effort: skipped silently if
+        # 'jsonschema' isn't installed (it's an optional dependency).
+        _schema_errs = validate_manifest_schema(manifest, required=False)
+        if _schema_errs:
+            _warn(f"Manifest schema: {len(_schema_errs)} validation issue(s) "
+                  "(run --validate for detail)")
 
         # Surface creation-time warnings recorded in the manifest (cosmetic, G6)
         for w in manifest.get("warnings", []):
@@ -2392,6 +2508,12 @@ supported hash algorithms:
         n_sl_missing = len(results["symlink_missing"])
         n_sl_new = len(results["symlink_new"])
         symlink_failed = bool(n_sl_changed or n_sl_missing or n_sl_new)
+
+        # ---- Content-root status (schema v3) ----
+        # "match" => the exact set of file contents is intact; any path
+        # discrepancy is then a relocation (move/rename/swap), not tampering.
+        content_match = (results.get("content_root_status") or [None])[0] == "match"
+        files_relocated = content_match and integrity_failed
 
         # ---- Signature policy ----
         # A manifest is treated as unsigned only if it carries the UNSIGNED
@@ -2478,7 +2600,17 @@ supported hash algorithms:
                     _warn(w)
 
         # ------------------------- Terminal verdict ------------------------- #
-        if integrity_failed:
+        if manifest.get("symlinks"):
+            _warn("Symlinks Present")
+
+        # Content-root pass: the full set of file contents is intact.
+        if content_match:
+            _ok("Move-invariant/Content Merkle root pass: All files present")
+
+        if files_relocated:
+            # Bytes all present, only their placement changed.
+            _qprint(f"{_tag('FAIL')} Files moved")
+        elif integrity_failed:
             _qprint(f"{_tag('FAIL')} {n_missing} Missing, {n_modified} Modified, "
                     f"{n_new} New/Moved, {n_ok}/{n_expected} OK")
         if symlink_failed:
@@ -2489,18 +2621,24 @@ supported hash algorithms:
         if trust_failed:
             _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
 
-        if integrity_failed or symlink_failed or sig_invalid or trust_failed:
-            sys.exit(1)
-
+        hard_fail = (integrity_failed or symlink_failed or sig_invalid or trust_failed)
         # A manifest that expects a signature but produced none: hashes are
         # intact, but authenticity could not be established.
-        if sig_required and not sig_verified:
+        sig_issue = sig_required and not sig_verified
+
+        # In --json mode, emit the report to stdout regardless of outcome.
+        if args.json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+
+        if hard_fail:
+            sys.exit(1)
+        if sig_issue:
             _warn("Verification completed with issues")
             sys.exit(1)
 
         # Success.  Unsigned manifests pass on integrity alone — the UNSIGNED
         # note printed above already flags the absence of a signature.
-        _ok("Verification successful")
+        _pass("Verification successful")
         return
 
     # ------------------------------------------------------------------ #
@@ -2612,6 +2750,10 @@ supported hash algorithms:
             _ok(f"SSH signature created: {ssh_sig_out.name}")
         else:
             _warn("SSH signing failed.")
+
+    # --json: echo the finished manifest to stdout for piping (logs are on stderr).
+    if args.json:
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

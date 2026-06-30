@@ -1,6 +1,9 @@
 .testing/
-manifest-*.json
-report-*.txt
-report-*.json
+# Generated artifacts at the repo root (anchored so they don't shadow shipped
+# files like schema/manifest-*.schema.json or schema/report-*.schema.json).
+/hashes-*.json
+/hashes-*.txt
+/report-*.txt
+/report-*.json
 __pycache__/
 *.pyc
