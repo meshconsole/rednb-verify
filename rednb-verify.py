@@ -328,6 +328,11 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _now_stamp() -> str:
+    """Human-readable UTC stamp for per-file verbose log lines."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def hash_file(path: Path, algo_spec: str) -> str:
     """Hash a file using an algorithm spec ('algo' or 'algo:length')."""
     algo, length = _parse_algo_spec(algo_spec)
@@ -999,20 +1004,33 @@ def collect_files(
     if jobs == 1:
         for path, rel_str in paths_to_hash:
             t0 = time.perf_counter()
-            files[rel_str] = hash_file_multi(path, algos)
+            try:
+                files[rel_str] = hash_file_multi(path, algos)
+            except OSError:
+                if _verbose:
+                    _vprint(f"{_tag('FAIL', stream=_log_stream())} {rel_str} {_now_stamp()}")
+                raise
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
-                _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
+                _vprint(f"{_tag('OK', stream=_log_stream())} {rel_str} "
+                        f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
     else:
         _lock = threading.Lock()
 
         def _hash_one(path: Path, rel_str: str) -> tuple:
             t0 = time.perf_counter()
-            h = hash_file_multi(path, algos)
+            try:
+                h = hash_file_multi(path, algos)
+            except OSError:
+                if _verbose:
+                    with _lock:
+                        _vprint(f"{_tag('FAIL', stream=_log_stream())} {rel_str} {_now_stamp()}")
+                raise
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 with _lock:
-                    _vprint(f"  hashing {rel_str} ... {elapsed_ms:.2f}ms")
+                    _vprint(f"{_tag('OK', stream=_log_stream())} {rel_str} "
+                            f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
             return rel_str, h
 
         max_workers = jobs if jobs > 0 else None
