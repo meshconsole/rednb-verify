@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.9.0
+Version: 0.10.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -19,6 +19,7 @@ Normal operation:
 "--validate [FILE|DIR]"       : Validate a manifest against the JSON schema and exit (needs optional jsonschema)
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
 "--report txt|json"           : Report format during --verify (default: txt)
+"--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
 "--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
 "--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
 "--hash-list"                 : Print available hash algorithms and exit
@@ -77,7 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 

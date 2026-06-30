@@ -8,9 +8,9 @@
 
 ## Version context
 
-- Current stable: **0.7.2** (main branch)
-- In-progress: **feature/trust-and-multi-hash** branch
-- New features below target the next minor release
+- Current stable: **0.10.0** (main branch)
+- Manifest schema: **v3** (v2 added RFC 6962 Merkle hardening + symlink table; v3 adds the move-invariant content root)
+- See "Feature 5: verify verdict, content root, --json (v0.10.0)" below for the latest behavior
 
 ---
 
@@ -626,3 +626,51 @@ The **manifest's own self-declaration** drives whether a signature is required:
 ### pyyaml
 - `--per-day` without PyYAML exits 2 with a friendly stderr message and a
   `pip install pyyaml` hint (`_require_yaml`).
+
+---
+
+## Feature 5: verify verdict, content root, `--json` — ✅ IMPLEMENTED (v0.10.0, schema v3)
+
+### Move-invariant content root
+- Manifests store `content_root` (single hash) / `content_roots` (multi) — the
+  same RFC 6962 tree as `merkle_root`, but with **leaves sorted by hash value**
+  instead of by path. It commits to the *set* of file contents, independent of
+  where each file lives. Derived from the (already-signed) per-file hashes, so
+  no extra trust assumptions.
+- Verify recomputes the content root from the live files and compares:
+  - **match + all paths match** → `[PASS] Verification successful` (exit 0).
+  - **match + paths differ** → content all present, only relocated:
+    `[OK] Move-invariant/Content Merkle root pass: All files present` then
+    `[FAIL] Files moved` (exit 1). The report `moved` field pairs
+    `old -> new` (renames paired by identical content signature).
+  - **mismatch** → genuine add/remove/modify → the usual
+    `[FAIL] … Missing/Modified/New` (exit 1).
+- Manifests without a content root (schema < 3) skip this check;
+  `content_root_status` is then `[]`.
+- A content swap between two paths (A↔B) keeps the multiset identical, so it
+  reports as a move/relocation, not tampering — by design.
+
+### Terminal verdict
+- The final success line is now **`[PASS]`** (green), distinct from the
+  per-step `[OK]` notes.
+- `[WARN] Symlinks Present` is printed at verify when the manifest carries a
+  non-empty symlink table.
+
+### `--json`
+- Emits one JSON document on **stdout** (the manifest on create, the report on
+  verify); **all** human/log output is routed to **stderr** so stdout stays
+  pipe-clean for `jq`. Implemented via `_json_mode` + `_log_stream()`.
+
+### Auto-validation
+- `--verify` validates the manifest against the bundled JSON schema first
+  (best-effort: returns/skips silently when `jsonschema` isn't installed). Works
+  on text manifests too — they're parsed to the same dict before validation.
+- `--validate` accepts manifests **and** reports (`schema/manifest-v3.schema.json`,
+  `schema/report-v1.schema.json`; auto-selected by content/filename).
+
+### Packaging note
+- `.gitignore` previously used unanchored `manifest-*.json` / `report-*.json`
+  patterns that also matched the shipped `schema/*.schema.json` files, so the
+  schema was never committed (and `--validate` couldn't find it on a clean
+  clone). Patterns are now anchored to the repo root and the manifest glob
+  corrected to the real `hashes-*` artifact name.
