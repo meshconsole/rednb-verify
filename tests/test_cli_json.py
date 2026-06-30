@@ -60,3 +60,32 @@ def test_verify_tamper_exits_one(tmp_path):
     r = _run(str(nb), "--verify", str(tmp_path), "--no-sign")
     assert r.returncode == 1
     assert "Modified" in r.stdout
+
+
+def test_verify_output_without_report_errors(tmp_path):
+    # -o has no effect on --verify unless a report is generated; using it alone
+    # is a usage error (exit 2) rather than silently doing nothing.
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path))
+    reports = tmp_path / "reports"
+    r = _run(str(nb), "--verify", str(tmp_path), "--no-sign", "-o", str(reports))
+    assert r.returncode == 2
+    assert "only sets where a report is written" in r.stderr
+
+
+def test_verify_no_report_writes_no_file(tmp_path):
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path))
+    before = set(tmp_path.glob("report-*"))
+    r = _run(str(nb), "--verify", str(tmp_path), "--no-sign")
+    assert r.returncode == 0
+    assert set(tmp_path.glob("report-*")) == before    # no new report file
+
+
+def test_verify_report_to_output_dir(tmp_path):
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path))
+    reports = tmp_path / "reports"
+    r = _run(str(nb), "--verify", str(tmp_path), "--no-sign", "-o", str(reports), "--report", "json")
+    assert r.returncode == 0
+    assert list(reports.glob("report-*.json"))

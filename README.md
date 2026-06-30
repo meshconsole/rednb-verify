@@ -104,7 +104,7 @@ Run the tool against a directory to hash its contents and write a manifest. Sign
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
 | `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
 | `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
-| `-o`, `--output DIR` | Output directory for the manifest (default: parent of the journal directory) |
+| `-o`, `--output DIR` | Output directory for the manifest (create), or the report (verify — requires `--report`). Default: parent of the journal directory. With `--verify` it does **not** select which manifest to verify — that's the `--verify` argument |
 | `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
 | `--no-bullets` | In a `txt` manifest, don't prefix per-file hash lines with `- ` (Merkle-root lines are never bulleted) |
 | `--hash ALGO[:LEN][,ALGO...]` | Hash algorithm(s) for files (default: `sha256`). Comma-separate for **multi-hashing** (e.g. `sha256,blake2b`). `shake_128`/`shake_256` require a byte length: `shake_128:32` |
@@ -130,7 +130,7 @@ Check a directory against a previously created manifest.
 | Flag | Description |
 |---|---|
 | `--verify [FILE\|DIR]` | Verify mode — pass a manifest file directly, a directory to search, or omit to auto-find the latest manifest in the output directory |
-| `--report [txt\|json]` | Verification report format: `txt` human-readable (default) or `json` structured |
+| `--report [txt\|json]` | Write a verification **report file** (`txt` or `json`). Omit it and `--verify` prints the verdict only, writing no file. `-o` sets where the report goes and requires this flag |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
@@ -404,10 +404,12 @@ Verification automatically reads the `mode` field from the manifest and uses the
 
 ## Verification Report
 
-`--report` writes a verification report alongside the manifest (in the journal's parent directory by default). Format is controlled by the argument:
+A report file is **opt-in**: pass `--report` and `--verify` writes one (to the journal's parent directory by default, or to `-o`); omit it and `--verify` just prints the terminal verdict (and `--json` to stdout if requested). Format is controlled by the argument:
 
-- `--report` or `--report txt` — human-readable numbered list (default)
+- `--report` or `--report txt` — human-readable numbered list
 - `--report json` — structured JSON
+
+Because `-o`/`--output` only directs the report, using it with `--verify` *without* `--report` is an error — `-o` never selects which manifest to verify (that's the `--verify` argument).
 
 ### Text format (default)
 
