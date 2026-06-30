@@ -1736,6 +1736,7 @@ def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
         arg = str(out_dir)
     target = Path(arg)
     if target.is_dir():
+        _info("Directory provided for manifest, choosing latest")
         candidates = sorted(
             list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
         )
@@ -2457,6 +2458,7 @@ supported hash algorithms:
 
         target = Path(verify_arg)
         if target.is_dir():
+            _info("Directory provided for manifest, choosing latest")
             candidates = sorted(
                 list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
             )
