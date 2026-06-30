@@ -18,7 +18,7 @@ Normal operation:
 "--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
 "--validate [FILE|DIR]"       : Validate a manifest against the JSON schema and exit (needs optional jsonschema)
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
-"--report txt|json"           : Report format during --verify (default: txt)
+"--report txt|json"           : Write a verify report file (txt|json). Omit = verdict only, no file. -o sets its location and requires this flag
 "--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
 "--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
 "--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
@@ -2068,7 +2068,10 @@ supported hash algorithms:
     parser.add_argument("-m", "--month-only", action="store_true",
                         help="Hash only YYYY-MM.txt files")
     parser.add_argument("-o", "--output", type=Path,
-                        help="Output directory (default: parent of journal directory)")
+                        help="Output directory for the manifest (create) or the report "
+                             "(verify; requires --report). Default: parent of the journal "
+                             "directory. With --verify it does NOT choose which manifest to "
+                             "verify — pass that to --verify.")
     parser.add_argument("--verify", nargs="?", const="__auto__", default=None,
                         metavar="MANIFEST_OR_DIR",
                         help="Verify mode: path to a manifest file, or directory to search "
@@ -2077,9 +2080,11 @@ supported hash algorithms:
     parser.add_argument("--manifest-type", nargs="?", const="txt", default="txt",
                         metavar="txt|json", dest="manifest_type",
                         help="Manifest creation format: txt (default) or json")
-    parser.add_argument("--report", nargs="?", const="txt", default="txt",
+    parser.add_argument("--report", nargs="?", const="txt", default=None,
                         metavar="txt|json",
-                        help="Verification report format: txt (default) or json")
+                        help="Write a verification report file (txt or json). When omitted, "
+                             "--verify prints the verdict only and writes no report. "
+                             "-o/--output sets where the report goes and requires this flag.")
     parser.add_argument("--json", action="store_true", dest="json",
                         help="Emit the result (manifest on create, report on verify) as a "
                              "single JSON document on stdout for piping; all logs go to stderr")
@@ -2230,7 +2235,7 @@ supported hash algorithms:
         _info(f"Using config: {_config_path}")
 
     # Validate format flags
-    if args.report not in ("txt", "json"):
+    if args.report is not None and args.report not in ("txt", "json"):
         _err(f"--report must be 'txt' or 'json', got: {args.report!r}")
         sys.exit(2)
     if args.manifest_type not in ("txt", "json"):
@@ -2434,6 +2439,17 @@ supported hash algorithms:
     #  Verify mode                                                         #
     # ------------------------------------------------------------------ #
     if args.verify is not None:
+        # -o/--output only directs the report file. With --verify it does
+        # nothing unless a report is being generated, and it never selects which
+        # manifest to verify (that is the --verify argument). Erroring here stops
+        # the silent confusion of "-o picked the wrong/old manifest".
+        if args.output is not None and args.report is None:
+            _err("-o/--output only sets where a report is written; with --verify it "
+                 "has no effect unless you also pass --report txt|json.")
+            _err("        To choose which manifest to verify, pass it to --verify "
+                 "(a file or a directory), e.g. --verify .testing/output")
+            sys.exit(2)
+
         # Resolve manifest path from --verify argument or auto-search
         verify_arg = args.verify
         if verify_arg == "__auto__":
@@ -2510,9 +2526,12 @@ supported hash algorithms:
 
         results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
 
-        report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
-        write_report(results, report_path, manifest_path)
-        _info(f"Verification report: {report_path}")
+        # A report file is written only when --report is requested; otherwise the
+        # terminal verdict (and --json on stdout) is the result.
+        if args.report is not None:
+            report_path = out_dir / f"report-{utc_timestamp()}.{args.report}"
+            write_report(results, report_path, manifest_path)
+            _info(f"Verification report: {report_path}")
 
         # ---- Integrity tallies ----
         n_missing = len(results["missing"])
