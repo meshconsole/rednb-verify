@@ -62,7 +62,7 @@ def test_report_schema_validates_clean_report(tool, tmp_path):
     m = _make_manifest(tool, tmp_path)
     nb = tmp_path / "nb"
     r = tool.verify_manifest(m, nb)
-    errors = tool.validate_against_schema(r, "report-v1.schema.json", required=True)
+    errors = tool.validate_against_schema(r, "report", required=True)
     assert errors == []
 
 
