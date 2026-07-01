@@ -143,7 +143,8 @@ Check a manifest's structure without touching the journal — useful in CI or be
 
 | Flag | Description |
 |---|---|
-| `--validate [FILE\|DIR]` | Validate a manifest against the bundled JSON schema and exit. Requires the optional `jsonschema` package. See [Schema & Validation](#schema--validation) |
+| `--validate [FILE\|DIR]` | Validate a manifest **or report** against the embedded JSON schema and exit. Requires the optional `jsonschema` package. See [Schema & Validation](#schema--validation) |
+| `--dump-schema [manifest\|report]` | Print the embedded JSON schema to stdout and exit (no dependency needed) — e.g. to regenerate `schema/*.json` or feed an external validator |
 
 ### Config management
 
@@ -607,7 +608,7 @@ In the manifest, hashed and cleartext entries are distinguished by field:
 
 ## Schema & Validation
 
-Every JSON manifest conforms to a published **JSON Schema** (Draft 2020-12), shipped at [`schema/manifest-v3.schema.json`](schema/manifest-v3.schema.json); verification reports have their own schema at [`schema/report-v1.schema.json`](schema/report-v1.schema.json). Validation lets you catch a malformed or truncated manifest *before* trusting it — handy in CI, or before archiving.
+Every JSON manifest conforms to a **JSON Schema** (Draft 2020-12). The schema is **embedded in the script**, so `--validate` is self-contained — it works from the single downloaded `rednb-verify.py` with no extra files. For external tools (editors, `check-jsonschema`, the links here) the same schemas are also exported at [`schema/manifest-v3.schema.json`](schema/manifest-v3.schema.json) and [`schema/report-v1.schema.json`](schema/report-v1.schema.json); those files are generated from the embedded copies (a test keeps them in sync). Validation lets you catch a malformed or truncated manifest *before* trusting it — handy in CI, or before archiving.
 
 Validate with the built-in flag (requires the optional `jsonschema` package):
 
@@ -619,6 +620,10 @@ python rednb-verify.py --validate hashes-20260617T120000Z.json
 
 # Validate the latest manifest in a directory
 python rednb-verify.py --validate ~/journal
+
+# Print / regenerate the schema itself (no dependency needed)
+python rednb-verify.py --dump-schema manifest > manifest.schema.json
+python rednb-verify.py --dump-schema report
 ```
 
 A `--verify` run also **auto-validates** the manifest first (best-effort: skipped silently when `jsonschema` isn't installed). This works for text manifests too — they're parsed to the same structure before validation.

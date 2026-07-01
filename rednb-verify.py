@@ -16,7 +16,8 @@ Normal operation:
 "-o", "--output"             : Output directory for manifest (default: journal parent)
 "-V", "--version"            : Print version and exit
 "--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
-"--validate [FILE|DIR]"       : Validate a manifest against the JSON schema and exit (needs optional jsonschema)
+"--validate [FILE|DIR]"       : Validate a manifest/report against the embedded JSON schema and exit (needs optional jsonschema)
+"--dump-schema manifest|report" : Print the embedded JSON schema to stdout and exit
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
 "--report txt|json"           : Write a verify report file (txt|json). Omit = verdict only, no file. -o sets its location and requires this flag
 "--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
@@ -1752,9 +1753,137 @@ def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
     return target
 
 
-def validate_against_schema(obj: Dict, schema_file: str, *, required: bool = True
+# JSON Schemas are EMBEDDED here as the single source of truth so --validate is
+# self-contained — it works from the single downloaded rednb-verify.py with no
+# sibling schema/ folder. The schema/*.json files are exports generated from
+# these dicts (see --dump-schema); a test asserts they stay in sync.
+MANIFEST_SCHEMA: Dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/meshconsole/rednb-verify/schema/manifest-v3.schema.json",
+    "title": "rednb-verify manifest (schema version 3)",
+    "type": "object",
+    "required": ["tool", "schema_version", "created", "date", "mode", "hash_algorithm", "files"],
+    "properties": {
+        "tool": {"const": "rednb-verify"},
+        "version": {"type": "string"},
+        "schema_version": {"type": "integer", "minimum": 2},
+        "created": {
+            "type": "string",
+            "pattern": "^[0-9]{8}T[0-9]{6}Z$",
+            "description": "UTC creation stamp, e.g. 20260617T120000Z",
+        },
+        "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "mode": {
+            "enum": [
+                "full-tree",
+                "month-only",
+                "per-day/full-tree",
+                "per-day/month-only",
+                "per-day",
+                "month-files",
+            ]
+        },
+        "hash_algorithm": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            ]
+        },
+        "merkle_hash": {"type": "string"},
+        "files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "hashes": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "additionalProperties": {"type": "string"},
+                    },
+                },
+                "oneOf": [
+                    {"required": ["hashes"]},
+                    {"allOf": [{"not": {"required": ["hashes"]}}, {"minProperties": 2}]},
+                ],
+            },
+        },
+        "merkle_root": {"type": "string"},
+        "merkle_roots": {"type": "object", "additionalProperties": {"type": "string"}},
+        "merkle_root_concat": {"type": "object", "additionalProperties": {"type": "string"}},
+        "content_root": {
+            "type": "string",
+            "description": "Move-invariant Merkle root over the multiset of file content hashes (schema v3)",
+        },
+        "content_roots": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Per-algorithm move-invariant content roots, multi-hash mode (schema v3)",
+        },
+        "exclude": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "signed_by": {
+            "type": "object",
+            "properties": {"gpg": {"type": "string"}, "ssh": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        "symlink_targets": {
+            "type": "string",
+            "pattern": "^(none|full|hash:.+)$",
+            "description": "How symlink targets are recorded: 'full', or 'hash:<algo-spec>'",
+        },
+        "symlinks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "target": {"type": "string"},
+                    "target_hash": {"type": "string"},
+                },
+                "oneOf": [{"required": ["target"]}, {"required": ["target_hash"]}],
+            },
+        },
+    },
+}
+
+REPORT_SCHEMA: Dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/meshconsole/rednb-verify/schema/report-v1.schema.json",
+    "title": "rednb-verify verification report (--report json)",
+    "type": "object",
+    "required": ["ok", "missing", "modified", "new"],
+    "properties": {
+        "ok": {"type": "array", "items": {"type": "string"}},
+        "missing": {"type": "array", "items": {"type": "string"}},
+        "modified": {"type": "array", "items": {"type": "string"}},
+        "new": {"type": "array", "items": {"type": "string"}},
+        "moved": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Relocated files as 'old/path -> new/path' (schema v3 move detection)",
+        },
+        "content_root_status": {
+            "type": "array",
+            "items": {"enum": ["match", "mismatch"]},
+            "maxItems": 1,
+            "description": "['match'] when the move-invariant content root verifies; [] if absent",
+        },
+        "symlink_ok": {"type": "array", "items": {"type": "string"}},
+        "symlink_changed": {"type": "array", "items": {"type": "string"}},
+        "symlink_missing": {"type": "array", "items": {"type": "string"}},
+        "symlink_new": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+EMBEDDED_SCHEMAS: Dict[str, Dict] = {"manifest": MANIFEST_SCHEMA, "report": REPORT_SCHEMA}
+
+
+def validate_against_schema(obj: Dict, schema_name: str, *, required: bool = True
                             ) -> Optional[List[str]]:
-    """Validate an object against a bundled JSON schema.
+    """Validate an object against an EMBEDDED schema ('manifest' or 'report').
 
     Returns a list of human-readable error strings ([] means valid), or None
     when the optional 'jsonschema' package is unavailable. With required=True
@@ -1770,39 +1899,26 @@ def validate_against_schema(obj: Dict, schema_file: str, *, required: bool = Tru
                  "pip install jsonschema")
             sys.exit(2)
         return None
-    schema_path = Path(__file__).resolve().parent / "schema" / schema_file
-    if not schema_path.exists():
-        if required:
-            _err(f"Schema file not found: {schema_path}")
-            sys.exit(2)
-        return None
-    try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        if required:
-            _err(f"Could not read schema: {exc}")
-            sys.exit(2)
-        return None
-    validator = jsonschema.Draft202012Validator(schema)
+    validator = jsonschema.Draft202012Validator(EMBEDDED_SCHEMAS[schema_name])
     errors = sorted(validator.iter_errors(obj), key=lambda e: list(e.path))
     return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}" for e in errors]
 
 
 def _schema_for(obj: Dict, path: Path) -> str:
-    """Pick the right schema file for a loaded JSON object (manifest vs report)."""
+    """Pick the right embedded schema for a loaded object: 'manifest' or 'report'."""
     if "tool" in obj or "files" in obj:
-        return "manifest-v3.schema.json"
+        return "manifest"
     if path.name.startswith("report") or any(
         k in obj for k in ("ok", "missing", "modified", "new")
     ):
-        return "report-v1.schema.json"
-    return "manifest-v3.schema.json"
+        return "report"
+    return "manifest"
 
 
 def validate_manifest_schema(manifest: Dict, *, required: bool = True
                              ) -> Optional[List[str]]:
-    """Validate a manifest dict against the current manifest schema."""
-    return validate_against_schema(manifest, "manifest-v3.schema.json", required=required)
+    """Validate a manifest dict against the embedded manifest schema."""
+    return validate_against_schema(manifest, "manifest", required=required)
 
 
 # ---------- CLI ----------
@@ -2096,6 +2212,10 @@ supported hash algorithms:
                              "for multi-hashing, e.g. sha256,blake2b")
     parser.add_argument("--hash-list", action="store_true",
                         help="Print available hash algorithms and exit")
+    parser.add_argument("--dump-schema", nargs="?", const="manifest", default=None,
+                        dest="dump_schema", metavar="manifest|report",
+                        help="Print the embedded JSON schema (manifest or report) to "
+                             "stdout and exit — e.g. to regenerate schema/*.json")
     parser.add_argument("--hash-merkle", default=None, dest="merkle_algo",
                         metavar="ALGO[,ALGO...]",
                         help="Merkle tree algorithm(s). Single mode: tree combiner "
@@ -2211,6 +2331,14 @@ supported hash algorithms:
     if args.quiet and args.verbose:
         _err("--quiet and --verbose are mutually exclusive.")
         sys.exit(2)
+
+    # ---- --dump-schema: print an embedded JSON schema and exit ----
+    if args.dump_schema is not None:
+        if args.dump_schema not in EMBEDDED_SCHEMAS:
+            _err(f"--dump-schema must be 'manifest' or 'report', got: {args.dump_schema!r}")
+            sys.exit(2)
+        print(json.dumps(EMBEDDED_SCHEMAS[args.dump_schema], indent=2, ensure_ascii=False))
+        return
 
     # ---- Config management (Feature 1): mutate config, optionally write & exit ----
     _set_tokens = (args.set_cf or []) + (args.set_cf_run or [])
@@ -2425,9 +2553,9 @@ supported hash algorithms:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _err(f"Could not read file: {exc}")
             sys.exit(2)
-        schema_file = _schema_for(doc, doc_path)
-        kind = "Report" if schema_file.startswith("report") else "Manifest"
-        errors = validate_against_schema(doc, schema_file, required=True)
+        schema_name = _schema_for(doc, doc_path)
+        kind = "Report" if schema_name == "report" else "Manifest"
+        errors = validate_against_schema(doc, schema_name, required=True)
         if errors:
             _err(f"{kind} failed schema validation ({len(errors)} error(s)):")
             for e in errors:
