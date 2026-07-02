@@ -133,6 +133,7 @@ Check a directory against a previously created manifest.
 | `--report [txt\|json]` | Write a verification **report file** (`txt` or `json`). Omit it and `--verify` prints the verdict only, writing no file. `-o` sets where the report goes and requires this flag |
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
+| `--ignore-symlinks` | During `--verify`, skip the symlink-table comparison and symlink warnings (parallel to `--ignore-sig`) |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
 | `--schema-ignore` | Verify a manifest whose schema is newer than this tool supports (risky) |
@@ -330,6 +331,8 @@ If GPG is available and secret keys are found, you are prompted to sign after ma
 
 Interactive key selection shows fingerprint and expiry for each key.
 
+**Non-interactive runs never block on the signing menu.** In a piped/cron/no-TTY session (and under `--quiet`), the tool skips signing by default and prints `[INFO] Non-interactive session; skipping signing`. Pass `--gpg`/`--ssh` to sign unattended, or `--no-sign` to silence the note.
+
 ### SSH
 
 Use `--ssh` to sign with an SSH key. The tool scans `~/.ssh` for key pairs and prompts for selection if multiple are found. Pass a `.pub` file or directory to use a specific key:
@@ -461,6 +464,7 @@ After writing the report, `--verify` prints a single terminal verdict:
 | `[FAIL] Manifest failed Signature` | A signature is present but did not validate (tampering) | `1` |
 | `[FAIL] Untrusted signer (--trust high)` | Signature valid, but the signer is not pinned in your trust list | `1` |
 | `[WARN] Symlinks Present` | The manifest records symbolic links — review the symlink table | — |
+| `[WARN] Symlink points outside the notebook: …` | A symlink's target resolves outside the base directory (data pulled in from elsewhere; a repointing surface). Also printed at create | — |
 | `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
 | `[WARN] Verification completed with issues` | Hashes intact, but the manifest implies a signature that could not be established | `1` |
 
@@ -574,6 +578,8 @@ At verify time this catches what content hashing alone cannot:
 - a symlink that appeared where the manifest committed to none (`Sym new`)
 
 Any of these fails verification (**exit 1**). The table is recorded even when a notebook has zero symlinks, so a link added later is still detected.
+
+A symlink whose target resolves **outside** the base directory is flagged with `[WARN] Symlink points outside the notebook: …` at both create and verify — its content is pulled in from elsewhere on the system, and it's a repointing surface worth eyeballing. To skip all symlink comparison and warnings during a verify (parallel to `--ignore-sig`), pass **`--ignore-symlinks`**.
 
 ### Recording policy — `--symlink-targets`
 
