@@ -92,6 +92,25 @@ def test_verify_empty_recorded_flags_new_symlink(tool, tmp_path, monkeypatch):
     assert r["symlink_new"] == ["new.txt"]
 
 
+def test_escaping_symlinks_detects_outside_base(tool, tmp_path, monkeypatch):
+    base = tmp_path / "nb"
+    base.mkdir()
+    monkeypatch.setattr(tool, "collect_symlinks",
+                        lambda b, exclude=None: {"out.txt": "/etc/passwd", "in.txt": "sub/x.txt"})
+    assert tool.escaping_symlinks(base) == ["out.txt -> /etc/passwd"]
+
+
+def test_verify_ignore_symlinks_skips_comparison(tool, tmp_path, monkeypatch):
+    nb = tmp_path / "nb"
+    nb.mkdir()
+    (nb / "2026-01.txt").write_text("alpha")
+    m = tool.generate_manifest(nb, False, ["sha256"], "sha256", symlink_policy="hash:sha256")
+    monkeypatch.setattr(tool, "collect_symlinks", lambda b, exclude=None: {"new.txt": "/z"})
+    assert tool.verify_manifest(m, nb)["symlink_new"] == ["new.txt"]
+    skipped = tool.verify_manifest(m, nb, ignore_symlinks=True)
+    assert skipped["symlink_new"] == [] and skipped["symlink_changed"] == []
+
+
 def test_verify_none_policy_skips_symlink_checks(tool, tmp_path, monkeypatch):
     nb = tmp_path / "nb"
     nb.mkdir()

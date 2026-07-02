@@ -31,6 +31,7 @@ Normal operation:
 "--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
 "--ssh-verify"                : Force SSH signature check during --verify
 "--ignore-sig"                : Verify integrity only; skip all signature checks
+"--ignore-symlinks"           : During --verify, skip the symlink-table comparison and symlink warnings
 "--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
 "--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
 "--trust high|low"            : Signing trust level (default: low)
@@ -1084,6 +1085,27 @@ def collect_symlinks(base: Path, exclude: Optional[List[str]] = None) -> Dict[st
     return dict(sorted(out.items()))
 
 
+def escaping_symlinks(base: Path, exclude: Optional[List[str]] = None) -> List[str]:
+    """Return 'rel -> target' for symlinks whose target resolves OUTSIDE base.
+
+    An escaping link pulls in (and hashes) data from elsewhere on the system, or
+    can be repointed to leak/point at sensitive paths — worth flagging in a
+    tamper-evidence tool, regardless of the recording policy.
+    """
+    base_real = base.resolve()
+    out: List[str] = []
+    for rel, target in collect_symlinks(base, exclude=exclude).items():
+        try:
+            real = (base / rel).parent.joinpath(target).resolve()
+        except (OSError, ValueError):
+            continue
+        try:
+            real.relative_to(base_real)
+        except ValueError:
+            out.append(f"{rel} -> {target}")
+    return out
+
+
 def _build_symlink_table(links: Dict[str, str], policy: str) -> List[Dict[str, str]]:
     """Turn {path: target} into manifest entries per the symlink policy.
 
@@ -1334,6 +1356,7 @@ def verify_manifest(
     notebook: Path,
     extra_exclude: Optional[List[str]] = None,
     jobs: int = 1,
+    ignore_symlinks: bool = False,
 ) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {
         "ok": [], "missing": [], "modified": [], "new": [],
@@ -1391,7 +1414,7 @@ def verify_manifest(
     # link<->file swaps, so this is where that tamper-evidence lives.
     policy = manifest.get("symlink_targets")
     recorded = manifest.get("symlinks")
-    if recorded is not None and policy and policy != "none":
+    if not ignore_symlinks and recorded is not None and policy and policy != "none":
         current = collect_symlinks(notebook, exclude=exclude)
         expected_links = {e["path"]: e for e in recorded}
         use_hash = policy.startswith("hash:")
@@ -2237,6 +2260,9 @@ supported hash algorithms:
     parser.add_argument("--ignore-sig", action="store_true", dest="ignore_sig",
                         help="During --verify, check integrity only and skip all "
                              "signature checks (returns 0 when hashes match)")
+    parser.add_argument("--ignore-symlinks", action="store_true", dest="ignore_symlinks",
+                        help="During --verify, skip the symlink-table comparison and "
+                             "symlink warnings (parallel to --ignore-sig)")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
                         help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
@@ -2654,7 +2680,8 @@ supported hash algorithms:
             _qprint(f"{_tag('WARN')} Missing Algorithms: {_hint}")
             sys.exit(1)
 
-        results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude, jobs=jobs)
+        results = verify_manifest(manifest, args.notebook_dir, extra_exclude=exclude,
+                                  jobs=jobs, ignore_symlinks=args.ignore_symlinks)
 
         # A report file is written only when --report is requested; otherwise the
         # terminal verdict (and --json on stdout) is the result.
@@ -2768,8 +2795,13 @@ supported hash algorithms:
                     _warn(w)
 
         # ------------------------- Terminal verdict ------------------------- #
-        if manifest.get("symlinks"):
-            _warn("Symlinks Present")
+        if args.ignore_symlinks:
+            _warn("Flag --ignore-symlinks in use")
+        else:
+            if manifest.get("symlinks"):
+                _warn("Symlinks Present")
+            for _esc in escaping_symlinks(args.notebook_dir, exclude=exclude):
+                _warn(f"Symlink points outside the notebook: {_esc}")
 
         # Content-root pass: the full set of file contents is intact.
         if content_match:
@@ -2847,6 +2879,10 @@ supported hash algorithms:
         concat_algo=args.merkle_concat,
         symlink_policy=_resolve_symlink_policy(args),
     )
+    # Flag links that reach outside the notebook — their content is pulled in
+    # from elsewhere, and they are a repointing attack surface.
+    for _esc in escaping_symlinks(args.notebook_dir, exclude=exclude):
+        _warn(f"Symlink points outside the notebook: {_esc}")
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
     manifest_name = f"hashes-{manifest['created']}{ext}"
@@ -2864,6 +2900,11 @@ supported hash algorithms:
         pass
     elif want_gpg or want_ssh:
         do_gpg, do_ssh = want_gpg, want_ssh
+    elif not sys.stdin.isatty():
+        # Non-interactive session (piped/cron/no TTY): don't block on the menu —
+        # default to skip-signing, mirroring how --quiet implies --no-sign.
+        _info("Non-interactive session; skipping signing "
+              "(use --gpg/--ssh to sign, or --no-sign to silence)")
     else:
         choice = _prompt_signing_menu()
         do_gpg, do_ssh = choice in (1, 3), choice in (2, 3)

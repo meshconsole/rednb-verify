@@ -82,6 +82,18 @@ def test_verify_no_report_writes_no_file(tmp_path):
     assert set(tmp_path.glob("report-*")) == before    # no new report file
 
 
+def test_noninteractive_create_skips_signing(tmp_path):
+    # Piped/non-interactive stdin: no signing menu, default to skip-signing,
+    # exit 0 with the manifest written (no prompt, no traceback).
+    nb = _journal(tmp_path)
+    r = subprocess.run([sys.executable, TOOL, str(nb), "-o", str(tmp_path)],
+                       capture_output=True, text=True, input="")
+    assert r.returncode == 0
+    assert "skipping signing" in r.stdout
+    assert "How would you like to sign" not in r.stdout
+    assert "Traceback" not in r.stderr
+
+
 def test_verify_report_to_output_dir(tmp_path):
     nb = _journal(tmp_path)
     _run(str(nb), "--no-sign", "-o", str(tmp_path))
