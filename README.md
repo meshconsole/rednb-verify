@@ -841,7 +841,7 @@ A notification is printed when a config file is in use. Use `--no-config` / `--n
 
 > **Shell quoting:** quotes are only needed when a value contains spaces. Comma-separate multiple values, e.g. `--set-cf trust-gpg:AB12,CD34`. Repeated flags avoid quotes entirely.
 
-### Field reference
+### Config field reference
 
 Every field is optional; an absent field simply falls back to the tool's default. CLI flags always win over config values.
 
