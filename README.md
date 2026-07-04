@@ -10,6 +10,35 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 
 ---
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [What This Tool Is Not](#what-this-tool-is-not)
+- [Non-Repudiation Warning](#non-repudiation-warning-)
+- [Usage](#usage)
+  - [Manifest creation](#manifest-creation) · [Signing](#signing) · [Timestamping](#timestamping) · [Verification](#verification) · [Validation](#validation) · [Config management](#config-management) · [Examples](#examples) · [Other](#other)
+- [Manifest Format](#manifest-format)
+- [Signing](#signing-1)
+- [Modes](#modes)
+- [Verification Report](#verification-report)
+- [Exit Codes](#exit-codes)
+- [Multi-Hashing](#multi-hashing)
+- [Merkle Tree](#merkle-tree)
+- [Move detection](#move-detection)
+- [Symlinks](#symlinks)
+- [Schema & Validation](#schema--validation)
+- [Trust & Signing](#trust--signing)
+- [Trusted Timestamping (RFC 3161)](#trusted-timestamping-rfc-3161)
+- [Config File](#config-file)
+- [Threat Model](#threat-model)
+- [Forensic Considerations](#forensic-considerations)
+- [Design Principles](#design-principles)
+- [Planned](#planned)
+- [Project Status](#project-status)
+
+---
+
 ## Installation
 
 **No install required.** Download the single file and run it:
@@ -811,6 +840,60 @@ openssl ts -verify -data hashes-20260703T000000Z.txt \
 A notification is printed when a config file is in use. Use `--no-config` / `--no-cf` to ignore it for a single run, or `--config FILE` to load an alternate file. The `--set-cf` / `--add-trust` flags edit this file for you (always the default file unless `--config` redirects). When `dir` is set, `notebook_dir` may be omitted on the command line.
 
 > **Shell quoting:** quotes are only needed when a value contains spaces. Comma-separate multiple values, e.g. `--set-cf trust-gpg:AB12,CD34`. Repeated flags avoid quotes entirely.
+
+### Field reference
+
+Every field is optional; an absent field simply falls back to the tool's default. CLI flags always win over config values.
+
+| Field | Type | CLI equivalent | Effect |
+|---|---|---|---|
+| `hash` | string | `--hash` | Default file-hash algorithm spec; comma-separate for multi-hashing (`"sha256,blake2b"`) |
+| `hash_merkle` | string \| `null` | `--hash-merkle` | Merkle combiner (single mode) / tree selection (multi mode); `null` = same as `hash` |
+| `quiet` | bool | `--quiet` | Suppress non-error output on every run (implies `no_sign` unless a signing key is configured) |
+| `no_sign` | bool | `--no-sign` | Never prompt to sign |
+| `gpg_key` | string | `--gpg FPR` | GPG fingerprint to sign with (skips the key menu) |
+| `ssh_key` | string (path) | `--ssh FILE` | SSH key to sign with; `~` is expanded |
+| `exclude` | array of strings | `--exclude` | Glob patterns excluded from every run |
+| `manifest_age_warn_days` | integer | `--warn-age` | Warn during `--verify` when the manifest is older than N days |
+| `jobs` | integer | `--jobs` | Parallel hashing workers (`0` = auto) |
+| `trust_level` | `"high"` \| `"low"` | `--trust` | Default trust level; written by `--set-cf trust-level:high` |
+| `dir` | string (path) | *(positional)* | Default notebook directory when none is given; written by `--set-cf dir:...` |
+| `trust.gpg` | array of strings | — | Pinned GPG fingerprints for `--trust high`; written by `--add-trust trust-gpg:...` |
+| `trust.ssh` | array of strings | — | Pinned SSH key fingerprints (`SHA256:...`) for `--trust high`; written by `--add-trust trust-ssh:...` |
+
+Only `trust-gpg`, `trust-ssh`, `trust-level`, and `dir` are managed by the `--set-cf` / `--add-trust` flags — the rest are edited by hand (the file is plain JSON).
+
+### Example profiles
+
+**Nightly cron run** — hash a fixed journal quietly with a pre-selected GPG key, and complain at verify time if the newest manifest is stale:
+
+```json
+{
+    "dir": "~/journal",
+    "quiet": true,
+    "gpg_key": "AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12",
+    "jobs": 0,
+    "exclude": ["*.tmp", ".~lock.*"],
+    "manifest_age_warn_days": 7
+}
+```
+
+With that in place, the cron lines shrink to `rednb-verify.py` (create + sign) and `rednb-verify.py --verify` (check).
+
+**High-trust workstation** — only pinned keys may sign, and a valid signature from any *other* key fails verification:
+
+```json
+{
+    "dir": "~/journal",
+    "trust_level": "high",
+    "trust": {
+        "gpg": ["AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12"],
+        "ssh": ["SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8"]
+    }
+}
+```
+
+Equivalent to running `--set-cf trust-level:high`, `--add-trust trust-gpg:AB12…`, and `--add-trust "trust-ssh:SHA256:nThbg…"` once.
 
 ---
 
