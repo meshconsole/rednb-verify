@@ -187,6 +187,94 @@
           }
         ]
       }
+    },
+    "tsa_stamp": {
+      "type": "object",
+      "required": [
+        "tsa",
+        "token_b64"
+      ],
+      "properties": {
+        "tsa": {
+          "type": "string",
+          "description": "TSA URL the token came from"
+        },
+        "time": {
+          "type": "string",
+          "description": "Asserted timestamp (informational)"
+        },
+        "token_b64": {
+          "type": "string",
+          "description": "Base64 RFC 3161 token (.tsr bytes)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tsa_merkle": {
+      "type": "object",
+      "required": [
+        "tsa",
+        "token_b64"
+      ],
+      "properties": {
+        "tsa": {
+          "type": "string",
+          "description": "TSA URL the token came from"
+        },
+        "time": {
+          "type": "string",
+          "description": "Asserted timestamp (informational)"
+        },
+        "token_b64": {
+          "type": "string",
+          "description": "Base64 RFC 3161 token (.tsr bytes)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tsa_concat": {
+      "type": "object",
+      "required": [
+        "tsa",
+        "token_b64"
+      ],
+      "properties": {
+        "tsa": {
+          "type": "string",
+          "description": "TSA URL the token came from"
+        },
+        "time": {
+          "type": "string",
+          "description": "Asserted timestamp (informational)"
+        },
+        "token_b64": {
+          "type": "string",
+          "description": "Base64 RFC 3161 token (.tsr bytes)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tsa_content": {
+      "type": "object",
+      "required": [
+        "tsa",
+        "token_b64"
+      ],
+      "properties": {
+        "tsa": {
+          "type": "string",
+          "description": "TSA URL the token came from"
+        },
+        "time": {
+          "type": "string",
+          "description": "Asserted timestamp (informational)"
+        },
+        "token_b64": {
+          "type": "string",
+          "description": "Base64 RFC 3161 token (.tsr bytes)"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

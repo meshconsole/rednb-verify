@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.10.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`)
+**Version:** 0.11.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`)
 
 ---
 
@@ -34,6 +34,7 @@ pip install -r requirements.txt
 **External tools** used when available (not required for basic operation):
 - `gpg` — for GPG signing and verification
 - `ssh-keygen` — for SSH signing and verification (ships with OpenSSH)
+- `openssl` — for RFC 3161 trusted timestamping (`--tsa`, opt-in)
 
 ---
 
@@ -130,6 +131,20 @@ Signing happens at creation time (or later with `--resign`). See [Signing](#sign
 | `--trust [high\|low]` | Signing trust level (default: `low`). `high` only allows pinned keys to sign — and also rejects untrusted signers at verify |
 | `--no-sign` | Skip all signing prompts |
 | `--resign FILE` | Re-sign an existing manifest without re-hashing or rewriting it (requires `--gpg` and/or `--ssh`) |
+
+### Timestamping
+
+Prove a manifest existed at a point in time via an RFC 3161 Timestamp Authority. **Strictly opt-in** — `--tsa` is the tool's *only* network operation; nothing is ever sent unless you pass it. See [Trusted Timestamping](#trusted-timestamping-rfc-3161).
+
+| Flag | Description |
+|---|---|
+| `--tsa NAME\|URL` | Request a timestamp at create time from a known TSA name (see `--tsa-list`) or any `http(s)://` URL (incl. self-hosted). Default output: detached `hashes-….tsr` token next to the manifest |
+| `--tsa-embed` | With `--tsa`: embed **one** stamp over the placement root (`merkle_root`, or the concat root in multi-hash mode) as `tsa_stamp` — 1 request, no detached file |
+| `--tsa-embed-separate` | With `--tsa`: embed **separate** stamps for the placement root (`tsa_merkle`/`tsa_concat`) and the content root (`tsa_content`), so a third party can attest each independently — 2 requests |
+| `--tsa-cert CAFILE` | TSA CA certificate used to verify tokens during `--verify` (verification is fully local — no network) |
+| `--ignore-tsa` | During `--verify`, skip all timestamp-token checks (parallel to `--ignore-sig`) |
+| `--tsa-list` | Print the built-in TSA registry (names → URLs) and exit — no network |
+| `--offline` | Assert that no network is used: refuses `--tsa`. The tool is offline by default; this makes the guarantee explicit in the command |
 
 ### Verification
 
@@ -269,7 +284,7 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.10.0
+version: 0.11.0
 schema_version: 3
 created: 20260528T120000Z
 date: 2026-05-28
@@ -295,7 +310,7 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "schema_version": 3,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
@@ -474,6 +489,9 @@ After writing the report, `--verify` prints a single terminal verdict:
 | `[WARN] Symlink points outside the notebook: …` | A symlink's target resolves outside the base directory (data pulled in from elsewhere; a repointing surface). Also printed at create | — |
 | `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
 | `[WARN] Verification completed with issues` | Hashes intact, but the manifest implies a signature that could not be established | `1` |
+| `[OK] TSA timestamp verified: …` | An RFC 3161 token (detached `.tsr` or embedded stamp) verified against `--tsa-cert` | — |
+| `[FAIL] TSA timestamp failed: …` | A timestamp token did not verify (tampering or wrong CA) | `1` |
+| `[WARN] TSA timestamp present but no --tsa-cert given …` | A token exists but can't be cryptographically checked without the TSA's CA certificate | — |
 
 **Integrity vs. authenticity.** Plain `--verify` checks *both* that files are unchanged **and** — when the manifest implies it is signed — that a valid signature establishes authenticity. How a manifest verifies depends on what it declares about itself:
 
@@ -654,7 +672,7 @@ A minimal valid manifest looks like:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "schema_version": 3,
   "created": "20260617T120000Z",
   "date": "2026-06-17",
@@ -697,6 +715,72 @@ python rednb-verify.py --add-trust trust-gpg:ABCDEF --config-out
 Before each signing or verification, the key's **fingerprint randomart** is shown (native `ssh-keygen` art for SSH, a Drunken-Bishop rendering for GPG) so you can eyeball-confirm the key out of band. The verified signer's fingerprint is also recorded in the manifest's `signed_by` field as a hint — but trust decisions always use the *cryptographically verified* key, never that field.
 
 > **Pin the maintainer fingerprint out of band.** To trust this project's own releases, obtain the maintainer's published key fingerprint from a separate channel (the project page) and pin it — don't trust a fingerprint that travels with the manifest.
+
+---
+
+## Trusted Timestamping (RFC 3161)
+
+A signature proves *who* vouched for a manifest; a **trusted timestamp** proves *when* it existed. `--tsa` sends the manifest's hash (never its contents) to a Timestamp Authority, which returns a signed token binding that hash to a UTC time. Anyone can later verify — **fully offline** — that the manifest existed at or before that moment, which defeats back-dating even by the manifest's own author.
+
+**Network policy.** The tool is offline by default and this feature is **strictly opt-in**: the timestamp *request* at create time is the only network operation in the entire tool, it announces itself (`[INFO] Requesting timestamp from <url>`), makes a single POST with a fixed timeout and no retries, and never runs unless you pass `--tsa`. Token *verification* is local (`openssl ts -verify`). Pass `--offline` to make the no-network guarantee explicit in the command itself.
+
+```bash
+# Create + timestamp: detached token saved as hashes-....txt.tsr
+python rednb-verify.py ~/journal --no-sign --tsa digicert
+
+# Same, against your own/self-hosted TSA
+python rednb-verify.py ~/journal --no-sign --tsa https://tsa.example.org/tsr
+
+# Embed ONE stamp over the placement root into the manifest (no sidecar)
+python rednb-verify.py ~/journal --no-sign --tsa freetsa --tsa-embed
+
+# Embed SEPARATE placement + content stamps (independent attestation)
+python rednb-verify.py ~/journal --no-sign --tsa freetsa --tsa-embed-separate
+
+# Verify, checking the token against the TSA's CA certificate (local, no network)
+python rednb-verify.py ~/journal --verify --tsa-cert ~/certs/tsa-ca.pem
+
+# Verify without checking the timestamp
+python rednb-verify.py ~/journal --verify --ignore-tsa
+
+# List the built-in TSA registry
+python rednb-verify.py --tsa-list
+```
+
+### Detached vs embedded
+
+| Mode | What the stamp covers | Where it lives | Requests |
+|---|---|---|---|
+| *(default)* | the **written manifest file's exact bytes** (strongest claim: covers every root, hash, and field) | detached `hashes-….tsr` sidecar, like `.asc`/`.sshsig` | 1 |
+| `--tsa-embed` | the **placement root** (`merkle_root`, or the concat root in multi-hash mode) | `tsa_stamp` field inside the manifest | 1 |
+| `--tsa-embed-separate` | the placement root **and** the content root, separately | `tsa_merkle`/`tsa_concat` + `tsa_content` fields | 2 |
+
+Embedded stamps cover **root values**, never the manifest itself — a token embedded into the very bytes it covers would invalidate itself. Because the roots don't change when the stamp fields are added, the manifest stays self-consistent, and signatures applied at creation cover the embedded stamps too. `--tsa-embed-separate` exists for forensics: with separate stamps, a third party can attest the *content* commitment and the *placement* commitment independently — e.g. prove the content set's timestamp without relying on the placement tree, or vice versa. In multi-hash mode the placement stamp uses the single concatenated root (`merkle_root_concat`, computed and stored automatically if absent), and the content stamp covers the alphabetical `algo:root,…` join of `content_roots`.
+
+An embedded stamp entry looks like:
+
+```json
+"tsa_stamp": {
+  "tsa": "http://timestamp.digicert.com",
+  "time": "Jul  3 00:00:00 2026 GMT",
+  "token_b64": "MIIC…"
+}
+```
+
+### Verifying timestamps
+
+`--verify` checks any detached `.tsr` sidecar and any embedded stamps automatically — but cryptographic verification needs the TSA's **CA certificate** (`--tsa-cert CAFILE`; most TSAs publish theirs). Without it, the tool prints `[WARN] … not cryptographically verified` and continues (exit unaffected); with it, a bad token is `[FAIL] TSA timestamp failed` → exit `1`. `--ignore-tsa` skips the checks entirely.
+
+You can also verify a detached token with plain OpenSSL, independent of this tool:
+
+```bash
+openssl ts -verify -data hashes-20260703T000000Z.txt \
+  -in hashes-20260703T000000Z.txt.tsr -CAfile tsa-ca.pem
+```
+
+### Choosing a TSA
+
+`--tsa-list` prints the built-in registry (DigiCert, Sectigo, GlobalSign, Certum, Apple, freeTSA). Public TSAs give you an *independent* attestation; a **self-hosted** TSA (e.g. `openssl ts` or `uts-server`) works with `--tsa <url>` but only convinces parties who trust *your* TSA key — fine for internal audit trails, useless against an accusation of back-dating. Note the request discloses a **hash** of your manifest plus your IP address and the request time to the TSA — not your data.
 
 ---
 
@@ -787,7 +871,6 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 
 ## Planned
 
-- RFC 3161 trusted timestamping (cryptographic proof of time from a timestamp authority)
 - Manifest chaining (each manifest references the previous one, making history tamper-evident)
 - `--json` output mode (structured JSON on stdout for piping and scripting)
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)

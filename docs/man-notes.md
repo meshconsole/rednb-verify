@@ -8,9 +8,9 @@
 
 ## Version context
 
-- Current stable: **0.10.0** (main branch)
+- Current stable: **0.11.0** (main branch)
 - Manifest schema: **v3** (v2 added RFC 6962 Merkle hardening + symlink table; v3 adds the move-invariant content root)
-- See "Feature 5: verify verdict, content root, --json (v0.10.0)" below for the latest behavior
+- See "Feature 6: RFC 3161 trusted timestamping (v0.11.0)" below for the latest behavior
 
 ---
 
@@ -674,3 +674,55 @@ The **manifest's own self-declaration** drives whether a signature is required:
   schema was never committed (and `--validate` couldn't find it on a clean
   clone). Patterns are now anchored to the repo root and the manifest glob
   corrected to the real `hashes-*` artifact name.
+
+---
+
+## Feature 6: RFC 3161 trusted timestamping — ✅ IMPLEMENTED (v0.11.0)
+
+### Network policy (the load-bearing rule)
+- The tool is offline by default. `--tsa` is the ONLY code path that touches
+  the network, ever. It announces itself (`[INFO] Requesting timestamp from
+  <url>`), makes a single POST (`Content-Type: application/timestamp-query`)
+  with a 30 s timeout and no retries. Token verification is fully local
+  (`openssl ts -verify -CAfile`).
+- `--offline` refuses `--tsa` (exit 2) and otherwise asserts the default.
+- `--tsa NAME|URL` — registry name (TSA_SERVERS: digicert/sectigo/globalsign/
+  certum/apple/freetsa) or verbatim http(s) URL. No silent default; a bare
+  `--tsa` is an argparse error. `--tsa-list` prints the registry and exits.
+- `--tsa` is create-only; using it with `--verify` exits 2 with guidance
+  (`--tsa-cert` / `--ignore-tsa` are the verify-side flags).
+
+### Modes
+- Default: detached sidecar `hashes-....tsr` covering the WRITTEN manifest
+  bytes (timestamped after signing, so it also covers `signed_by`). Same
+  sidecar pattern as `.asc`/`.sshsig`.
+- `--tsa-embed` (1 request): embed one stamp over the placement root as
+  `tsa_stamp` — merkle_root in single-hash mode, the concat root in multi.
+- `--tsa-embed-separate` (2 requests): `tsa_merkle`/`tsa_concat` (placement)
+  + `tsa_content` (content root; multi-hash covers the alphabetical
+  `algo:root,...` join of content_roots).
+- Embedded stamps cover ROOT VALUES (utf-8 hex string as the timestamped
+  data), never the manifest bytes — self-reference would invalidate the token.
+  Embedding happens BEFORE write/sign so signatures cover the stamp fields.
+  Multi-hash placement auto-computes and STORES merkle_root_concat (sha256
+  combiner) when absent, so verify can recheck the same value.
+- Entry shape: `{"tsa": url, "time": str, "token_b64": base64(.tsr bytes)}`;
+  schema-validated via `_TSA_ENTRY_SCHEMA` (tsa + token_b64 required).
+- Text manifests store each stamp as an inline-JSON header line
+  (`tsa_stamp: {...}`); `_parse_text_manifest` json.loads it back.
+
+### Verify semantics
+- Detached `.tsr` and embedded stamps are checked when present:
+  - no openssl → `[WARN] ... openssl is unavailable` (skip, exit unaffected)
+  - no `--tsa-cert` → `[WARN] ... not cryptographically verified` (skip)
+  - with `--tsa-cert`: `[OK] TSA timestamp verified: ...` or
+    `[FAIL] TSA timestamp failed: ...` → contributes to hard_fail → exit 1.
+- Embedded checks use the manifest's STORED roots (the token authenticates the
+  manifest's claim; integrity checks separately tie disk state to manifest).
+- `--ignore-tsa` skips everything with `[WARN] Flag --ignore-tsa in use`.
+
+### Failure at create
+- Embed mode: network/query failure aborts BEFORE writing (exit 1, nothing
+  half-stamped on disk).
+- Detached mode: manifest is already written+signed; failure keeps it and
+  exits 1 with an explicit "written without a timestamp" error.
