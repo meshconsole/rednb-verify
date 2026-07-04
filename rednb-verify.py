@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.10.0
+Version: 0.11.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -34,6 +34,15 @@ Signing:
 "--trust high|low"            : Signing trust level (default: low)
 "--no-sign"                   : Skip all signing
 "--resign MANIFEST"           : Re-sign an existing manifest (requires --gpg and/or --ssh)
+
+Timestamping (RFC 3161 — strictly opt-in; --tsa is the tool's ONLY network operation):
+"--tsa NAME|URL"              : Request a trusted timestamp at create (detached hashes-....tsr by default)
+"--tsa-embed"                 : With --tsa: embed ONE stamp over the placement root as tsa_stamp (1 request)
+"--tsa-embed-separate"        : With --tsa: embed placement + content stamps separately (2 requests)
+"--tsa-cert CAFILE"           : TSA CA certificate to verify tokens during --verify (local check)
+"--ignore-tsa"                : During --verify, skip all timestamp-token checks
+"--tsa-list"                  : Print the built-in TSA registry and exit (no network)
+"--offline"                   : Assert no network: refuses --tsa (offline is already the default)
 
 Verification:
 "--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
@@ -72,6 +81,7 @@ Exit codes:
 """
 
 import argparse
+import base64
 import fnmatch
 import hashlib
 import json
@@ -88,7 +98,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -976,6 +986,209 @@ def show_randomart_gpg(fpr: str) -> None:
     print(fingerprint_randomart(raw, "GPG"))
 
 
+# ---------- TSA (RFC 3161 trusted timestamping) ----------
+# Strictly OPT-IN: nothing here runs unless --tsa is passed on the command
+# line. The single network operation is the timestamp REQUEST at create time;
+# verification of a token is fully local (openssl ts -verify against a CA).
+
+TSA_SERVERS: Dict[str, str] = {
+    "digicert":   "http://timestamp.digicert.com",
+    "sectigo":    "http://timestamp.sectigo.com",
+    "globalsign": "http://timestamp.globalsign.com/tsa/r6advanced1",
+    "certum":     "http://time.certum.pl",
+    "apple":      "http://timestamp.apple.com/ts01",
+    "freetsa":    "https://freetsa.org/tsr",
+}
+
+# Manifest fields that may carry an embedded timestamp entry.
+TSA_FIELDS = ("tsa_stamp", "tsa_merkle", "tsa_concat", "tsa_content")
+
+
+def openssl_available() -> bool:
+    try:
+        subprocess.run(["openssl", "version"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_tsa(arg: str) -> str:
+    """Map a registry short name to its URL, or accept an http(s) URL verbatim.
+
+    There is deliberately no fallback default: contacting a third party must
+    always be an explicit user choice.
+    """
+    if arg.lower() in TSA_SERVERS:
+        return TSA_SERVERS[arg.lower()]
+    if arg.startswith(("http://", "https://")):
+        return arg
+    _err(f"Unknown TSA {arg!r}. Use --tsa-list for known names, "
+         "or pass a full http(s):// URL.")
+    sys.exit(2)
+
+
+def _tsa_query_bytes(data_path: Path) -> Optional[bytes]:
+    """Build a DER timestamp query (RFC 3161 TimeStampReq) over a file's bytes."""
+    result = subprocess.run(
+        ["openssl", "ts", "-query", "-data", str(data_path), "-sha256", "-cert"],
+        capture_output=True,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _tsa_http_post(url: str, tsq: bytes, timeout: int = 30) -> Optional[bytes]:
+    """POST the query to the TSA. Single request, fixed timeout, no retries —
+    keeping the network footprint predictable and minimal."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        url, data=tsq, method="POST",
+        headers={"Content-Type": "application/timestamp-query"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        _err(f"TSA request failed: {exc}")
+        return None
+
+
+def tsa_timestamp_file(data_path: Path, url: str) -> Optional[bytes]:
+    """Request an RFC 3161 token over a file. Returns raw .tsr bytes or None."""
+    tsq = _tsa_query_bytes(data_path)
+    if tsq is None:
+        _err("openssl could not build the timestamp query")
+        return None
+    _info(f"Requesting timestamp from {url}")
+    return _tsa_http_post(url, tsq)
+
+
+def tsa_timestamp_data(data: bytes, url: str) -> Optional[bytes]:
+    """Request a token over in-memory bytes (used for embedded root stamps)."""
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tf.write(data)
+        tmp = Path(tf.name)
+    try:
+        return tsa_timestamp_file(tmp, url)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def tsa_token_time(tsr: bytes) -> str:
+    """Best-effort 'Time stamp:' extraction via openssl ts -reply -text."""
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tf.write(tsr)
+        tmp = Path(tf.name)
+    try:
+        result = subprocess.run(["openssl", "ts", "-reply", "-in", str(tmp), "-text"],
+                                capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Time stamp:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Path) -> bool:
+    """Verify a token against data, locally, using the TSA's CA certificate."""
+    with tempfile.NamedTemporaryFile(delete=False) as df:
+        df.write(data)
+        data_tmp = Path(df.name)
+    with tempfile.NamedTemporaryFile(delete=False) as rf:
+        rf.write(tsr)
+        tsr_tmp = Path(rf.name)
+    try:
+        result = subprocess.run(
+            ["openssl", "ts", "-verify", "-data", str(data_tmp),
+             "-in", str(tsr_tmp), "-CAfile", str(ca_file)],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    finally:
+        data_tmp.unlink(missing_ok=True)
+        tsr_tmp.unlink(missing_ok=True)
+
+
+def _tsa_entry(url: str, tsr: bytes) -> Dict[str, str]:
+    return {
+        "tsa": url,
+        "time": tsa_token_time(tsr),
+        "token_b64": base64.b64encode(tsr).decode("ascii"),
+    }
+
+
+def _tsa_placement(manifest: Dict, compute_if_missing: bool = False) -> tuple:
+    """(field_name, root_value) for the placement stamp.
+
+    Single-hash mode stamps merkle_root as 'tsa_merkle'; multi-hash mode
+    collapses the per-algo trees to the single concatenated root ('tsa_concat'),
+    computing and STORING merkle_root_concat when the manifest lacks one so
+    verify can recompute the same value.
+    """
+    multi = isinstance(manifest.get("hash_algorithm"), list)
+    if not multi:
+        return "tsa_merkle", manifest.get("merkle_root")
+    mrc = manifest.get("merkle_root_concat")
+    if not mrc and compute_if_missing:
+        files = {e["path"]: dict(e["hashes"]) for e in manifest["files"]}
+        root = _concat_merkle_root(files, manifest["hash_algorithm"], "sha256")
+        manifest["merkle_root_concat"] = {"sha256": root}
+        _info("Computed concat root for timestamp")
+        mrc = manifest["merkle_root_concat"]
+    return "tsa_concat", (next(iter(mrc.values())) if mrc else None)
+
+
+def _tsa_content_value(manifest: Dict) -> Optional[str]:
+    """The value the content stamp covers: content_root (single-hash), or the
+    alphabetical 'algo:root,algo:root' join of content_roots (multi-hash)."""
+    if manifest.get("content_root"):
+        return manifest["content_root"]
+    crs = manifest.get("content_roots") or {}
+    return ",".join(f"{a}:{crs[a]}" for a in sorted(crs)) or None
+
+
+def _tsa_stamped_value(manifest: Dict, field: str) -> Optional[str]:
+    """Recover the value an embedded stamp covers, from the manifest's own
+    stored roots (the token authenticates the manifest's claim; integrity
+    checks separately tie the disk state to the manifest)."""
+    if field == "tsa_content":
+        return _tsa_content_value(manifest)
+    if field == "tsa_concat" or (field == "tsa_stamp"
+                                 and isinstance(manifest.get("hash_algorithm"), list)):
+        mrc = manifest.get("merkle_root_concat") or {}
+        return next(iter(mrc.values()), None)
+    return manifest.get("merkle_root")
+
+
+def tsa_embed_into_manifest(manifest: Dict, url: str, separate: bool) -> bool:
+    """Request and embed timestamp stamp(s) over the manifest's root values.
+
+    Stamps cover ROOT values (stable hex strings), never the manifest itself —
+    embedding a token into the very bytes it covers would invalidate it.
+    Single mode: one request, field 'tsa_stamp'. Separate mode: one placement
+    stamp (tsa_merkle/tsa_concat) plus one content stamp (tsa_content), so a
+    third party can attest each dimension independently.
+    """
+    if separate:
+        field, value = _tsa_placement(manifest, compute_if_missing=True)
+        targets = [(field, value), ("tsa_content", _tsa_content_value(manifest))]
+    else:
+        _, value = _tsa_placement(manifest, compute_if_missing=True)
+        targets = [("tsa_stamp", value)]
+    if any(v is None for _, v in targets):
+        _err("Manifest lacks the root value(s) to timestamp")
+        return False
+    _info(f"Requesting {len(targets)} timestamp(s) from {url}")
+    for field, value in targets:
+        tsr = tsa_timestamp_data(value.encode("utf-8"), url)
+        if tsr is None:
+            return False
+        manifest[field] = _tsa_entry(url, tsr)
+    return True
+
+
 # ---------- Manifest ----------
 
 def collect_files(
@@ -1524,6 +1737,11 @@ def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
         if manifest.get("content_root"):
             lines.append(f"content_root: {manifest['content_root']}")
+    # Embedded TSA stamps: one inline-JSON header line per field, so the token
+    # round-trips exactly through the text format.
+    for _tf in TSA_FIELDS:
+        if manifest.get(_tf):
+            lines.append(f"{_tf}: {json.dumps(manifest[_tf], ensure_ascii=False)}")
     # Symlink table (schema v2): a numbered "path -> target" list, with the
     # recording policy noted on the header line so verify knows how to compare.
     # Written even when empty so the manifest still commits to "zero symlinks".
@@ -1666,6 +1884,13 @@ def _parse_text_manifest(text: str) -> Dict:
             manifest["schema_version"] = int(manifest["schema_version"])
         except (TypeError, ValueError):
             pass
+    # Embedded TSA stamps were written as inline JSON — rebuild the dicts.
+    for _tf in TSA_FIELDS:
+        if isinstance(manifest.get(_tf), str):
+            try:
+                manifest[_tf] = json.loads(manifest[_tf])
+            except json.JSONDecodeError:
+                pass
     return manifest
 
 
@@ -1788,6 +2013,17 @@ def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
 # self-contained — it works from the single downloaded rednb-verify.py with no
 # sibling schema/ folder. The schema/*.json files are exports generated from
 # these dicts (see --dump-schema); a test asserts they stay in sync.
+_TSA_ENTRY_SCHEMA: Dict = {
+    "type": "object",
+    "required": ["tsa", "token_b64"],
+    "properties": {
+        "tsa": {"type": "string", "description": "TSA URL the token came from"},
+        "time": {"type": "string", "description": "Asserted timestamp (informational)"},
+        "token_b64": {"type": "string", "description": "Base64 RFC 3161 token (.tsr bytes)"},
+    },
+    "additionalProperties": False,
+}
+
 MANIFEST_SCHEMA: Dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://github.com/meshconsole/rednb-verify/schema/manifest-v3.schema.json",
@@ -1877,6 +2113,10 @@ MANIFEST_SCHEMA: Dict = {
                 "oneOf": [{"required": ["target"]}, {"required": ["target_hash"]}],
             },
         },
+        "tsa_stamp": _TSA_ENTRY_SCHEMA,
+        "tsa_merkle": _TSA_ENTRY_SCHEMA,
+        "tsa_concat": _TSA_ENTRY_SCHEMA,
+        "tsa_content": _TSA_ENTRY_SCHEMA,
     },
 }
 
@@ -2279,6 +2519,32 @@ supported hash algorithms:
                         help="Skip all signing")
     parser.add_argument("--resign", type=Path, default=None, metavar="MANIFEST",
                         help="Re-sign an existing manifest (requires --gpg and/or --ssh)")
+    # --- Timestamping (RFC 3161) — the ONLY flags that can touch the network ---
+    parser.add_argument("--tsa", default=None, metavar="NAME|URL",
+                        help="Request an RFC 3161 timestamp at create time from a known "
+                             "TSA name (see --tsa-list) or an http(s) URL. Saves a detached "
+                             "token next to the manifest (hashes-....tsr) unless an embed "
+                             "flag is given. This is the tool's only network operation.")
+    parser.add_argument("--tsa-embed", action="store_true", dest="tsa_embed",
+                        help="With --tsa: embed ONE stamp over the placement root "
+                             "(merkle_root, or the concat root in multi-hash mode) as "
+                             "'tsa_stamp' instead of writing a detached token (1 request)")
+    parser.add_argument("--tsa-embed-separate", action="store_true", dest="tsa_embed_separate",
+                        help="With --tsa: embed SEPARATE stamps for the placement root "
+                             "(tsa_merkle/tsa_concat) and the content root (tsa_content) "
+                             "so each can be attested independently (2 requests)")
+    parser.add_argument("--tsa-cert", type=Path, default=None, dest="tsa_cert", metavar="CAFILE",
+                        help="TSA CA certificate used to verify timestamp tokens during "
+                             "--verify (verification is fully local)")
+    parser.add_argument("--ignore-tsa", action="store_true", dest="ignore_tsa",
+                        help="During --verify, skip all timestamp-token checks "
+                             "(parallel to --ignore-sig)")
+    parser.add_argument("--tsa-list", action="store_true", dest="tsa_list",
+                        help="Print the built-in TSA registry (names and URLs) and exit — "
+                             "no network")
+    parser.add_argument("--offline", action="store_true",
+                        help="Assert that no network is used: refuses --tsa. The tool is "
+                             "offline by default; this makes it explicit")
     parser.add_argument("--warn-age", type=int, default=None, dest="warn_age", metavar="DAYS",
                         help="Warn during --verify if manifest is older than N days")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2373,6 +2639,36 @@ supported hash algorithms:
             sys.exit(2)
         print(json.dumps(EMBEDDED_SCHEMAS[args.dump_schema], indent=2, ensure_ascii=False))
         return
+
+    # ---- --tsa-list: print the TSA registry and exit (no network) ----
+    if args.tsa_list:
+        print("Known timestamp authorities (use with --tsa <name>, or pass any URL):")
+        for name in sorted(TSA_SERVERS):
+            print(f"  {name:<12} {TSA_SERVERS[name]}")
+        return
+
+    # ---- Timestamping flag validation (network is strictly opt-in) ----
+    if args.offline and args.tsa:
+        _err("--offline forbids network flags: remove --tsa (the tool is "
+             "offline by default; --offline makes that explicit).")
+        sys.exit(2)
+    if (args.tsa_embed or args.tsa_embed_separate) and not args.tsa:
+        _err("--tsa-embed/--tsa-embed-separate require --tsa <name|url>.")
+        sys.exit(2)
+    if args.tsa_embed and args.tsa_embed_separate:
+        _err("--tsa-embed and --tsa-embed-separate are mutually exclusive.")
+        sys.exit(2)
+    tsa_url: Optional[str] = None
+    if args.tsa:
+        if args.verify is not None:
+            _err("--tsa is a create-time flag; to check a token during --verify, "
+                 "pass --tsa-cert CAFILE (or --ignore-tsa to skip).")
+            sys.exit(2)
+        if not openssl_available():
+            _err("--tsa needs the 'openssl' command-line tool to build the "
+                 "timestamp query.")
+            sys.exit(2)
+        tsa_url = resolve_tsa(args.tsa)
 
     # ---- Config management (Feature 1): mutate config, optionally write & exit ----
     _set_tokens = (args.set_cf or []) + (args.set_cf_run or [])
@@ -2802,6 +3098,44 @@ supported hash algorithms:
                 for w in result.warnings:
                     _warn(w)
 
+        # ---- TSA timestamp checks (fully local: openssl ts -verify) ----
+        tsa_failed = False
+        _tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
+        _embedded = [f for f in TSA_FIELDS if isinstance(manifest.get(f), dict)]
+        _tsa_present = _tsr_path.exists() or bool(_embedded)
+        if args.ignore_tsa:
+            if _tsa_present:
+                _warn("Flag --ignore-tsa in use")
+        elif _tsa_present:
+            if not openssl_available():
+                _warn("TSA timestamp present but openssl is unavailable — "
+                      "timestamp not verified")
+            elif args.tsa_cert is None:
+                _warn("TSA timestamp present but no --tsa-cert given — "
+                      "timestamp not cryptographically verified")
+            else:
+                if _tsr_path.exists():
+                    if tsa_verify_data(manifest_path.read_bytes(),
+                                       _tsr_path.read_bytes(), args.tsa_cert):
+                        _ok(f"TSA timestamp verified: {_tsr_path.name}")
+                    else:
+                        _qprint(f"{_tag('FAIL')} TSA timestamp failed: {_tsr_path.name}")
+                        tsa_failed = True
+                for _field in _embedded:
+                    _value = _tsa_stamped_value(manifest, _field)
+                    try:
+                        _token = base64.b64decode(manifest[_field].get("token_b64", ""))
+                    except (ValueError, TypeError):
+                        _token = b""
+                    if _value and _token and tsa_verify_data(
+                            _value.encode("utf-8"), _token, args.tsa_cert):
+                        _t = manifest[_field].get("time", "")
+                        _ok(f"TSA timestamp verified: {_field}"
+                            + (f" ({_t})" if _t else ""))
+                    else:
+                        _qprint(f"{_tag('FAIL')} TSA timestamp failed: {_field}")
+                        tsa_failed = True
+
         # ------------------------- Terminal verdict ------------------------- #
         if args.ignore_symlinks:
             _warn("Flag --ignore-symlinks in use")
@@ -2829,7 +3163,8 @@ supported hash algorithms:
         if trust_failed:
             _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
 
-        hard_fail = (integrity_failed or symlink_failed or sig_invalid or trust_failed)
+        hard_fail = (integrity_failed or symlink_failed or sig_invalid
+                     or trust_failed or tsa_failed)
         # A manifest that expects a signature but produced none: hashes are
         # intact, but authenticity could not be established.
         sig_issue = sig_required and not sig_verified
@@ -2891,6 +3226,14 @@ supported hash algorithms:
     # from elsewhere, and they are a repointing attack surface.
     for _esc in escaping_symlinks(args.notebook_dir, exclude=exclude):
         _warn(f"Symlink points outside the notebook: {_esc}")
+
+    # ---- Embedded TSA stamps (before write, so signatures cover them). The
+    # stamps cover root VALUES, so adding them cannot invalidate themselves. ----
+    if tsa_url and (args.tsa_embed or args.tsa_embed_separate):
+        if not tsa_embed_into_manifest(manifest, tsa_url, args.tsa_embed_separate):
+            _err("Timestamping failed — manifest not written.")
+            sys.exit(1)
+
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
     manifest_name = f"hashes-{manifest['created']}{ext}"
@@ -2967,6 +3310,20 @@ supported hash algorithms:
             _ok(f"SSH signature created: {ssh_sig_out.name}")
         else:
             _warn("SSH signing failed.")
+
+    # ---- Detached TSA token (default --tsa mode): timestamp the WRITTEN
+    # manifest bytes, after signing, and save the token as a .tsr sidecar
+    # (same pattern as the .asc / .sshsig signature files). ----
+    if tsa_url and not (args.tsa_embed or args.tsa_embed_separate):
+        tsr = tsa_timestamp_file(manifest_path, tsa_url)
+        if tsr is None:
+            _err("TSA request failed — manifest was written without a timestamp.")
+            sys.exit(1)
+        tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
+        tsr_path.write_bytes(tsr)
+        _time = tsa_token_time(tsr)
+        _ok(f"Timestamp token saved: {tsr_path.name}"
+            + (f" ({_time})" if _time else ""))
 
     # --json: echo the finished manifest to stdout for piping (logs are on stderr).
     if args.json:
