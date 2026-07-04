@@ -9,44 +9,52 @@ Creates and verifies cryptographic manifests for notebook directories.
 CLI/Commands:
 rednb-verify.py [options] [notebook_directory]
 
-Normal operation:
+Manifest creation:
 "-m", "--month-only"          : Hashes only month files
 "-D", "--per-day"             : Hash individual day entries within month files (requires PyYAML)
 "-j", "--jobs N"              : Parallel hashing workers (0 = auto, default: 1)
-"-o", "--output"             : Output directory for manifest (default: journal parent)
-"-V", "--version"            : Print version and exit
-"--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
-"--validate [FILE|DIR]"       : Validate a manifest/report against the embedded JSON schema and exit (needs optional jsonschema)
-"--dump-schema manifest|report" : Print the embedded JSON schema to stdout and exit
+"-o", "--output"             : Output dir for manifest (create) or report (verify; requires --report)
 "--manifest-type txt|json"    : Manifest creation format (default: txt)
-"--report txt|json"           : Write a verify report file (txt|json). Omit = verdict only, no file. -o sets its location and requires this flag
-"--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
 "--no-bullets"                : Text manifest: don't prefix per-file hash lines with '- '
 "--hash ALGO[:LEN][,ALGO...]" : Hash algorithm(s); comma-separate for multi-hashing
 "--hash-list"                 : Print available hash algorithms and exit
 "--hash-merkle ALGO[,...]"    : Merkle algo (single: combiner; multi: select trees)
 "--hash-merkle-concatenate [ALGO]" : One tree over per-file concatenated hashes
-"--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
-"--gpg-k FILE"                : GPG armored key file; implies --gpg
-"--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
-"--ssh-verify"                : Force SSH signature check during --verify
-"--ignore-sig"                : Verify integrity only; skip all signature checks
-"--ignore-symlinks"           : During --verify, skip the symlink-table comparison and symlink warnings
-"--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
-"--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
-"--trust high|low"            : Signing trust level (default: low)
-"--no-sign"                   : Skip all signing
-"--resign MANIFEST"           : Re-sign an existing manifest (requires --gpg and/or --ssh)
-"--warn-age DAYS"             : Warn during verify if manifest is older than N days
-"--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
-"-v", "--verbose"            : Print per-file hash timing and detailed progress
-"--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
-"-y", "--yes"                : Assume yes to confirmation prompts
 "--exclude PATTERN"           : Exclude files matching glob (repeatable)
 "--exclude-from FILE"         : File of glob patterns to exclude (one literal pattern per line)
 "--symlink-targets MODE"      : Record symlink targets: none|full|hash[:ALGO[:LEN]] (default: hash = sha256 of target)
 "--no-symlink-table"          : Omit the symlink table (alias for --symlink-targets none)
 "--privacy"                   : Minimise manifest disclosure (currently implies --no-symlink-table)
+
+Signing:
+"--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
+"--gpg-k FILE"                : GPG armored key file; implies --gpg
+"--ssh [FILE_OR_DIR]"         : Sign with SSH key; optional .pub file or directory
+"--ssh-fido [NAME]"           : Prefer FIDO2/hardware-backed SSH keys; optional name filter
+"--trust high|low"            : Signing trust level (default: low)
+"--no-sign"                   : Skip all signing
+"--resign MANIFEST"           : Re-sign an existing manifest (requires --gpg and/or --ssh)
+
+Verification:
+"--verify [FILE|DIR]"         : Verify mode; optional manifest path/dir (auto-finds latest if omitted)
+"--report txt|json"           : Write a verify report file (txt|json). Omit = verdict only, no file. -o sets its location and requires this flag
+"--ssh-verify"                : Force SSH signature check during --verify
+"--ignore-sig"                : Verify integrity only; skip all signature checks
+"--ignore-symlinks"           : During --verify, skip the symlink-table comparison and symlink warnings
+"--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
+"--warn-age DAYS"             : Warn during verify if manifest is older than N days
+"--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
+
+Validation:
+"--validate [FILE|DIR]"       : Validate a manifest/report against the embedded JSON schema and exit (needs optional jsonschema)
+"--dump-schema manifest|report" : Print the embedded JSON schema to stdout and exit
+
+General:
+"-V", "--version"            : Print version and exit
+"-v", "--verbose"            : Print per-file hash timing and detailed progress
+"--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
+"-y", "--yes"                : Assume yes to confirmation prompts
+"--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
 
 Config management:
 "--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
