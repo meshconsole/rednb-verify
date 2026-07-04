@@ -847,16 +847,16 @@ Every field is optional; an absent field simply falls back to the tool's default
 
 | Field | Type | CLI equivalent | Effect |
 |---|---|---|---|
-| `hash` | string | `--hash` | Default file-hash algorithm spec; comma-separate for multi-hashing (`"sha256,blake2b"`) |
-| `hash_merkle` | string \| `null` | `--hash-merkle` | Merkle combiner (single mode) / tree selection (multi mode); `null` = same as `hash` |
+| `hash` | string | `--hash ALGO` | Default file-hash algorithm spec; comma-separate for multi-hashing (`"sha256,blake2b"`) |
+| `hash_merkle` | string \| `null` | `--hash-merkle ALGO` | Merkle combiner (single mode) / tree selection (multi mode); `null` = same as `hash` |
 | `quiet` | bool | `--quiet` | Suppress non-error output on every run (implies `no_sign` unless a signing key is configured) |
 | `no_sign` | bool | `--no-sign` | Never prompt to sign |
 | `gpg_key` | string | `--gpg FPR` | GPG fingerprint to sign with (skips the key menu) |
 | `ssh_key` | string (path) | `--ssh FILE` | SSH key to sign with; `~` is expanded |
-| `exclude` | array of strings | `--exclude` | Glob patterns excluded from every run |
-| `manifest_age_warn_days` | integer | `--warn-age` | Warn during `--verify` when the manifest is older than N days |
-| `jobs` | integer | `--jobs` | Parallel hashing workers (`0` = auto) |
-| `trust_level` | `"high"` \| `"low"` | `--trust` | Default trust level; written by `--set-cf trust-level:high` |
+| `exclude` | array of strings | `--exclude PATTERN` | Glob patterns excluded from every run |
+| `manifest_age_warn_days` | integer | `--warn-age DAYS` | Warn during `--verify` when the manifest is older than N days |
+| `jobs` | integer | `--jobs N` | Parallel hashing workers (`0` = auto) |
+| `trust_level` | `"high"` \| `"low"` | `--trust high\|low` | Default trust level; written by `--set-cf trust-level:high` |
 | `dir` | string (path) | *(positional)* | Default notebook directory when none is given; written by `--set-cf dir:...` |
 | `trust.gpg` | array of strings | — | Pinned GPG fingerprints for `--trust high`; written by `--add-trust trust-gpg:...` |
 | `trust.ssh` | array of strings | — | Pinned SSH key fingerprints (`SHA256:...`) for `--trust high`; written by `--add-trust trust-ssh:...` |
