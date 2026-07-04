@@ -96,7 +96,7 @@ rednb-verify.py [options] [notebook_dir]
 
 ### Manifest creation
 
-Run the tool against a directory to hash its contents and write a manifest. Signing happens at creation time (or later with `--resign`).
+Run the tool against a directory to hash its contents and write a manifest.
 
 | Flag | Description |
 |---|---|
@@ -115,6 +115,14 @@ Run the tool against a directory to hash its contents and write a manifest. Sign
 | `--exclude-from FILE` | File of glob patterns to exclude — one literal pattern per line. No comment syntax: a journal filename may legitimately start with `#` |
 | `--symlink-targets MODE` | How to record symlink targets: `none` \| `full` \| `hash[:ALGO[:LEN]]` (default: `hash` = sha256 of the target). See [Symlinks](#symlinks) |
 | `--no-symlink-table` | Omit the symlink table (alias for `--symlink-targets none`) |
+| `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
+
+### Signing
+
+Signing happens at creation time (or later with `--resign`). See [Signing](#signing-1) and [Trust & Signing](#trust--signing).
+
+| Flag | Description |
+|---|---|
 | `--gpg [FPR]` | Sign with GPG; optionally specify a key fingerprint to skip the selection menu |
 | `--gpg-k FILE` | GPG armored key export file to sign with; implies `--gpg` |
 | `--ssh [FILE_OR_DIR]` | Sign with SSH key; optionally specify a `.pub` file or directory to scan (default: `~/.ssh`) |
@@ -249,7 +257,6 @@ python rednb-verify.py ~/journal --verify --no-sign --json | jq '.modified'
 | `-v`, `--verbose` | Print per-file hash timing and detailed progress |
 | `--quiet` | Suppress non-error output; implies `--no-sign` unless a signing flag is given |
 | `-y`, `--yes` | Assume yes to confirmation prompts (automation-friendly) |
-| `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
 | `--json` | Emit the result to **stdout** as one JSON document for piping (manifest on create, report on verify); all logs go to stderr, so `… --json \| jq` works |
 
 ---
