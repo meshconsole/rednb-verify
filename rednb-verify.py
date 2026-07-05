@@ -64,6 +64,7 @@ General:
 "--quiet"                     : Suppress non-error output; implies --no-sign unless signing is explicit
 "-y", "--yes"                : Assume yes to confirmation prompts
 "--json"                      : Emit result as one JSON document on stdout (logs to stderr) for piping
+"--install-opt"               : Let the tool 'pip install' optional packages a command needs (the only path that runs pip)
 
 Config management:
 "--set-cf FIELD:VALUE"        : Set a config field and exit (trust-gpg, trust-ssh, trust-level, dir)
@@ -86,6 +87,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1054,61 +1056,130 @@ def _tsa_http_post(url: str, tsq: bytes, timeout: int = 30) -> Optional[bytes]:
         return None
 
 
+def _tsa_lib_available() -> bool:
+    return _module_available("rfc3161ng")
+
+
+def tsa_backend_available() -> bool:
+    """A timestamp can be produced/checked if openssl OR the library is present."""
+    return openssl_available() or _tsa_lib_available()
+
+
+def _lib_request(data: bytes, url: str) -> Optional[bytes]:
+    """Request a token via the rfc3161ng library (the openssl-free path, for
+    Windows). EXPERIMENTAL — validate on your platform before relying on it."""
+    try:
+        import rfc3161ng
+        from pyasn1.codec.der import encoder
+        stamper = rfc3161ng.RemoteTimestamper(
+            url, hashname="sha256", include_tsa_certificate=True, timeout=30)
+        tsr = stamper(data=data, return_tsr=True)
+        return encoder.encode(tsr)
+    except Exception as exc:  # noqa: BLE001 — surface any lib/network error clearly
+        _err(f"TSA request (rfc3161ng backend) failed: {exc}")
+        return None
+
+
+def _lib_verify(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
+    """Verify via rfc3161ng. True/False = verified/failed; None = inconclusive
+    (API/format issue — use openssl or verify externally). EXPERIMENTAL."""
+    try:
+        import rfc3161ng
+        cert = ca_file.read_bytes()
+        tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Library-backend timestamp verify inconclusive: {exc}")
+        return None
+    try:
+        rfc3161ng.check_timestamp(tst, certificate=cert, data=data, hashname="sha256")
+        return True
+    except getattr(rfc3161ng, "TimestampingError", Exception):
+        return False
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Library-backend timestamp verify inconclusive: {exc}")
+        return None
+
+
+def _tsa_request_bytes(data: bytes, url: str) -> Optional[bytes]:
+    """Backend-agnostic timestamp request. Prefers openssl (broadly tested);
+    falls back to the rfc3161ng library when openssl isn't installed."""
+    _info(f"Requesting timestamp from {url}")
+    if openssl_available():
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(data)
+            tmp = Path(tf.name)
+        try:
+            tsq = _tsa_query_bytes(tmp)
+            if tsq is None:
+                _err("openssl could not build the timestamp query")
+                return None
+            return _tsa_http_post(url, tsq)
+        finally:
+            tmp.unlink(missing_ok=True)
+    if _tsa_lib_available():
+        return _lib_request(data, url)
+    _err("No TSA backend available (need openssl on PATH, or 'pip install rfc3161ng').")
+    return None
+
+
 def tsa_timestamp_file(data_path: Path, url: str) -> Optional[bytes]:
     """Request an RFC 3161 token over a file. Returns raw .tsr bytes or None."""
-    tsq = _tsa_query_bytes(data_path)
-    if tsq is None:
-        _err("openssl could not build the timestamp query")
-        return None
-    _info(f"Requesting timestamp from {url}")
-    return _tsa_http_post(url, tsq)
+    return _tsa_request_bytes(data_path.read_bytes(), url)
 
 
 def tsa_timestamp_data(data: bytes, url: str) -> Optional[bytes]:
     """Request a token over in-memory bytes (used for embedded root stamps)."""
-    with tempfile.NamedTemporaryFile(delete=False) as tf:
-        tf.write(data)
-        tmp = Path(tf.name)
-    try:
-        return tsa_timestamp_file(tmp, url)
-    finally:
-        tmp.unlink(missing_ok=True)
+    return _tsa_request_bytes(data, url)
 
 
 def tsa_token_time(tsr: bytes) -> str:
-    """Best-effort 'Time stamp:' extraction via openssl ts -reply -text."""
-    with tempfile.NamedTemporaryFile(delete=False) as tf:
-        tf.write(tsr)
-        tmp = Path(tf.name)
-    try:
-        result = subprocess.run(["openssl", "ts", "-reply", "-in", str(tmp), "-text"],
-                                capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if line.strip().startswith("Time stamp:"):
-                return line.split(":", 1)[1].strip()
-        return ""
-    finally:
-        tmp.unlink(missing_ok=True)
+    """Best-effort human timestamp from a token (openssl, else the library)."""
+    if openssl_available():
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(tsr)
+            tmp = Path(tf.name)
+        try:
+            result = subprocess.run(["openssl", "ts", "-reply", "-in", str(tmp), "-text"],
+                                    capture_output=True, text=True)
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Time stamp:"):
+                    return line.split(":", 1)[1].strip()
+            return ""
+        finally:
+            tmp.unlink(missing_ok=True)
+    if _tsa_lib_available():
+        try:
+            import rfc3161ng
+            tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+            return str(rfc3161ng.get_timestamp(tst))
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
 
 
-def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Path) -> bool:
-    """Verify a token against data, locally, using the TSA's CA certificate."""
-    with tempfile.NamedTemporaryFile(delete=False) as df:
-        df.write(data)
-        data_tmp = Path(df.name)
-    with tempfile.NamedTemporaryFile(delete=False) as rf:
-        rf.write(tsr)
-        tsr_tmp = Path(rf.name)
-    try:
-        result = subprocess.run(
-            ["openssl", "ts", "-verify", "-data", str(data_tmp),
-             "-in", str(tsr_tmp), "-CAfile", str(ca_file)],
-            capture_output=True,
-        )
-        return result.returncode == 0
-    finally:
-        data_tmp.unlink(missing_ok=True)
-        tsr_tmp.unlink(missing_ok=True)
+def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
+    """Verify a token against data, locally. True/False = verified/failed;
+    None = no usable backend or inconclusive. Prefers openssl -CAfile."""
+    if openssl_available():
+        with tempfile.NamedTemporaryFile(delete=False) as df:
+            df.write(data)
+            data_tmp = Path(df.name)
+        with tempfile.NamedTemporaryFile(delete=False) as rf:
+            rf.write(tsr)
+            tsr_tmp = Path(rf.name)
+        try:
+            result = subprocess.run(
+                ["openssl", "ts", "-verify", "-data", str(data_tmp),
+                 "-in", str(tsr_tmp), "-CAfile", str(ca_file)],
+                capture_output=True,
+            )
+            return result.returncode == 0
+        finally:
+            data_tmp.unlink(missing_ok=True)
+            tsr_tmp.unlink(missing_ok=True)
+    if _tsa_lib_available():
+        return _lib_verify(data, tsr, ca_file)
+    return None
 
 
 def _tsa_entry(url: str, tsr: bytes) -> Dict[str, str]:
@@ -1181,12 +1252,154 @@ def tsa_embed_into_manifest(manifest: Dict, url: str, separate: bool) -> bool:
         _err("Manifest lacks the root value(s) to timestamp")
         return False
     _info(f"Requesting {len(targets)} timestamp(s) from {url}")
-    for field, value in targets:
+    for i, (field, value) in enumerate(targets):
         tsr = tsa_timestamp_data(value.encode("utf-8"), url)
         if tsr is None:
+            # Preserve the hashing work: mark this stamp and any remaining ones
+            # 'failed' so the manifest still records the intent; --resign can
+            # add a real token later. Already-succeeded stamps are kept.
+            for f, _ in targets[i:]:
+                manifest[f] = "failed"
             return False
         manifest[field] = _tsa_entry(url, tsr)
     return True
+
+
+# ---------- Optional dependencies (preflight + --install-opt) ----------
+
+# pip package name -> import name, for availability checks and installation.
+_OPTIONAL_PIP: Dict[str, str] = {
+    "pyyaml": "yaml",
+    "jsonschema": "jsonschema",
+    "rfc3161ng": "rfc3161ng",
+    "blake3": "blake3",
+    "xxhash": "xxhash",
+}
+
+
+def _module_available(import_name: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(import_name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+@dataclass
+class _Capability:
+    """A requested feature's dependency. Satisfied if it is available now.
+    pip_pkgs can install it; ext_tools are system commands we cannot install."""
+    name: str
+    ok: bool
+    pip_pkgs: tuple = ()
+    ext_tools: tuple = ()
+
+
+def _required_capabilities(args) -> List[_Capability]:
+    """Only the dependencies the *requested* operation actually needs."""
+    caps: List[_Capability] = []
+    if getattr(args, "per_day", False):
+        caps.append(_Capability("--per-day", _module_available("yaml"),
+                                pip_pkgs=("pyyaml",)))
+    if getattr(args, "validate", None) is not None:
+        caps.append(_Capability("--validate", _module_available("jsonschema"),
+                                pip_pkgs=("jsonschema",)))
+    if getattr(args, "tsa", None):
+        caps.append(_Capability(
+            "--tsa timestamping",
+            openssl_available() or _module_available("rfc3161ng"),
+            pip_pkgs=("rfc3161ng",), ext_tools=("openssl",)))
+    if getattr(args, "gpg", None) is not None or getattr(args, "gpg_k", None) is not None:
+        caps.append(_Capability("GPG signing", gpg_available(), ext_tools=("gpg",)))
+    if getattr(args, "ssh", None) is not None or getattr(args, "ssh_fido", None) is not None:
+        caps.append(_Capability("SSH signing", ssh_keygen_available(),
+                                ext_tools=("ssh-keygen",)))
+    return caps
+
+
+def _pip_install(pkgs: List[str]) -> bool:
+    cmd = [sys.executable, "-m", "pip", "install", *pkgs]
+    _info("Running: " + " ".join(cmd))
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except OSError as exc:
+        _err(f"Could not run pip: {exc}")
+        return False
+
+
+def install_all_optional() -> None:
+    """`--install-opt` alone: install every missing optional package and exit."""
+    missing = [p for p, imp in _OPTIONAL_PIP.items() if not _module_available(imp)]
+    if not missing:
+        _ok("All optional packages are already installed.")
+        return
+    _info("Missing optional packages: " + ", ".join(missing))
+    if _pip_install(missing):
+        _ok("Optional packages installed. Re-run your command to use them.")
+    else:
+        _err("Some packages failed to install; see pip output above.")
+        sys.exit(1)
+
+
+def preflight_dependencies(args) -> None:
+    """Verify the requested operation's dependencies BEFORE doing any work.
+
+    Missing pip libraries → print the exact `pip install` line and ask the user
+    to re-run with --install-opt (or, when --install-opt is given, install them
+    and stop so they re-run). Missing external tools (gpg/ssh-keygen; openssl
+    only when the pip alternative is also absent) can't be installed for the
+    user, so we exit with a plain reason. Nothing here touches pip or the
+    network unless --install-opt was explicitly passed.
+    """
+    missing = [c for c in _required_capabilities(args) if not c.ok]
+    if not missing:
+        return
+    pip_missing = [c for c in missing if c.pip_pkgs]      # installable for the user
+    ext_missing = [c for c in missing if not c.pip_pkgs]  # external-only
+
+    for c in missing:
+        fixes = []
+        if c.pip_pkgs:
+            fixes.append("pip install " + " ".join(c.pip_pkgs))
+        if c.ext_tools:
+            fixes.append(("or install " if c.pip_pkgs else "install ")
+                         + "/".join(c.ext_tools) + " on your system")
+        _err(f"{c.name} is unavailable — {'; '.join(fixes)}.")
+
+    # External tools we cannot install for the user → hard stop with a reason.
+    if ext_missing:
+        _err("The program(s) above must be installed and on your PATH; re-run once they are.")
+        sys.exit(2)
+
+    # Only pip-installable libraries remain.
+    pkgs = sorted({p for c in pip_missing for p in c.pip_pkgs})
+    if getattr(args, "install_opt", False):
+        if _pip_install(pkgs):
+            _ok("Installed. Please re-run your command to use it.")
+            sys.exit(0)
+        _err("Installation failed; see pip output above.")
+        sys.exit(1)
+    _err("Install with:  pip install " + " ".join(pkgs))
+    _err("Or re-run with --install-opt and rednb-verify will install it for you.")
+    sys.exit(2)
+
+
+def _bad_path_hint(raw: str) -> str:
+    """Extra guidance appended when a path argument doesn't resolve.
+
+    A literal '"' inside a path can never be a legitimate Windows filename
+    character — its presence here is a reliable sign of a specific, common
+    shell mishap: a quoted path ending in a single backslash right before the
+    closing quote (e.g. "C:\\journal\\") escapes that quote instead of ending
+    the argument, silently swallowing the rest of the command line into this
+    one path. Flag substrings surviving inside the string are the tell.
+    """
+    if '"' in raw or re.search(r"\s-{1,2}[A-Za-z]", raw):
+        return (" This looks like a quoted path ending in a backslash before "
+                "the closing quote — that swallows the rest of the command "
+                "into this one argument on Windows. Drop the trailing "
+                "backslash, double it (\\\\), or use forward slashes (/).")
+    return ""
 
 
 # ---------- Manifest ----------
@@ -2004,7 +2217,7 @@ def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
         return candidates[-1]
     target = target.resolve()
     if not target.exists():
-        _err(f"Manifest not found: {target}")
+        _err(f"Manifest not found: {target}" + _bad_path_hint(arg))
         sys.exit(2)
     return target
 
@@ -2023,6 +2236,10 @@ _TSA_ENTRY_SCHEMA: Dict = {
     },
     "additionalProperties": False,
 }
+
+# A tsa_* field is either a token entry or the literal "failed" marker (a stamp
+# that was attempted but couldn't be obtained — see --resign to add one later).
+_TSA_FIELD_SCHEMA: Dict = {"oneOf": [_TSA_ENTRY_SCHEMA, {"const": "failed"}]}
 
 MANIFEST_SCHEMA: Dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2113,10 +2330,10 @@ MANIFEST_SCHEMA: Dict = {
                 "oneOf": [{"required": ["target"]}, {"required": ["target_hash"]}],
             },
         },
-        "tsa_stamp": _TSA_ENTRY_SCHEMA,
-        "tsa_merkle": _TSA_ENTRY_SCHEMA,
-        "tsa_concat": _TSA_ENTRY_SCHEMA,
-        "tsa_content": _TSA_ENTRY_SCHEMA,
+        "tsa_stamp": _TSA_FIELD_SCHEMA,
+        "tsa_merkle": _TSA_FIELD_SCHEMA,
+        "tsa_concat": _TSA_FIELD_SCHEMA,
+        "tsa_content": _TSA_FIELD_SCHEMA,
     },
 }
 
@@ -2545,6 +2762,11 @@ supported hash algorithms:
     parser.add_argument("--offline", action="store_true",
                         help="Assert that no network is used: refuses --tsa. The tool is "
                              "offline by default; this makes it explicit")
+    parser.add_argument("--install-opt", action="store_true", dest="install_opt",
+                        help="Permit the tool to 'pip install' the optional Python "
+                             "packages a command needs (pyyaml/jsonschema/rfc3161ng/…). "
+                             "Alone, installs all missing optional packages and exits. "
+                             "The only path that runs pip; nothing installs without it.")
     parser.add_argument("--warn-age", type=int, default=None, dest="warn_age", metavar="DAYS",
                         help="Warn during --verify if manifest is older than N days")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2647,6 +2869,12 @@ supported hash algorithms:
             print(f"  {name:<12} {TSA_SERVERS[name]}")
         return
 
+    # ---- --install-opt alone: install every missing optional package, exit ----
+    if (args.install_opt and args.notebook_dir is None and args.verify is None
+            and args.validate is None and args.resign is None):
+        install_all_optional()
+        return
+
     # ---- Timestamping flag validation (network is strictly opt-in) ----
     if args.offline and args.tsa:
         _err("--offline forbids network flags: remove --tsa (the tool is "
@@ -2664,10 +2892,7 @@ supported hash algorithms:
             _err("--tsa is a create-time flag; to check a token during --verify, "
                  "pass --tsa-cert CAFILE (or --ignore-tsa to skip).")
             sys.exit(2)
-        if not openssl_available():
-            _err("--tsa needs the 'openssl' command-line tool to build the "
-                 "timestamp query.")
-            sys.exit(2)
+        # openssl-or-library availability is enforced by preflight_dependencies().
         tsa_url = resolve_tsa(args.tsa)
 
     # ---- Config management (Feature 1): mutate config, optionally write & exit ----
@@ -2830,6 +3055,11 @@ supported hash algorithms:
         out_dir = (args.output or Path.cwd()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Check the requested operation's optional/external dependencies up front,
+    # before any hashing — so a missing lib/tool is a clear message, not a
+    # mid-run failure. May install (only with --install-opt) or exit.
+    preflight_dependencies(args)
+
     want_gpg = args.gpg is not None
     want_ssh = args.ssh is not None
 
@@ -2909,6 +3139,11 @@ supported hash algorithms:
                  "(a file or a directory), e.g. --verify .testing/output")
             sys.exit(2)
 
+        if not args.notebook_dir.is_dir():
+            _err(f"Notebook directory not found: {args.notebook_dir}"
+                 + _bad_path_hint(str(args.notebook_dir)))
+            sys.exit(2)
+
         # Resolve manifest path from --verify argument or auto-search
         verify_arg = args.verify
         if verify_arg == "__auto__":
@@ -2928,7 +3163,8 @@ supported hash algorithms:
         else:
             manifest_path = target.resolve()
             if not manifest_path.exists():
-                _err(f"Manifest not found: {manifest_path}")
+                _err(f"Manifest not found: {manifest_path}"
+                     + _bad_path_hint(verify_arg))
                 sys.exit(2)
 
         try:
@@ -3098,40 +3334,50 @@ supported hash algorithms:
                 for w in result.warnings:
                     _warn(w)
 
-        # ---- TSA timestamp checks (fully local: openssl ts -verify) ----
+        # ---- TSA timestamp checks (fully local: openssl or rfc3161ng) ----
         tsa_failed = False
         _tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
         _embedded = [f for f in TSA_FIELDS if isinstance(manifest.get(f), dict)]
+        _failed_markers = [f for f in TSA_FIELDS if manifest.get(f) == "failed"]
         _tsa_present = _tsr_path.exists() or bool(_embedded)
+        for _f in _failed_markers:
+            _warn(f"Timestamp was not applied ({_f}: failed) — add one later with --resign")
         if args.ignore_tsa:
             if _tsa_present:
                 _warn("Flag --ignore-tsa in use")
         elif _tsa_present:
-            if not openssl_available():
-                _warn("TSA timestamp present but openssl is unavailable — "
+            if not tsa_backend_available():
+                _warn("TSA timestamp present but no backend (openssl / rfc3161ng) — "
                       "timestamp not verified")
             elif args.tsa_cert is None:
                 _warn("TSA timestamp present but no --tsa-cert given — "
                       "timestamp not cryptographically verified")
             else:
-                if _tsr_path.exists():
-                    if tsa_verify_data(manifest_path.read_bytes(),
-                                       _tsr_path.read_bytes(), args.tsa_cert):
-                        _ok(f"TSA timestamp verified: {_tsr_path.name}")
-                    else:
-                        _qprint(f"{_tag('FAIL')} TSA timestamp failed: {_tsr_path.name}")
+                def _check_tsa(label: str, data: bytes, tsr: bytes, extra: str = "") -> None:
+                    nonlocal tsa_failed
+                    result = tsa_verify_data(data, tsr, args.tsa_cert)
+                    if result is True:
+                        _ok(f"TSA timestamp verified: {label}{extra}")
+                    elif result is False:
+                        _qprint(f"{_tag('FAIL')} TSA timestamp failed: {label}")
                         tsa_failed = True
+                    else:  # None — inconclusive (backend couldn't decide)
+                        _warn(f"TSA timestamp inconclusive: {label} "
+                              "(verify with openssl externally)")
+
+                if _tsr_path.exists():
+                    _check_tsa(_tsr_path.name, manifest_path.read_bytes(),
+                               _tsr_path.read_bytes())
                 for _field in _embedded:
                     _value = _tsa_stamped_value(manifest, _field)
                     try:
                         _token = base64.b64decode(manifest[_field].get("token_b64", ""))
                     except (ValueError, TypeError):
                         _token = b""
-                    if _value and _token and tsa_verify_data(
-                            _value.encode("utf-8"), _token, args.tsa_cert):
+                    if _value and _token:
                         _t = manifest[_field].get("time", "")
-                        _ok(f"TSA timestamp verified: {_field}"
-                            + (f" ({_t})" if _t else ""))
+                        _check_tsa(_field, _value.encode("utf-8"), _token,
+                                   f" ({_t})" if _t else "")
                     else:
                         _qprint(f"{_tag('FAIL')} TSA timestamp failed: {_field}")
                         tsa_failed = True
@@ -3187,6 +3433,11 @@ supported hash algorithms:
     # ------------------------------------------------------------------ #
     #  Create mode                                                         #
     # ------------------------------------------------------------------ #
+    if not args.notebook_dir.is_dir():
+        _err(f"Notebook directory not found: {args.notebook_dir}"
+             + _bad_path_hint(str(args.notebook_dir)))
+        sys.exit(2)
+
     # Determine and display mode when verbose
     if args.per_day and not args.month_only:
         _mode_label = "per-day/full-tree"
@@ -3231,8 +3482,10 @@ supported hash algorithms:
     # stamps cover root VALUES, so adding them cannot invalidate themselves. ----
     if tsa_url and (args.tsa_embed or args.tsa_embed_separate):
         if not tsa_embed_into_manifest(manifest, tsa_url, args.tsa_embed_separate):
-            _err("Timestamping failed — manifest not written.")
-            sys.exit(1)
+            # Don't throw away the hashing: the manifest now carries tsa_*: "failed"
+            # markers and is written anyway; --resign can add a real token later.
+            _warn("Timestamping failed — recorded as 'failed' in the manifest; "
+                  "add a token later with --resign.")
 
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
@@ -3317,13 +3570,18 @@ supported hash algorithms:
     if tsa_url and not (args.tsa_embed or args.tsa_embed_separate):
         tsr = tsa_timestamp_file(manifest_path, tsa_url)
         if tsr is None:
-            _err("TSA request failed — manifest was written without a timestamp.")
-            sys.exit(1)
-        tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
-        tsr_path.write_bytes(tsr)
-        _time = tsa_token_time(tsr)
-        _ok(f"Timestamp token saved: {tsr_path.name}"
-            + (f" ({_time})" if _time else ""))
+            # The manifest is already written (and signed) — don't waste that.
+            _warn("Timestamping failed — the manifest is written but has no .tsr "
+                  "token; add one later with --resign.")
+            # Halt so an interactive user notices; -y (or non-interactive) continues.
+            if sys.stdin.isatty() and not args.yes:
+                sys.exit(1)
+        else:
+            tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
+            tsr_path.write_bytes(tsr)
+            _time = tsa_token_time(tsr)
+            _ok(f"Timestamp token saved: {tsr_path.name}"
+                + (f" ({_time})" if _time else ""))
 
     # --json: echo the finished manifest to stdout for piping (logs are on stderr).
     if args.json:
