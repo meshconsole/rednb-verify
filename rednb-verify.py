@@ -1189,6 +1189,125 @@ def tsa_embed_into_manifest(manifest: Dict, url: str, separate: bool) -> bool:
     return True
 
 
+# ---------- Optional dependencies (preflight + --install-opt) ----------
+
+# pip package name -> import name, for availability checks and installation.
+_OPTIONAL_PIP: Dict[str, str] = {
+    "pyyaml": "yaml",
+    "jsonschema": "jsonschema",
+    "rfc3161ng": "rfc3161ng",
+    "blake3": "blake3",
+    "xxhash": "xxhash",
+}
+
+
+def _module_available(import_name: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(import_name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+@dataclass
+class _Capability:
+    """A requested feature's dependency. Satisfied if it is available now.
+    pip_pkgs can install it; ext_tools are system commands we cannot install."""
+    name: str
+    ok: bool
+    pip_pkgs: tuple = ()
+    ext_tools: tuple = ()
+
+
+def _required_capabilities(args) -> List[_Capability]:
+    """Only the dependencies the *requested* operation actually needs."""
+    caps: List[_Capability] = []
+    if getattr(args, "per_day", False):
+        caps.append(_Capability("--per-day", _module_available("yaml"),
+                                pip_pkgs=("pyyaml",)))
+    if getattr(args, "validate", None) is not None:
+        caps.append(_Capability("--validate", _module_available("jsonschema"),
+                                pip_pkgs=("jsonschema",)))
+    if getattr(args, "tsa", None):
+        caps.append(_Capability(
+            "--tsa timestamping",
+            openssl_available() or _module_available("rfc3161ng"),
+            pip_pkgs=("rfc3161ng",), ext_tools=("openssl",)))
+    if getattr(args, "gpg", None) is not None or getattr(args, "gpg_k", None) is not None:
+        caps.append(_Capability("GPG signing", gpg_available(), ext_tools=("gpg",)))
+    if getattr(args, "ssh", None) is not None or getattr(args, "ssh_fido", None) is not None:
+        caps.append(_Capability("SSH signing", ssh_keygen_available(),
+                                ext_tools=("ssh-keygen",)))
+    return caps
+
+
+def _pip_install(pkgs: List[str]) -> bool:
+    cmd = [sys.executable, "-m", "pip", "install", *pkgs]
+    _info("Running: " + " ".join(cmd))
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except OSError as exc:
+        _err(f"Could not run pip: {exc}")
+        return False
+
+
+def install_all_optional() -> None:
+    """`--install-opt` alone: install every missing optional package and exit."""
+    missing = [p for p, imp in _OPTIONAL_PIP.items() if not _module_available(imp)]
+    if not missing:
+        _ok("All optional packages are already installed.")
+        return
+    _info("Missing optional packages: " + ", ".join(missing))
+    if _pip_install(missing):
+        _ok("Optional packages installed. Re-run your command to use them.")
+    else:
+        _err("Some packages failed to install; see pip output above.")
+        sys.exit(1)
+
+
+def preflight_dependencies(args) -> None:
+    """Verify the requested operation's dependencies BEFORE doing any work.
+
+    Missing pip libraries → print the exact `pip install` line and ask the user
+    to re-run with --install-opt (or, when --install-opt is given, install them
+    and stop so they re-run). Missing external tools (gpg/ssh-keygen; openssl
+    only when the pip alternative is also absent) can't be installed for the
+    user, so we exit with a plain reason. Nothing here touches pip or the
+    network unless --install-opt was explicitly passed.
+    """
+    missing = [c for c in _required_capabilities(args) if not c.ok]
+    if not missing:
+        return
+    pip_missing = [c for c in missing if c.pip_pkgs]      # installable for the user
+    ext_missing = [c for c in missing if not c.pip_pkgs]  # external-only
+
+    for c in missing:
+        fixes = []
+        if c.pip_pkgs:
+            fixes.append("pip install " + " ".join(c.pip_pkgs))
+        if c.ext_tools:
+            fixes.append(("or install " if c.pip_pkgs else "install ")
+                         + "/".join(c.ext_tools) + " on your system")
+        _err(f"{c.name} is unavailable — {'; '.join(fixes)}.")
+
+    # External tools we cannot install for the user → hard stop with a reason.
+    if ext_missing:
+        _err("The program(s) above must be installed and on your PATH; re-run once they are.")
+        sys.exit(2)
+
+    # Only pip-installable libraries remain.
+    pkgs = sorted({p for c in pip_missing for p in c.pip_pkgs})
+    if getattr(args, "install_opt", False):
+        if _pip_install(pkgs):
+            _ok("Installed. Please re-run your command to use it.")
+            sys.exit(0)
+        _err("Installation failed; see pip output above.")
+        sys.exit(1)
+    _err("Install with:  pip install " + " ".join(pkgs))
+    _err("Or re-run with --install-opt and rednb-verify will install it for you.")
+    sys.exit(2)
+
+
 # ---------- Manifest ----------
 
 def collect_files(
@@ -2545,6 +2664,11 @@ supported hash algorithms:
     parser.add_argument("--offline", action="store_true",
                         help="Assert that no network is used: refuses --tsa. The tool is "
                              "offline by default; this makes it explicit")
+    parser.add_argument("--install-opt", action="store_true", dest="install_opt",
+                        help="Permit the tool to 'pip install' the optional Python "
+                             "packages a command needs (pyyaml/jsonschema/rfc3161ng/…). "
+                             "Alone, installs all missing optional packages and exits. "
+                             "The only path that runs pip; nothing installs without it.")
     parser.add_argument("--warn-age", type=int, default=None, dest="warn_age", metavar="DAYS",
                         help="Warn during --verify if manifest is older than N days")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2647,6 +2771,12 @@ supported hash algorithms:
             print(f"  {name:<12} {TSA_SERVERS[name]}")
         return
 
+    # ---- --install-opt alone: install every missing optional package, exit ----
+    if (args.install_opt and args.notebook_dir is None and args.verify is None
+            and args.validate is None and args.resign is None):
+        install_all_optional()
+        return
+
     # ---- Timestamping flag validation (network is strictly opt-in) ----
     if args.offline and args.tsa:
         _err("--offline forbids network flags: remove --tsa (the tool is "
@@ -2664,10 +2794,7 @@ supported hash algorithms:
             _err("--tsa is a create-time flag; to check a token during --verify, "
                  "pass --tsa-cert CAFILE (or --ignore-tsa to skip).")
             sys.exit(2)
-        if not openssl_available():
-            _err("--tsa needs the 'openssl' command-line tool to build the "
-                 "timestamp query.")
-            sys.exit(2)
+        # openssl-or-library availability is enforced by preflight_dependencies().
         tsa_url = resolve_tsa(args.tsa)
 
     # ---- Config management (Feature 1): mutate config, optionally write & exit ----
@@ -2829,6 +2956,11 @@ supported hash algorithms:
         # --validate with no notebook dir: search/anchor at the cwd.
         out_dir = (args.output or Path.cwd()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check the requested operation's optional/external dependencies up front,
+    # before any hashing — so a missing lib/tool is a clear message, not a
+    # mid-run failure. May install (only with --install-opt) or exit.
+    preflight_dependencies(args)
 
     want_gpg = args.gpg is not None
     want_ssh = args.ssh is not None
