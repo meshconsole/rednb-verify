@@ -8,6 +8,11 @@ pyyaml>=6.0
 # Optional — install to enable --validate (manifest JSON-schema validation):
 jsonschema>=4.0
 
+# Optional — install to enable --tsa (RFC 3161 timestamping) WITHOUT the
+# openssl command-line tool (e.g. stock Windows, which ships no openssl).
+# Not needed at all if openssl is already on PATH — that is tried first.
+rfc3161ng>=2.1
+
 # Optional — faster/extra hash backends (used automatically if present):
 # blake3
 # xxhash

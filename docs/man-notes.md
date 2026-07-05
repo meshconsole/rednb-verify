@@ -713,16 +713,81 @@ The **manifest's own self-declaration** drives whether a signature is required:
 
 ### Verify semantics
 - Detached `.tsr` and embedded stamps are checked when present:
-  - no openssl → `[WARN] ... openssl is unavailable` (skip, exit unaffected)
+  - no backend (openssl AND rfc3161ng both absent) → `[WARN] ... no backend` (skip)
   - no `--tsa-cert` → `[WARN] ... not cryptographically verified` (skip)
-  - with `--tsa-cert`: `[OK] TSA timestamp verified: ...` or
-    `[FAIL] TSA timestamp failed: ...` → contributes to hard_fail → exit 1.
+  - with `--tsa-cert`: `tsa_verify_data` returns True/False/None (tri-state —
+    None = inconclusive, e.g. library-backend decode issue) →
+    `[OK] TSA timestamp verified: ...` / `[FAIL] ... failed: ...` (→ hard_fail,
+    exit 1) / `[WARN] ... inconclusive: ...` (skip, exit unaffected).
+- A `tsa_*` field holding the literal string `"failed"` (see below) prints
+  `[WARN] Timestamp was not applied (...: failed) — add one later with --resign`
+  and is NOT treated as a verification failure.
 - Embedded checks use the manifest's STORED roots (the token authenticates the
   manifest's claim; integrity checks separately tie disk state to manifest).
 - `--ignore-tsa` skips everything with `[WARN] Flag --ignore-tsa in use`.
 
-### Failure at create
-- Embed mode: network/query failure aborts BEFORE writing (exit 1, nothing
-  half-stamped on disk).
-- Detached mode: manifest is already written+signed; failure keeps it and
-  exits 1 with an explicit "written without a timestamp" error.
+### Failure at create (revised — preserve the hashing work)
+- Embed mode: a failed stamp writes the literal string `"failed"` into that
+  field (and any not-yet-attempted fields in `--tsa-embed-separate`) instead
+  of aborting; already-succeeded stamps in the same run are kept; the
+  manifest is written normally. `_TSA_FIELD_SCHEMA` = oneOf(entry, const
+  "failed").
+- Detached mode: the manifest (and signature) is already written; on failure
+  the tool warns and, if `sys.stdin.isatty() and not args.yes`, exits 1 so an
+  interactive user notices — `-y` or non-interactive continues (exit 0).
+- Rationale: re-hashing a large notebook from scratch is expensive; a TSA
+  hiccup should never discard completed work.
+- `--resign` gaining the ability to add/replace a TSA token is planned but
+  NOT implemented (tracked for a future branch).
+
+### TSA backend: openssl-or-library (Windows has no openssl by default)
+- `tsa_backend_available()` = `openssl_available() or _tsa_lib_available()`.
+- Request/verify/token-time each try openssl first, then fall back to the
+  optional `rfc3161ng` package (`_lib_request`/`_lib_verify`, using
+  `RemoteTimestamper(url, hashname="sha256", include_tsa_certificate=True)`
+  and `check_timestamp`/`decode_timestamp_response`). `rfc3161ng` wheels do
+  NOT need a system openssl (bundles via `cryptography`'s wheel).
+- EXPERIMENTAL: the library path is far less exercised than the openssl path
+  in this codebase; do one real request+verify round trip before relying on
+  it. `tsa_verify_data` returns `Optional[bool]` (None = no backend, or the
+  library backend couldn't decide) rather than assuming a hard True/False.
+
+---
+
+## Feature 7: dependency preflight + `--install-opt` — ✅ IMPLEMENTED
+
+- `_required_capabilities(args)` maps ONLY the flags actually passed to their
+  dependencies: `--per-day`→pyyaml, `--validate`→jsonschema, `--tsa`→openssl
+  OR rfc3161ng, `--gpg*`→gpg, `--ssh*`→ssh-keygen.
+- `preflight_dependencies(args)` runs after `out_dir` is established (so it
+  applies to both create and verify) and before any hashing:
+  - external tool missing (gpg/ssh-keygen) → print reason, exit 2 (cannot be
+    installed for the user).
+  - pip-installable lib missing, no `--install-opt` → print the exact
+    `pip install ...` line + "re-run with --install-opt", exit 2. NEVER
+    prompts, NEVER installs without the flag (deliberately conservative —
+    users include non-technical journalists).
+  - pip-installable lib missing, WITH `--install-opt` → run pip, print
+    "re-run your command", exit 0 (a just-installed compiled package like
+    cryptography is not reliably importable in the same process).
+- `--install-opt` alone (no notebook_dir/verify/validate/resign) →
+  `install_all_optional()`: installs every missing package in `_OPTIONAL_PIP`
+  (pyyaml, jsonschema, rfc3161ng, blake3, xxhash) in one shot.
+- `_pip_install` is the ONLY code path that invokes `pip`, ever.
+
+## Feature 8: bad-path diagnostics — ✅ IMPLEMENTED
+
+- Root cause investigated: a nonexistent `notebook_dir` previously produced a
+  SILENT empty (zero-file) manifest at exit 0 — `os.walk()` on a missing dir
+  just yields nothing. Now both create and verify check
+  `args.notebook_dir.is_dir()` up front and exit 2 with a clear message.
+- Separately: Windows/MSVCRT argv parsing has a real, well-known gotcha — a
+  quoted path ending in a single backslash before the closing quote
+  (`"C:\journal\"`) escapes the quote instead of ending the argument, silently
+  swallowing the rest of the command line into that one string. Reproduced
+  and confirmed (`argv = ['C:\\some\\path" --no-sign extra']`).
+- `_bad_path_hint(raw)` detects the telltale signs — a literal `"` (never
+  legal in a Windows filename) or a surviving `-flag`-looking substring — and
+  appends a specific, actionable hint (not a generic error) to the "not
+  found" messages in create mode, verify mode, and `_resolve_manifest_path`
+  (used by `--validate`).
