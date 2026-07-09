@@ -817,20 +817,66 @@ The **manifest's own self-declaration** drives whether a signature is required:
   works off in-memory YAML content already parsed successfully, not a live
   file read, so there's no OSError path analogous to `collect_files`'.
 
-## Planned: progress bar in normal (non-verbose) mode — NOT IMPLEMENTED
+## Planned: progress bar in normal (non-verbose) mode — SPEC CONVERGED, NOT IMPLEMENTED
 
 - User complaint: normal (non-verbose) mode shows nothing at all while
   hashing a large notebook — reads as a frozen/blank pause. `--verbose` is
   too noisy for routine runs (one line per file).
-- Requirements gathering in progress: wants a menu of real-world CLI
-  progress-bar conventions to choose from (examples requested: pip/tqdm
-  percentage+ETA bar, npm/cargo spinner+status line, git clone
-  "Receiving objects: NN% (x/y)", docker pull multi-line layer bars, rich
-  library styles) before committing to one design.
-- Constraints to respect when implementing: stdlib-only by default (no hard
-  dependency on `rich`/`tqdm`); must not corrupt `--quiet` (still silent) or
-  `--json`/piped output (progress bar escape codes must never hit stdout in
-  `--json` mode — route to stderr, or disable entirely when not a TTY,
-  mirroring the existing `_tag()` TTY-detection pattern); must coexist
-  sensibly with `--verbose` (probably mutually exclusive display modes, since
-  verbose already gives full per-file detail).
+- Six real-world conventions were presented (animated HTML mockup) for the
+  user to compare: tqdm-style, pip/apt bracket-bar, git-clone plain count,
+  rich/cargo segmented-unicode bar, minimal spinner+fraction, docker-pull
+  concurrent-worker bars. **User picked minimal spinner+fraction.** All six
+  are reproducible stdlib-only (`\r` line-overwrite) — none require actually
+  installing tqdm/rich; the names only describe the visual convention.
+
+### Converged format
+```
+⠋ Hashing... 3/9 files (33%) [Time Elapsed: 340ms]
+```
+- Braille spinner frame, then `<done>/<total> files (<pct>%)`, then
+  `[Time Elapsed: X]`.
+- Elapsed unit auto-switches: milliseconds while elapsed < 1000ms
+  (`"340ms"`, integer), seconds once ≥ 1s (`"4.2s"`, one decimal). Exact
+  thresholds/precision still open for adjustment once it's actually on
+  screen.
+- **Total is ALWAYS known before the bar starts** — confirmed in code:
+  `collect_files` fully walks the tree into `paths_to_hash` (and
+  `collect_files_per_day` fully parses all month files into `entries`)
+  BEFORE any hashing begins; `total = len(...)` is available on the very
+  next line. So the earlier caveat about "spinner style suits an unknown
+  total" doesn't apply here — a real percentage is always available, never
+  an estimate.
+
+### Two-phase design (closes the gap at BOTH ends, not just hashing)
+The `os.walk`/month-file enumeration pass is itself unbounded work with no
+feedback today — same blank-pause problem, just one step earlier, and now
+more likely to matter since the tool hashes arbitrary directories, not just
+small RedNotebook journals. Proposed:
+```
+[INFO] Counting files...
+[OK] 9 files to hash
+⠋ Hashing... 3/9 files (33%) [Time Elapsed: 340ms]
+```
+Applies to both verbose (two `[INFO]`/`[OK]` lines, matching existing
+message-tier conventions) and normal/progress-bar mode (same two lines
+before the bar takes over).
+
+### Scope: hashing phase ONLY — verify's post-hash checks stay as-is
+User correctly identified that verify does more than hash (content-root
+compare, symlink checks, signature checks, TSA checks) and asked whether
+those need bar/fraction treatment too. Resolved: NO — each of those is a
+single equality check or a single subprocess call, finishes in
+milliseconds, and already prints its own `[OK]`/`[FAIL]` line immediately
+as it happens (this is what the existing terminal-verdict section already
+does). There is no blank pause there to fix, so nothing changes in that
+part of verify. The progress bar's scope is exactly "counting → hashing";
+everything after hashing in both create and verify is unaffected.
+
+### Constraints to respect when implementing
+Stdlib-only (no hard dependency on `rich`/`tqdm` — see above, not needed
+anyway); must not corrupt `--quiet` (still fully silent) or `--json`/piped
+output (progress-bar `\r` updates must never hit stdout in `--json` mode —
+route to stderr, or disable entirely when not a TTY, mirroring the existing
+`_tag()` TTY-detection pattern); must coexist sensibly with `--verbose`
+(mutually exclusive display modes — verbose already gives full per-file
+detail, the two shouldn't both try to own the same line).
