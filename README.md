@@ -1003,7 +1003,7 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 ## Planned
 
 - Manifest chaining (each manifest references the previous one, making history tamper-evident)
-- `--json` output mode (structured JSON on stdout for piping and scripting)
+- Progress bar in normal (non-verbose) mode — hashing currently shows nothing until it finishes, which reads as a blank/frozen pause on a large notebook
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
 - RedNotebook UI integration
 - **rednb-verify-config** — GUI config editor (desktop app for managing `~/.config/rednb-verify/config.json`, trusted keys, and saved paths without touching the CLI)
