@@ -791,3 +791,46 @@ The **manifest's own self-declaration** drives whether a signature is required:
   appends a specific, actionable hint (not a generic error) to the "not
   found" messages in create mode, verify mode, and `_resolve_manifest_path`
   (used by `--validate`).
+
+## Feature 9: verbose progress fraction — ✅ IMPLEMENTED
+
+- `--verbose` per-file lines now include a `<done>/<total>` fraction right
+  after the tag: `[OK] 3/12 2026-05.txt 2026-07-09T19:33:40Z (0.13ms)`.
+- `total = len(paths_to_hash)` (or `len(entries)` for `--per-day`), computed
+  once up front since the file/entry list is fully known before hashing
+  starts.
+- Sequential (`--jobs 1`, the default): fraction = loop index via
+  `enumerate(..., 1)` — matches submission order.
+- Parallel (`--jobs N>1` or `--jobs 0`/auto): fraction counts COMPLETION
+  order via a `nonlocal _done` counter incremented under the same lock that
+  guards the print, NOT submission order — jobs finish out of order, so e.g.
+  file 4 can legitimately print before file 3. This was a deliberate choice:
+  counting still monotonically reaches N/N and reflects real progress, vs.
+  submission-order which would show gaps/out-of-order numbers.
+- Applied identically to both hashing paths: `collect_files` (already had
+  `[OK]/[FAIL] <path> <timestamp>` from an earlier feature) and
+  `collect_files_per_day` (`--per-day`) — the latter was found to still be on
+  an OLD, inconsistent format (`"  hashing {key} ... {elapsed}ms"`, no tag,
+  no timestamp) that had never been migrated when the tag+timestamp feature
+  was added earlier. Fixed to match exactly.
+- No FAILED-fraction case exists for `collect_files_per_day` — day hashing
+  works off in-memory YAML content already parsed successfully, not a live
+  file read, so there's no OSError path analogous to `collect_files`'.
+
+## Planned: progress bar in normal (non-verbose) mode — NOT IMPLEMENTED
+
+- User complaint: normal (non-verbose) mode shows nothing at all while
+  hashing a large notebook — reads as a frozen/blank pause. `--verbose` is
+  too noisy for routine runs (one line per file).
+- Requirements gathering in progress: wants a menu of real-world CLI
+  progress-bar conventions to choose from (examples requested: pip/tqdm
+  percentage+ETA bar, npm/cargo spinner+status line, git clone
+  "Receiving objects: NN% (x/y)", docker pull multi-line layer bars, rich
+  library styles) before committing to one design.
+- Constraints to respect when implementing: stdlib-only by default (no hard
+  dependency on `rich`/`tqdm`); must not corrupt `--quiet` (still silent) or
+  `--json`/piped output (progress bar escape codes must never hit stdout in
+  `--json` mode — route to stderr, or disable entirely when not a TTY,
+  mirroring the existing `_tag()` TTY-detection pattern); must coexist
+  sensibly with `--verbose` (probably mutually exclusive display modes, since
+  verbose already gives full per-file detail).

@@ -1436,36 +1436,44 @@ def collect_files(
             paths_to_hash.append((path, rel_str))
 
     files: Dict[str, Dict[str, str]] = {}
+    total = len(paths_to_hash)
 
     if jobs == 1:
-        for path, rel_str in paths_to_hash:
+        for i, (path, rel_str) in enumerate(paths_to_hash, 1):
             t0 = time.perf_counter()
             try:
                 files[rel_str] = hash_file_multi(path, algos)
             except OSError:
                 if _verbose:
-                    _vprint(f"{_tag('FAIL', stream=_log_stream())} {rel_str} {_now_stamp()}")
+                    _vprint(f"{_tag('FAIL', stream=_log_stream())} {i}/{total} "
+                            f"{rel_str} {_now_stamp()}")
                 raise
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
-                _vprint(f"{_tag('OK', stream=_log_stream())} {rel_str} "
+                _vprint(f"{_tag('OK', stream=_log_stream())} {i}/{total} {rel_str} "
                         f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
     else:
         _lock = threading.Lock()
+        _done = 0  # count of files completed so far, in COMPLETION order (not
+                   # submission order, since parallel jobs finish out of order)
 
         def _hash_one(path: Path, rel_str: str) -> tuple:
+            nonlocal _done
             t0 = time.perf_counter()
             try:
                 h = hash_file_multi(path, algos)
             except OSError:
                 if _verbose:
                     with _lock:
-                        _vprint(f"{_tag('FAIL', stream=_log_stream())} {rel_str} {_now_stamp()}")
+                        _done += 1
+                        _vprint(f"{_tag('FAIL', stream=_log_stream())} {_done}/{total} "
+                                f"{rel_str} {_now_stamp()}")
                 raise
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 with _lock:
-                    _vprint(f"{_tag('OK', stream=_log_stream())} {rel_str} "
+                    _done += 1
+                    _vprint(f"{_tag('OK', stream=_log_stream())} {_done}/{total} {rel_str} "
                             f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
             return rel_str, h
 
@@ -1609,6 +1617,7 @@ def collect_files_per_day(
             entries.append((day_key, content[day_num]))
 
     files: Dict[str, Dict[str, str]] = {}
+    total = len(entries)
 
     def _hash_day(day_key: str, day_data) -> tuple:
         # Canonicalise: dicts → sorted JSON; plain strings kept as-is
@@ -1622,19 +1631,24 @@ def collect_files_per_day(
         return day_key, digests, elapsed_ms
 
     if jobs == 1:
-        for day_key, day_data in entries:
+        for i, (day_key, day_data) in enumerate(entries, 1):
             key, digests, elapsed_ms = _hash_day(day_key, day_data)
             files[key] = digests
             if _verbose:
-                _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
+                _vprint(f"{_tag('OK', stream=_log_stream())} {i}/{total} {key} "
+                        f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
     else:
         _lock = threading.Lock()
+        _done = 0  # completion order, same rationale as collect_files
 
         def _hash_day_parallel(day_key: str, day_data) -> tuple:
+            nonlocal _done
             key, digests, elapsed_ms = _hash_day(day_key, day_data)
             if _verbose:
                 with _lock:
-                    _vprint(f"  hashing {key} ... {elapsed_ms:.2f}ms")
+                    _done += 1
+                    _vprint(f"{_tag('OK', stream=_log_stream())} {_done}/{total} {key} "
+                            f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
             return key, digests
 
         max_workers = jobs if jobs > 0 else None
