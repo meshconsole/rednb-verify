@@ -1081,29 +1081,91 @@ def _lib_request(data: bytes, url: str) -> Optional[bytes]:
 
 
 def _lib_verify(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
-    """Verify via rfc3161ng. True/False = verified/failed; None = inconclusive
-    (API/format issue — use openssl or verify externally). EXPERIMENTAL."""
+    """Verify via rfc3161ng: (1) the token's own signature validates over
+    `data` using its embedded certificate, and (2) that embedded certificate
+    was actually issued by the given CA. Both must hold for True. EXPERIMENTAL.
+
+    check_timestamp()'s `certificate=` parameter is NOT "the CA to trust" — it
+    is the certificate the SIGNATURE is checked against. Passing our CA root
+    there (an earlier bug here) verifies the token's signature against the
+    CA's key instead of the TSA's own signing key, which always fails. The
+    correct two-step is: let check_timestamp extract and use the token's own
+    embedded certificate (its OWN default of certificate=None is actually
+    broken — it must be passed explicitly as b"", matching load_certificate's
+    default), then separately confirm that embedded certificate was signed by
+    our CA.
+
+    Known limitation: check_timestamp's final signature check always calls
+    the RSA PKCS1v15 verify path regardless of key type, so a token signed
+    with an EC key (e.g. FreeTSA's TSA certs) cannot be checked here — that
+    surfaces as an inconclusive (None) result, not a false pass. The earlier,
+    cheaper message-imprint check (which is the actual tamper-evidence
+    mechanism) still runs and still catches a data/token mismatch regardless
+    of key type, so tamper detection is unaffected by this limitation — only
+    full cryptographic non-repudiation is.
+    """
     try:
         import rfc3161ng
-        cert = ca_file.read_bytes()
-        tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+        from rfc3161ng.api import load_certificate
+        from cryptography import x509
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
         return None
+
     try:
-        rfc3161ng.check_timestamp(tst, certificate=cert, data=data, hashname="sha256")
+        tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+        ca_cert = x509.load_pem_x509_certificate(ca_file.read_bytes())
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Library-backend timestamp verify inconclusive: {exc}")
+        return None
+
+    # Step 1: the token's own signature over `data`, checked against its own
+    # embedded certificate (certificate=b"" — NOT the library's own default of
+    # None, which raises inside load_certificate; see docstring).
+    try:
+        rfc3161ng.check_timestamp(tst, certificate=b"", data=data, hashname="sha256")
+    except InvalidSignature:
+        return False
+    except ValueError:
+        # e.g. "Message imprint mismatch" — the library's own tamper signal,
+        # not a tooling limitation.
+        return False
+    except TypeError:
+        _warn("Library-backend timestamp verify inconclusive: token uses an EC "
+              "signing key, which this backend cannot check (RSA-only) — "
+              "verify with openssl externally")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Library-backend timestamp verify inconclusive: {exc}")
+        return None
+
+    # Step 2: the embedded certificate was actually issued by the given CA.
+    try:
+        leaf_cert = load_certificate(tst.content, b"")
+        ca_key = ca_cert.public_key()
+        if isinstance(ca_key, rsa.RSAPublicKey):
+            ca_key.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes,
+                          padding.PKCS1v15(), leaf_cert.signature_hash_algorithm)
+        elif isinstance(ca_key, ec.EllipticCurvePublicKey):
+            ca_key.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes,
+                          ec.ECDSA(leaf_cert.signature_hash_algorithm))
+        else:
+            _warn("Library-backend timestamp verify inconclusive: unsupported CA key type")
+            return None
         return True
-    except getattr(rfc3161ng, "TimestampingError", Exception):
+    except InvalidSignature:
         return False
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
         return None
 
 
-def _tsa_request_bytes(data: bytes, url: str) -> Optional[bytes]:
+def _tsa_request_bytes(data: bytes, url: str, label: str = "") -> Optional[bytes]:
     """Backend-agnostic timestamp request. Prefers openssl (broadly tested);
     falls back to the rfc3161ng library when openssl isn't installed."""
-    _info(f"Requesting timestamp from {url}")
+    _info(f"Requesting timestamp from {url}{label}")
     if openssl_available():
         with tempfile.NamedTemporaryFile(delete=False) as tf:
             tf.write(data)
@@ -1127,9 +1189,9 @@ def tsa_timestamp_file(data_path: Path, url: str) -> Optional[bytes]:
     return _tsa_request_bytes(data_path.read_bytes(), url)
 
 
-def tsa_timestamp_data(data: bytes, url: str) -> Optional[bytes]:
+def tsa_timestamp_data(data: bytes, url: str, label: str = "") -> Optional[bytes]:
     """Request a token over in-memory bytes (used for embedded root stamps)."""
-    return _tsa_request_bytes(data, url)
+    return _tsa_request_bytes(data, url, label)
 
 
 def tsa_token_time(tsr: bytes) -> str:
@@ -1251,9 +1313,9 @@ def tsa_embed_into_manifest(manifest: Dict, url: str, separate: bool) -> bool:
     if any(v is None for _, v in targets):
         _err("Manifest lacks the root value(s) to timestamp")
         return False
-    _info(f"Requesting {len(targets)} timestamp(s) from {url}")
     for i, (field, value) in enumerate(targets):
-        tsr = tsa_timestamp_data(value.encode("utf-8"), url)
+        label = f" ({i + 1}/{len(targets)})" if len(targets) > 1 else ""
+        tsr = tsa_timestamp_data(value.encode("utf-8"), url, label)
         if tsr is None:
             # Preserve the hashing work: mark this stamp and any remaining ones
             # 'failed' so the manifest still records the intent; --resign can
@@ -1757,8 +1819,11 @@ def generate_manifest(
         manifest["content_roots"] = {
             a: merkle_root(sorted(files[p][a] for p in files), a) for a in tree_algos
         }
-        # files entry: {path, hashes: {algo: hex, ... alphabetical}}
-        manifest["files"] = [
+        # files entry: {path, hashes: {algo: hex, ... alphabetical}}. Assignment
+        # to manifest["files"] itself is deferred to the end of this function so
+        # it serialises as the LAST key in JSON output — every summary field
+        # (roots, warnings, symlinks, TSA stamps) is visible before the detail.
+        files_entry = [
             {"path": p, "hashes": {a: files[p][a] for a in algos}}
             for p in files
         ]
@@ -1777,7 +1842,7 @@ def generate_manifest(
         manifest["content_root"] = merkle_root(
             sorted(files[p][algo] for p in files), merkle_algo
         )
-        manifest["files"] = [{"path": p, algo: files[p][algo]} for p in files]
+        files_entry = [{"path": p, algo: files[p][algo]} for p in files]
 
     if exclude:
         manifest["exclude"] = exclude
@@ -1794,7 +1859,26 @@ def generate_manifest(
 
     if warnings:
         manifest["warnings"] = warnings
+
+    # "files" goes last: every summary/verdict-relevant field (roots, warnings,
+    # symlinks) should be visible at a glance before the per-file detail. Note
+    # that signing/TSA-embedding (in main(), after this function returns) can
+    # still add keys afterward — _manifest_files_last() re-asserts this order
+    # right before the manifest is actually serialised.
+    manifest["files"] = files_entry
     return manifest
+
+
+def _manifest_files_last(manifest: Dict) -> None:
+    """Move the 'files' key to the end of the dict's iteration order, in place.
+
+    Re-inserting a key via pop+assign moves it to the end (Python dicts keep a
+    key's original position on update, only a fresh insertion appends). Needed
+    because signing/TSA-embedding add keys to the manifest after
+    generate_manifest() already put 'files' last.
+    """
+    if "files" in manifest:
+        manifest["files"] = manifest.pop("files")
 
 
 # ---------- Verification ----------
@@ -3350,6 +3434,11 @@ supported hash algorithms:
 
         # ---- TSA timestamp checks (fully local: openssl or rfc3161ng) ----
         tsa_failed = False
+        # Soft "could not confirm, but not proven tampered" reasons collected
+        # across the whole verify — printed as ONE combined non-PASS verdict at
+        # the end (see "Terminal verdict" below) rather than a bare warning
+        # that let verification silently read as successful.
+        issues: List[str] = []
         _tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
         _embedded = [f for f in TSA_FIELDS if isinstance(manifest.get(f), dict)]
         _failed_markers = [f for f in TSA_FIELDS if manifest.get(f) == "failed"]
@@ -3375,9 +3464,13 @@ supported hash algorithms:
                     elif result is False:
                         _qprint(f"{_tag('FAIL')} TSA timestamp failed: {label}")
                         tsa_failed = True
-                    else:  # None — inconclusive (backend couldn't decide)
+                    else:
+                        # None: inconclusive. --tsa-cert was explicitly given, so
+                        # the user asked for this check — an inconclusive result
+                        # must not still let verification read as a clean PASS.
                         _warn(f"TSA timestamp inconclusive: {label} "
                               "(verify with openssl externally)")
+                        issues.append(f"TSA timestamp could not be verified ({label})")
 
                 if _tsr_path.exists():
                     _check_tsa(_tsr_path.name, manifest_path.read_bytes(),
@@ -3427,7 +3520,8 @@ supported hash algorithms:
                      or trust_failed or tsa_failed)
         # A manifest that expects a signature but produced none: hashes are
         # intact, but authenticity could not be established.
-        sig_issue = sig_required and not sig_verified
+        if sig_required and not sig_verified:
+            issues.append("manifest implies a signature, but none could be verified")
 
         # In --json mode, emit the report to stdout regardless of outcome.
         if args.json:
@@ -3435,8 +3529,12 @@ supported hash algorithms:
 
         if hard_fail:
             sys.exit(1)
-        if sig_issue:
-            _warn("Verification completed with issues")
+        if issues:
+            # Hashes are intact, but something that was actually checked (an
+            # explicitly requested TSA verification, or an implied signature)
+            # could not be confirmed — a soft PASS here would be misleading.
+            _qprint(f"{_tag('FAIL')} Verification completed with issues: "
+                    f"{'; '.join(issues)}")
             sys.exit(1)
 
         # Success.  Unsigned manifests pass on integrity alone — the UNSIGNED
@@ -3553,6 +3651,9 @@ supported hash algorithms:
             manifest["warnings"].append(WARN_UNSIGNED)
 
     # ---- Write the manifest (now contains signed_by / UNSIGNED) ----
+    # Re-assert files-last: tsa_embed_into_manifest and signed_by above both
+    # add keys after generate_manifest() already put "files" last once.
+    _manifest_files_last(manifest)
     if manifest_fmt == "json":
         manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"

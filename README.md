@@ -552,15 +552,16 @@ After writing the report, `--verify` prints a single terminal verdict:
 | `[WARN] Symlinks Present` | The manifest records symbolic links — review the symlink table | — |
 | `[WARN] Symlink points outside the notebook: …` | A symlink's target resolves outside the base directory (data pulled in from elsewhere; a repointing surface). Also printed at create | — |
 | `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
-| `[WARN] Verification completed with issues` | Hashes intact, but the manifest implies a signature that could not be established | `1` |
+| `[FAIL] Verification completed with issues: …` | Hashes are intact, but something that was actually checked couldn't be confirmed — an implied signature with none verified, or (see below) a TSA check you explicitly requested came back inconclusive. Lists the specific reason(s) | `1` |
 | `[OK] TSA timestamp verified: …` | An RFC 3161 token (detached `.tsr` or embedded stamp) verified against `--tsa-cert` | — |
 | `[FAIL] TSA timestamp failed: …` | A timestamp token did not verify (tampering or wrong CA) | `1` |
-| `[WARN] TSA timestamp present but no --tsa-cert given …` | A token exists but can't be cryptographically checked without the TSA's CA certificate | — |
+| `[WARN] TSA timestamp present but no --tsa-cert given …` | A token exists but can't be cryptographically checked without the TSA's CA certificate — informational only, does not block `[PASS]` | — |
+| `[WARN] TSA timestamp inconclusive: …` | `--tsa-cert` **was** given but the token could not be confirmed either way (e.g. a known backend limitation — see [Backend](#backend-openssl-or-rfc3161ng)). Since this check was explicitly requested, it also contributes to `[FAIL] Verification completed with issues` rather than a silent pass | `1` |
 
 **Integrity vs. authenticity.** Plain `--verify` checks *both* that files are unchanged **and** — when the manifest implies it is signed — that a valid signature establishes authenticity. How a manifest verifies depends on what it declares about itself:
 
 - **The manifest declares itself unsigned** (it was created without signing). `--verify` checks integrity only, prints `[WARN] Manifest note: MANIFEST UNSIGNED`, and returns `0` when the hashes match. No signature is expected.
-- **The manifest implies a signature** (it does *not* carry the unsigned marker) but no valid signature is provided. `--verify` prints `[WARN] Verification completed with issues` and returns `1` — the files are intact, but the authenticity the manifest claims could not be confirmed.
+- **The manifest implies a signature** (it does *not* carry the unsigned marker) but no valid signature is provided. `--verify` prints `[FAIL] Verification completed with issues: …` and returns `1` — the files are intact, but the authenticity the manifest claims could not be confirmed. The same verdict applies if you passed `--tsa-cert` and the timestamp check came back inconclusive — anything you explicitly asked to be checked and couldn't be confirmed blocks a clean `[PASS]`, listing every such reason together.
 - **You want integrity only, regardless of what the manifest declares.** Add **`--ignore-sig`** to `--verify`. It skips all signature checks and returns `0` when the hashes match — useful when you have the signed manifest but not its signature file, or simply don't care who signed it.
 
 ---
@@ -858,6 +859,8 @@ openssl ts -verify -data hashes-20260703T000000Z.txt \
 `--tsa` needs a way to build and check RFC 3161 requests. **`openssl` is tried first** (widely available on Linux/macOS, and well field-tested); if it isn't on PATH — as on a stock Windows machine, which ships no openssl — the optional **`rfc3161ng`** Python package is used instead (`pip install rfc3161ng`, or `--install-opt`). Nothing else about `--tsa` changes based on the backend.
 
 > **The `rfc3161ng` backend is newer and less battle-tested than the openssl path.** If you have openssl available, that's the more proven route. Before relying on the library backend for something that matters, do one real request-and-verify round trip (e.g. against `freetsa`) to confirm it works on your machine.
+>
+> **Known limitation: EC-signed tokens.** The `rfc3161ng` library's own signature-check call always assumes an RSA key; a token signed with an EC key (some TSAs, including FreeTSA's, use one) can't have its cryptographic signature checked by this backend and verifies as `[WARN] TSA timestamp inconclusive`, not a false pass. This does **not** weaken tamper detection — the message-imprint check (does this token actually match this data?) runs first and is unaffected by key type, so a genuinely mismatched/tampered token is still correctly reported as `[FAIL]`. Only full cryptographic non-repudiation (proving *who* signed it) is unavailable for EC-signed tokens on this backend; `openssl`, when available, is unaffected by this limitation.
 
 ---
 

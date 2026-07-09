@@ -5,6 +5,7 @@ touches openssl (query generation) skips when openssl isn't installed.
 """
 import base64
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,7 +32,7 @@ def _fake_net(tool, monkeypatch, token=b"FAKE-TSR"):
     """Stub the network + token-time so embed logic runs without a TSA."""
     calls = []
 
-    def fake_request(data: bytes, url: str):
+    def fake_request(data: bytes, url: str, label: str = ""):
         calls.append((data, url))
         return token
 
@@ -148,7 +149,7 @@ def test_embed_separate_multi_hash_uses_concat(tool, tmp_path, monkeypatch):
 
 def test_embed_failure_returns_false(tool, tmp_path, monkeypatch):
     m = _manifest(tool, tmp_path)
-    monkeypatch.setattr(tool, "tsa_timestamp_data", lambda data, url: None)
+    monkeypatch.setattr(tool, "tsa_timestamp_data", lambda data, url, label="": None)
     assert not tool.tsa_embed_into_manifest(m, "http://tsa.example", separate=False)
 
 
@@ -272,7 +273,7 @@ def test_verify_no_backend_is_none(tool, tmp_path, monkeypatch):
 
 def test_embed_failure_marks_failed(tool, tmp_path, monkeypatch):
     m = _manifest(tool, tmp_path)
-    monkeypatch.setattr(tool, "tsa_timestamp_data", lambda data, url: None)
+    monkeypatch.setattr(tool, "tsa_timestamp_data", lambda data, url, label="": None)
     assert tool.tsa_embed_into_manifest(m, "http://x", separate=False) is False
     assert m["tsa_stamp"] == "failed"
 
@@ -280,7 +281,7 @@ def test_embed_failure_marks_failed(tool, tmp_path, monkeypatch):
 def test_embed_separate_partial_failure_keeps_success(tool, tmp_path, monkeypatch):
     calls = []
 
-    def fake(data, url):
+    def fake(data, url, label=""):
         calls.append(data)
         return b"TSR" if len(calls) == 1 else None   # placement ok, content fails
 
@@ -340,3 +341,198 @@ def test_cli_verify_failed_marker_warns_not_fail(tmp_path):
     r = _run(str(nb), "--verify", str(mf), "--no-sign")
     assert r.returncode == 0
     assert "not applied" in (r.stdout + r.stderr)
+
+
+# ---- duplicate "Requesting timestamp" log line (bug found in live testing) ----
+# Mocking tsa_timestamp_data directly would replace the very code whose
+# _info() call these tests check, so the single-request case is tested at the
+# CLI level (subprocess, real code path, a dead TSA fails fast on request 1).
+# The two-request case needs two SUCCESSFUL round trips -- a dead TSA stops
+# after the first failure -- so that one mocks only the network primitive
+# (_tsa_http_post), leaving the real _tsa_request_bytes/_info() path intact.
+
+def test_cli_embed_single_prints_exactly_one_request_line(tmp_path):
+    # End-to-end reproduction of the exact bug: --tsa-embed used to print BOTH
+    # a "Requesting N timestamp(s)" summary AND a per-request "Requesting
+    # timestamp" line for the same single request.
+    nb = _journal(tmp_path)
+    r = _run(str(nb), "--no-sign", "--tsa", _DEAD_TSA, "--tsa-embed",
+             "-o", str(tmp_path), input="")
+    lines = [l for l in (r.stdout + r.stderr).splitlines() if "Requesting timestamp" in l]
+    assert len(lines) == 1
+
+
+def test_embed_separate_prints_two_distinct_labeled_lines(tool, tmp_path, monkeypatch, capsys):
+    # _DEAD_TSA can't cover this: the embed loop correctly stops after the
+    # FIRST failed request rather than attempting the second against a TSA
+    # that just refused the connection, so it never gets to a second label.
+    # Testing two REQUESTS requires two SUCCESSFUL round trips; mock only the
+    # actual network primitive (_tsa_http_post) so the real _tsa_request_bytes
+    # -- including its _info() call -- still runs for both attempts.
+    m = _manifest(tool, tmp_path)
+    monkeypatch.setattr(tool, "_tsa_http_post", lambda url, tsq, timeout=30: b"FAKE-TSR")
+    monkeypatch.setattr(tool, "openssl_available", lambda: True)
+    monkeypatch.setattr(tool, "_tsa_query_bytes", lambda data_path: b"FAKE-QUERY")
+    monkeypatch.setattr(tool, "tsa_token_time", lambda tsr: "t")
+    capsys.readouterr()
+    assert tool.tsa_embed_into_manifest(m, "http://tsa.example", separate=True)
+    lines = [l for l in capsys.readouterr().out.splitlines() if "Requesting timestamp" in l]
+    assert len(lines) == 2
+    assert "(1/2)" in lines[0] and "(2/2)" in lines[1]
+
+
+# ---- verdict: an explicitly-requested TSA check that can't be confirmed must
+# not still report [PASS] (bug found in live testing against a real TSA) ----
+#
+# The subprocess is run with a PATH that excludes openssl, forcing the library
+# (rfc3161ng) backend regardless of what happens to be installed on the machine
+# running these tests -- this matters because openssl's -verify always returns
+# a clean True/False, never inconclusive; only the library path can produce
+# None, and that's specifically the case this test needs to exercise.
+
+def _env_without_openssl():
+    # A machine can have more than one openssl on PATH (e.g. Git for Windows
+    # ships one under both mingw64\bin and usr\bin) -- shutil.which() only
+    # finds the first, so scan every PATH entry directly instead.
+    env = dict(os.environ)
+    dirs_with_openssl = {
+        p for p in env.get("PATH", "").split(os.pathsep)
+        if any((Path(p) / name).is_file() for name in ("openssl", "openssl.exe"))
+    }
+    env["PATH"] = os.pathsep.join(
+        p for p in env.get("PATH", "").split(os.pathsep) if p not in dirs_with_openssl
+    )
+    return env
+
+
+def test_verify_tsa_inconclusive_with_cert_blocks_pass(tmp_path):
+    pytest.importorskip("rfc3161ng")
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path), "--manifest-type", "json")
+    mf = sorted(tmp_path.glob("hashes-*.json"))[-1]
+    doc = json.loads(mf.read_text())
+    doc["tsa_stamp"] = {"tsa": "http://x", "time": "t", "token_b64": "Zm9v"}
+    mf.write_text(json.dumps(doc))
+    ca = tmp_path / "ca.pem"
+    ca.write_text("dummy")  # not a real cert -> decode fails -> inconclusive
+
+    r = _run(str(nb), "--verify", str(mf), "--no-sign", "--tsa-cert", str(ca),
+             env=_env_without_openssl())
+    out = r.stdout + r.stderr
+    assert r.returncode == 1
+    assert "[PASS]" not in out
+    assert "Verification completed with issues" in out
+    assert "TSA timestamp" in out
+
+
+def test_verify_tsa_no_cert_given_still_passes(tmp_path):
+    # Unchanged existing behaviour: no --tsa-cert at all is a soft, informational
+    # warning (the common case — most verifies won't have a CA file handy) and
+    # must NOT block PASS, only the explicitly-requested-but-inconclusive case does.
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path), "--manifest-type", "json")
+    mf = sorted(tmp_path.glob("hashes-*.json"))[-1]
+    doc = json.loads(mf.read_text())
+    doc["tsa_stamp"] = {"tsa": "http://x", "time": "t", "token_b64": "Zm9v"}
+    mf.write_text(json.dumps(doc))
+
+    r = _run(str(nb), "--verify", str(mf), "--no-sign")
+    assert r.returncode == 0
+    assert "[PASS]" in r.stdout
+
+
+# ---- _lib_verify exception routing (the actual bug: certificate= misuse and
+# check_timestamp's own broken None-vs-b"" default). Uses a real self-signed
+# cert (offline, no network) so _lib_verify's CA-load step succeeds, then
+# monkeypatches rfc3161ng.check_timestamp to force each exception path. ----
+
+def _throwaway_pem_cert(tmp_path):
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime as _dt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_dt.datetime.now(_dt.timezone.utc))
+        .not_valid_after(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path / "throwaway-ca.pem"
+    path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return path
+
+
+def test_lib_verify_ec_typeerror_is_inconclusive_not_false(tool, tmp_path, monkeypatch):
+    pytest.importorskip("rfc3161ng")
+    import rfc3161ng
+
+    class _Tst:
+        content = object()
+
+    class _Resp:
+        time_stamp_token = _Tst()
+
+    monkeypatch.setattr(rfc3161ng, "decode_timestamp_response", lambda tsr: _Resp())
+
+    def _raise_ec(tst, certificate=None, data=None, hashname=None):
+        raise TypeError("ECPublicKey.verify() takes 3 positional arguments but 4 were given")
+
+    monkeypatch.setattr(rfc3161ng, "check_timestamp", _raise_ec)
+    ca_file = _throwaway_pem_cert(tmp_path)
+    assert tool._lib_verify(b"root-value", b"fake-tsr-bytes", ca_file) is None
+
+
+def test_lib_verify_message_imprint_mismatch_is_false_not_none(tool, tmp_path, monkeypatch):
+    # This is the library's own tamper-detection signal (data given doesn't
+    # match what the token certifies) -- a real failure, not a tooling gap.
+    pytest.importorskip("rfc3161ng")
+    import rfc3161ng
+
+    class _Tst:
+        content = object()
+
+    class _Resp:
+        time_stamp_token = _Tst()
+
+    monkeypatch.setattr(rfc3161ng, "decode_timestamp_response", lambda tsr: _Resp())
+
+    def _raise_mismatch(tst, certificate=None, data=None, hashname=None):
+        raise ValueError("Message imprint mismatch")
+
+    monkeypatch.setattr(rfc3161ng, "check_timestamp", _raise_mismatch)
+    ca_file = _throwaway_pem_cert(tmp_path)
+    assert tool._lib_verify(b"tampered-value", b"fake-tsr-bytes", ca_file) is False
+
+
+def test_lib_verify_passes_certificate_bstring_not_none(tool, tmp_path, monkeypatch):
+    # Regression guard for the check_timestamp(certificate=None) bug: its OWN
+    # default is None, but load_certificate's "auto-extract from token" sentinel
+    # is b"" -- passing None crashes inside load_certificate. _lib_verify must
+    # always pass certificate=b"" explicitly for step 1.
+    pytest.importorskip("rfc3161ng")
+    import rfc3161ng
+
+    class _Tst:
+        content = object()
+
+    class _Resp:
+        time_stamp_token = _Tst()
+
+    monkeypatch.setattr(rfc3161ng, "decode_timestamp_response", lambda tsr: _Resp())
+    seen = {}
+
+    def _capture(tst, certificate=None, data=None, hashname=None):
+        seen["certificate"] = certificate
+        return True
+
+    monkeypatch.setattr(rfc3161ng, "check_timestamp", _capture)
+    ca_file = _throwaway_pem_cert(tmp_path)
+    tool._lib_verify(b"root-value", b"fake-tsr-bytes", ca_file)
+    assert seen["certificate"] == b""

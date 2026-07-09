@@ -880,3 +880,106 @@ route to stderr, or disable entirely when not a TTY, mirroring the existing
 `_tag()` TTY-detection pattern); must coexist sensibly with `--verbose`
 (mutually exclusive display modes — verbose already gives full per-file
 detail, the two shouldn't both try to own the same line).
+
+## Bugs found via live testing against a real TSA (freetsa.org) — ✅ FIXED
+
+Live round-trip testing (real network request, real downloaded CA cert)
+surfaced three real bugs beyond the mocked test suite's coverage.
+
+### 1. Duplicate "Requesting timestamp" log line
+`tsa_embed_into_manifest` printed a summary `_info(f"Requesting {N}
+timestamp(s) from {url}")`, then `_tsa_request_bytes` (called once per
+target) ALSO printed `_info(f"Requesting timestamp from {url}")` — for a
+single `--tsa-embed`, both fired back-to-back for the same one request.
+Fixed: removed the summary line; `_tsa_request_bytes`/`tsa_timestamp_data`
+now take an optional `label` (e.g. `" (1/2)"`) so `--tsa-embed-separate`'s
+two requests are each announced once, distinctly.
+
+### 2. `_lib_verify` (rfc3161ng backend) was fundamentally broken
+Reproduced against the real downloaded token+cert (not guessed):
+- **Root bug**: `certificate=cert` passed OUR CA cert as the parameter
+  `check_timestamp` uses to verify the token's SIGNATURE, not "the CA to
+  trust". This checks the signature against the CA's public key instead of
+  the TSA's own signing key, which always fails — surfaced as
+  `InvalidSignature`, whose `str()` is EMPTY (explains the blank
+  `"... inconclusive: "` message the user saw).
+- **Second bug, in the library itself**: `check_timestamp`'s own default is
+  `certificate=None`, but `load_certificate` (which it calls internally)
+  only auto-extracts the embedded cert when passed `certificate=b""` — `None`
+  hits `if b'...' in certificate:` and raises `TypeError: argument of type
+  'NoneType' is not a container or iterable`. Must always pass
+  `certificate=b""` explicitly.
+- **Third, a real library limitation (not fixable here)**: `check_timestamp`
+  always calls `public_key.verify(sig, data, padding.PKCS1v15(), hash)` —
+  RSA-only. FreeTSA's actual TSA-signing cert is EC, so this raises
+  `TypeError: ECPublicKey.verify() takes 3 positional arguments but 4 were
+  given`. Caught explicitly and reported as inconclusive (None) with a
+  specific message, never as a false pass/fail.
+- **Fix implemented** (two-step, both must pass for True):
+  1. `rfc3161ng.check_timestamp(tst, certificate=b"", data=data,
+     hashname="sha256")` — the token's own signature over `data`, via its
+     embedded cert. `ValueError` (e.g. "Message imprint mismatch" — the
+     library's actual tamper signal) → False. `TypeError` (EC limitation) →
+     None with a specific message. Other exceptions → None.
+  2. Extract that embedded cert via `rfc3161ng.api.load_certificate(
+     tst.content, b"")` (same function `check_timestamp` uses internally,
+     importable from the submodule though not re-exported at package level),
+     then verify IT was signed by the given CA — `ca_cert.public_key().
+     verify(leaf.signature, leaf.tbs_certificate_bytes, ...)`, RSA or EC
+     branch chosen by `isinstance(ca_key, rsa.RSAPublicKey | ec.
+     EllipticCurvePublicKey)`. `InvalidSignature` → False (not issued by
+     this CA); other exceptions → None.
+  Live-tested against the real freetsa.org token: step 1 correctly hits the
+  EC TypeError (→ None, honest); step 2 (CA→leaf chain) succeeds cleanly
+  (freetsa's CA is RSA). A tampered `data` value is caught by step 1's
+  message-imprint check BEFORE the RSA/EC signature call is ever reached, so
+  tamper detection works regardless of the EC limitation — confirmed live.
+
+### 3. Verdict: inconclusive-when-requested silently allowed [PASS]
+Before this fix, `_check_tsa`'s `None` (inconclusive) branch only printed a
+`[WARN]` and did not affect the exit verdict — so a manifest whose TSA check
+was explicitly requested (`--tsa-cert` given) but couldn't be confirmed still
+reported `[PASS] Verification successful`, exactly as observed live. Fixed:
+a new `issues: List[str]` collector (also subsuming the old bare `sig_issue`
+bool) accumulates reasons; if non-empty and not a hard_fail, the verdict is
+now `[FAIL] Verification completed with issues: <reasons>` → exit 1, never
+`[PASS]`. Scope: this only fires when `--tsa-cert` was explicitly passed
+(verification was actively requested) — the far more common "no --tsa-cert
+at all" case remains a soft, informational warning that does not block
+`[PASS]`, preserving the low-friction default for anyone who hasn't fetched
+a CA file.
+
+### 4. "files" should be the manifest's last field (user request, not a bug)
+`generate_manifest` now builds the file list into a local `files_entry` and
+assigns `manifest["files"] = files_entry` as literally the last statement
+before `return` — but signing and TSA-embedding (in `main()`, after
+`generate_manifest` returns) add more keys (`signed_by`, `tsa_*`) afterward,
+which would re-displace "files" from the end (Python dicts keep a key's
+ORIGINAL position on update; new keys always append at the end).
+`_manifest_files_last(manifest)` (`files = manifest.pop("files"); manifest
+["files"] = files`) re-asserts the order once, right before the JSON write
+in `main()`; the `--json` stdout echo reuses the same already-reordered dict
+object, no second call needed. The text-format writer was ALREADY
+hardcoded to put the `files:` section last regardless of dict order — only
+JSON's insertion-order-preserving serialisation needed this fix.
+
+### Test methodology notes
+- Mocking `tsa_timestamp_data` directly to test the duplicate-log fix
+  silently replaced the very code containing the `_info()` call under test —
+  caught by capsys showing zero output where a real fix would show a line.
+  Correct level to mock for that class of test is the actual network
+  primitive (`_tsa_http_post`) or a CLI-level subprocess run against a dead
+  port (`_DEAD_TSA`), which lets the real logging code execute.
+- Testing "two distinct successful request lines" via `_DEAD_TSA` doesn't
+  work: the embed loop deliberately stops after the FIRST failed request
+  (doesn't hammer an unreachable TSA a second time), so only request 1 ever
+  gets attempted. Needed two SUCCESSFUL round trips — done in-process via
+  monkeypatching `_tsa_http_post`.
+- Testing the inconclusive-verdict path via `--tsa-cert` initially returned
+  the wrong (hard-False) result because the TEST-RUNNING machine has openssl
+  on PATH, and `tsa_verify_data` prefers openssl (which gives a clean
+  True/False, never None, for garbage input) — only the library backend can
+  produce None. Fixed by stripping ALL PATH directories containing an
+  openssl binary from the subprocess env (this machine has TWO: Git's
+  `mingw64\bin` and `usr\bin` — `shutil.which()` only finds the first, so
+  the test scans every PATH entry directly rather than trusting `which`).
