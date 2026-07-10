@@ -208,8 +208,9 @@ def _create_with_fake_stamp(tmp_path):
 def test_verify_warns_without_tsa_cert(tmp_path):
     nb, mf = _create_with_fake_stamp(tmp_path)
     r = _run(str(nb), "--verify", str(mf), "--no-sign")
-    assert r.returncode == 0                                  # warn, don't fail
+    assert r.returncode == 1                                  # unconfirmed TSA claim blocks PASS
     assert "no --tsa-cert" in r.stdout + r.stderr
+    assert "Verification completed with issues" in r.stdout
 
 
 def test_verify_ignore_tsa_skips(tmp_path):
@@ -425,10 +426,12 @@ def test_verify_tsa_inconclusive_with_cert_blocks_pass(tmp_path):
     assert "TSA timestamp" in out
 
 
-def test_verify_tsa_no_cert_given_still_passes(tmp_path):
-    # Unchanged existing behaviour: no --tsa-cert at all is a soft, informational
-    # warning (the common case — most verifies won't have a CA file handy) and
-    # must NOT block PASS, only the explicitly-requested-but-inconclusive case does.
+def test_verify_tsa_no_cert_given_also_blocks_pass(tmp_path):
+    # A TSA claim exists in the manifest and wasn't ignored (--ignore-tsa) --
+    # leaving it silently unconfirmed just because --tsa-cert happened to be
+    # omitted would let verification read as a clean pass even though part of
+    # what the manifest asserts was never checked. Only --ignore-tsa (or a
+    # confirmed match) produces a clean [PASS] when a TSA stamp is present.
     nb = _journal(tmp_path)
     _run(str(nb), "--no-sign", "-o", str(tmp_path), "--manifest-type", "json")
     mf = sorted(tmp_path.glob("hashes-*.json"))[-1]
@@ -437,6 +440,23 @@ def test_verify_tsa_no_cert_given_still_passes(tmp_path):
     mf.write_text(json.dumps(doc))
 
     r = _run(str(nb), "--verify", str(mf), "--no-sign")
+    assert r.returncode == 1
+    assert "[PASS]" not in r.stdout
+    assert "Verification completed with issues" in r.stdout
+    assert "TSA timestamp could not be verified" in r.stdout
+
+
+def test_verify_tsa_ignore_tsa_still_passes(tmp_path):
+    # --ignore-tsa is the one way to get a clean PASS with an unconfirmed
+    # TSA stamp present -- an explicit, deliberate opt-out.
+    nb = _journal(tmp_path)
+    _run(str(nb), "--no-sign", "-o", str(tmp_path), "--manifest-type", "json")
+    mf = sorted(tmp_path.glob("hashes-*.json"))[-1]
+    doc = json.loads(mf.read_text())
+    doc["tsa_stamp"] = {"tsa": "http://x", "time": "t", "token_b64": "Zm9v"}
+    mf.write_text(json.dumps(doc))
+
+    r = _run(str(nb), "--verify", str(mf), "--no-sign", "--ignore-tsa")
     assert r.returncode == 0
     assert "[PASS]" in r.stdout
 
