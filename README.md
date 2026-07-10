@@ -810,6 +810,8 @@ Before each signing or verification, the key's **fingerprint randomart** is show
 
 ## Trusted Timestamping (RFC 3161)
 
+> **⚠ EXPERIMENTAL.** `--tsa` is new, and live testing against real Timestamp Authorities has found real (if narrow) verification gaps — see [Backend](#backend-openssl-or-rfc3161ng) below for exactly what's confirmed working and what isn't yet. The tool prints a warning whenever `--tsa` or a `--tsa-cert` check runs.
+
 A signature proves *who* vouched for a manifest; a **trusted timestamp** proves *when* it existed. `--tsa` sends the manifest's hash (never its contents) to a Timestamp Authority, which returns a signed token binding that hash to a UTC time. Anyone can later verify — **fully offline** — that the manifest existed at or before that moment, which defeats back-dating even by the manifest's own author.
 
 **Network policy.** The tool is offline by default and this feature is **strictly opt-in**: the timestamp *request* at create time is the only network operation in the entire tool, it announces itself (`[INFO] Requesting timestamp from <url>`), makes a single POST with a fixed timeout and no retries, and never runs unless you pass `--tsa`. Token *verification* is local (`openssl ts -verify`). Pass `--offline` to make the no-network guarantee explicit in the command itself.
@@ -883,9 +885,20 @@ openssl ts -verify -data hashes-20260703T000000Z.txt \
 
 `--tsa` needs a way to build and check RFC 3161 requests. **`openssl` is tried first** (widely available on Linux/macOS, and well field-tested); if it isn't on PATH — as on a stock Windows machine, which ships no openssl — the optional **`rfc3161ng`** Python package is used instead (`pip install rfc3161ng`, or `--install-opt`). Nothing else about `--tsa` changes based on the backend.
 
-> **The `rfc3161ng` backend is newer and less battle-tested than the openssl path.** If you have openssl available, that's the more proven route. Before relying on the library backend for something that matters, do one real request-and-verify round trip (e.g. against `freetsa`) to confirm it works on your machine.
->
-> **Known limitation: EC-signed tokens.** The `rfc3161ng` library's own signature-check call always assumes an RSA key; a token signed with an EC key (some TSAs, including FreeTSA's, use one) can't have its cryptographic signature checked by this backend and verifies as `[WARN] TSA timestamp inconclusive`, not a false pass. This does **not** weaken tamper detection — the message-imprint check (does this token actually match this data?) runs first and is unaffected by key type, so a genuinely mismatched/tampered token is still correctly reported as `[FAIL]`. Only full cryptographic non-repudiation (proving *who* signed it) is unavailable for EC-signed tokens on this backend; `openssl`, when available, is unaffected by this limitation.
+**Status as of live testing (2026-07-10):**
+
+| | Request (create) | Verify (`--tsa-cert`) |
+|---|---|---|
+| `openssl` | ✅ Not yet independently live-tested, but the standard, mature path | ✅ No known issues |
+| `rfc3161ng` | ✅ Confirmed working against freeTSA, Apple, and DigiCert | ⚠️ Mixed — see below |
+
+The `rfc3161ng` verify path has two **confirmed** false-negative bugs, both found against real tokens from real TSAs, not synthetic test data:
+- An **EC-signed token** (e.g. freeTSA's) crashes the library's hardcoded-RSA signature check — caught and reported as `[WARN] ... inconclusive`, never a false pass or false tamper report.
+- A **legacy SHA-1-signed token** (Apple's TSA, whose signing cert dates to 2012) raises `InvalidSignature` in the library despite being independently proven cryptographically valid (cross-checked with real `openssl cms -verify -noverify`). This one is more serious: it currently surfaces as `[FAIL] TSA timestamp failed` — a false *tampering* report for a legitimate token — rather than a safe "inconclusive."
+
+Against that, a **modern SHA-256/RSA-4096 token (DigiCert) verified cleanly** through the same `rfc3161ng` code path with no issues. So the gap looks narrow — legacy/uncommon signing conventions, not the library broadly — but the exact root cause of the Apple case isn't pinned down yet (ruled out so far: SHA-1 OID resolution, CMS attribute re-encoding, signature-length mismatch — all correct). Until that's resolved, treat any `rfc3161ng`-backend `[FAIL]` as worth double-checking with `openssl` externally before concluding a manifest was tampered with. `openssl`, when available, has shown no equivalent issues.
+
+Note that for EC-signed tokens specifically, tamper detection itself is unaffected: the message-imprint check (does this token actually match this data?) runs *before* the broken signature step and is unaffected by key type, so a genuinely mismatched/tampered token is still correctly reported as `[FAIL]`. Only the SHA-1 case has shown a false-tampering report for a legitimate token — see above.
 
 ---
 
