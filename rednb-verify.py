@@ -3089,6 +3089,8 @@ supported hash algorithms:
             _err("--tsa is a create-time flag; to check a token during --verify, "
                  "pass --tsa-cert CAFILE (or --ignore-tsa to skip).")
             sys.exit(2)
+        _warn("--tsa is an EXPERIMENTAL feature (network + a new code path). "
+              "See README 'Trusted Timestamping' for what's been tested so far.")
         # openssl-or-library availability is enforced by preflight_dependencies().
         tsa_url = resolve_tsa(args.tsa)
 
@@ -3564,6 +3566,17 @@ supported hash algorithms:
                       "timestamp not cryptographically verified")
                 issues.append(f"TSA certificate not provided ({', '.join(_tsa_labels)})")
             else:
+                if not openssl_available():
+                    # Only the rfc3161ng fallback has shown issues so far; openssl
+                    # itself has no known problems, so don't alarm users who have it.
+                    _warn("--tsa-cert verification is EXPERIMENTAL on this backend "
+                          "(rfc3161ng, used because openssl isn't on PATH). Testing "
+                          "found real false-negative results for EC-signed and at "
+                          "least one legacy SHA-1-signed token — a [FAIL] here is "
+                          "not yet fully trustworthy for those cases. Modern SHA-256/"
+                          "RSA tokens have verified correctly in testing. See README "
+                          "'Trusted Timestamping'.")
+
                 def _check_tsa(label: str, data: bytes, tsr: bytes, extra: str = "") -> None:
                     nonlocal tsa_failed
                     result = tsa_verify_data(data, tsr, args.tsa_cert)

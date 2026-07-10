@@ -1072,3 +1072,47 @@ JSON's insertion-order-preserving serialisation needed this fix.
   openssl binary from the subprocess env (this machine has TWO: Git's
   `mingw64\bin` and `usr\bin` — `shutil.which()` only finds the first, so
   the test scans every PATH entry directly rather than trusting `which`).
+
+## --tsa marked EXPERIMENTAL (both create and verify) + DigiCert data point
+
+- User: given two live-testing rounds found real rfc3161ng bugs (EC crash,
+  Apple SHA-1 false InvalidSignature) with no fully-clean round trip found
+  yet, `--tsa` should be labeled experimental at the code level, not just a
+  README aside.
+- `[WARN] --tsa is an EXPERIMENTAL feature ...` printed unconditionally at
+  create time whenever `--tsa` resolves (right after `resolve_tsa()`).
+- `[WARN] --tsa-cert verification is EXPERIMENTAL on this backend
+  (rfc3161ng, ...)` printed at verify time, but ONLY when `not
+  openssl_available()` — openssl has shown no equivalent issues in testing,
+  so don't alarm users who have it. Message enumerates the two confirmed
+  bug classes (EC, legacy SHA-1) and notes modern SHA-256/RSA tokens have
+  verified correctly.
+- Both use `_warn()`, an em-dash character — confirmed encodable in cp1252
+  (unlike the braille spinner glyphs fixed earlier this session) and
+  already used 73× elsewhere in the file without issue on Windows, so no
+  new encoding-crash risk introduced.
+
+### DigiCert data point (incidental, from testing the warning itself)
+
+A `--tsa digicert` smoke-test request (real network call, side effect of
+verifying the new warning text) produced a token whose cert is:
+```
+Subject: CN=DigiCert SHA256 RSA4096 Timestamp Responder 2025 1
+Issuer : CN=DigiCert Trusted G4 TimeStamping RSA4096 SHA256 2025 CA1
+Key type: RSA 4096-bit
+CMS digestAlgorithm OID: 2.16.840.1.101.3.4.2.1 (sha256)
+```
+Running `rfc3161ng.check_timestamp(tst, certificate=b"", data=manifest_bytes,
+hashname="sha256")` against this token returned **`True`** — the first
+fully-clean library-backend self-signature check seen in testing. This
+narrows the earlier finding meaningfully: the gap looks specific to
+EC-signed and/or legacy-SHA-1-signed tokens, not the library broadly.
+Modern SHA-256/RSA setups (DigiCert here) verify correctly. Root cause of
+the Apple SHA-1 case is still not pinned down (see the "Bugs found via live
+testing" section above); this doesn't change the deferred decision, just
+sharpens what the experimental warning should say.
+
+Next TSA suggested for testing: **sectigo** or **globalsign** (both
+modern/actively-maintained, likely to pattern-match DigiCert's clean
+result) — would further confirm "legacy signing conventions" as the actual
+boundary rather than "TSA vendor" being the relevant variable.

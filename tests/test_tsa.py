@@ -558,3 +558,32 @@ def test_lib_verify_passes_certificate_bstring_not_none(tool, tmp_path, monkeypa
     ca_file = _throwaway_pem_cert(tmp_path)
     tool._lib_verify(b"root-value", b"fake-tsr-bytes", ca_file)
     assert seen["certificate"] == b""
+
+
+# ---- --tsa marked experimental (two live testing rounds found real, if
+# narrow, reliability gaps in the rfc3161ng fallback backend) ----
+
+def test_cli_create_tsa_prints_experimental_warning(tmp_path):
+    nb = _journal(tmp_path)
+    r = _run(str(nb), "--no-sign", "--tsa", _DEAD_TSA, "-o", str(tmp_path), input="")
+    assert "EXPERIMENTAL" in r.stdout
+
+
+def test_cli_verify_tsa_check_prints_experimental_warning_without_openssl(tmp_path):
+    nb, mf = _create_with_fake_stamp(tmp_path)
+    ca = _throwaway_pem_cert(tmp_path)
+    r = _run(str(nb), "--verify", str(mf), "--no-sign", "--tsa-cert", str(ca),
+             env=_env_without_openssl())
+    assert "EXPERIMENTAL" in r.stdout
+
+
+def test_verify_experimental_warning_skipped_when_openssl_available(tool, tmp_path):
+    if not tool.openssl_available():
+        pytest.skip("openssl not installed")
+    # Only the rfc3161ng fallback has shown issues -- don't alarm users who
+    # have openssl, which has no known problems in testing so far. Run
+    # WITHOUT stripping PATH so openssl (present on this dev machine) is used.
+    nb, mf = _create_with_fake_stamp(tmp_path)
+    ca = _throwaway_pem_cert(tmp_path)
+    r = _run(str(nb), "--verify", str(mf), "--no-sign", "--tsa-cert", str(ca))
+    assert "EXPERIMENTAL" not in r.stdout
