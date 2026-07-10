@@ -711,20 +711,38 @@ The **manifest's own self-declaration** drives whether a signature is required:
 - Text manifests store each stamp as an inline-JSON header line
   (`tsa_stamp: {...}`); `_parse_text_manifest` json.loads it back.
 
-### Verify semantics
-- Detached `.tsr` and embedded stamps are checked when present:
-  - no backend (openssl AND rfc3161ng both absent) → `[WARN] ... no backend` (skip)
-  - no `--tsa-cert` → `[WARN] ... not cryptographically verified` (skip)
+### Verify semantics (REVISED per live-testing feedback — see below)
+- Detached `.tsr` and embedded stamps are checked when present and not
+  `--ignore-tsa`'d:
+  - no backend (openssl AND rfc3161ng both absent) → `[WARN] ... no backend`
+    AND appends to `issues` (does NOT skip silently any more — see below).
+  - no `--tsa-cert` → `[WARN] ... not cryptographically verified` AND
+    appends to `issues` (also no longer skips silently).
   - with `--tsa-cert`: `tsa_verify_data` returns True/False/None (tri-state —
     None = inconclusive, e.g. library-backend decode issue) →
-    `[OK] TSA timestamp verified: ...` / `[FAIL] ... failed: ...` (→ hard_fail,
-    exit 1) / `[WARN] ... inconclusive: ...` (skip, exit unaffected).
+    `[OK] TSA timestamp verified: ...` / `[FAIL] ... failed: ...` (→
+    hard_fail, exit 1) / `[WARN] ... inconclusive: ...` + appends to
+    `issues` (exit 1 via the issues path, not a silent skip).
+- **Revision (live-testing feedback, same day as the fix below)**: the
+  no-cert and no-backend branches originally only warned and let
+  verification still read as `[PASS]` — user flagged this directly after
+  seeing it live: an unconfirmed TSA claim that was neither ignored nor
+  actually checked should not produce a clean pass. `_tsa_labels =
+  ([_tsr_path.name] if present) + list(_embedded)` built once up front so
+  both branches can name which stamp(s) are affected in the issue message:
+  `"TSA timestamp could not be verified (tsa_stamp)"`. Net effect: ANY
+  present, non-ignored TSA claim now requires either a successful
+  `--tsa-cert` check or `--ignore-tsa` to reach `[PASS]` — there is no more
+  "silently unconfirmed but still passes" state.
 - A `tsa_*` field holding the literal string `"failed"` (see below) prints
   `[WARN] Timestamp was not applied (...: failed) — add one later with --resign`
-  and is NOT treated as a verification failure.
+  and is NOT treated as a verification failure (this one stays a soft skip —
+  it's an honestly-recorded failed *attempt*, not an unconfirmed claim).
 - Embedded checks use the manifest's STORED roots (the token authenticates the
   manifest's claim; integrity checks separately tie disk state to manifest).
-- `--ignore-tsa` skips everything with `[WARN] Flag --ignore-tsa in use`.
+- `--ignore-tsa` is now the ONLY way to reach `[PASS]` with an unconfirmed TSA
+  claim present — prints `[WARN] Flag --ignore-tsa in use`, contributes
+  nothing to `issues`.
 
 ### Failure at create (revised — preserve the hashing work)
 - Embed mode: a failed stamp writes the literal string `"failed"` into that

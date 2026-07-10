@@ -3544,6 +3544,7 @@ supported hash algorithms:
         _tsa_present = _tsr_path.exists() or bool(_embedded)
         for _f in _failed_markers:
             _warn(f"Timestamp was not applied ({_f}: failed) — add one later with --resign")
+        _tsa_labels = ([_tsr_path.name] if _tsr_path.exists() else []) + list(_embedded)
         if args.ignore_tsa:
             if _tsa_present:
                 _warn("Flag --ignore-tsa in use")
@@ -3551,9 +3552,14 @@ supported hash algorithms:
             if not tsa_backend_available():
                 _warn("TSA timestamp present but no backend (openssl / rfc3161ng) — "
                       "timestamp not verified")
+                issues.append(f"TSA timestamp could not be verified ({', '.join(_tsa_labels)})")
             elif args.tsa_cert is None:
+                # A TSA claim exists and wasn't ignored -- leaving it unconfirmed
+                # would let verification silently read as successful even though
+                # part of what the manifest asserts was never checked.
                 _warn("TSA timestamp present but no --tsa-cert given — "
                       "timestamp not cryptographically verified")
+                issues.append(f"TSA timestamp could not be verified ({', '.join(_tsa_labels)})")
             else:
                 def _check_tsa(label: str, data: bytes, tsr: bytes, extra: str = "") -> None:
                     nonlocal tsa_failed
