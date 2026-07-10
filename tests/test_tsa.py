@@ -270,6 +270,8 @@ def test_verify_no_backend_is_none(tool, tmp_path, monkeypatch):
     assert tool.tsa_verify_data(b"d", b"t", tmp_path / "ca.pem") is None
 
 
+
+
 # ---- failure handling: preserve the hashing, mark 'failed' ----
 
 def test_embed_failure_marks_failed(tool, tmp_path, monkeypatch):
@@ -443,7 +445,7 @@ def test_verify_tsa_no_cert_given_also_blocks_pass(tmp_path):
     assert r.returncode == 1
     assert "[PASS]" not in r.stdout
     assert "Verification completed with issues" in r.stdout
-    assert "TSA timestamp could not be verified" in r.stdout
+    assert "TSA certificate not provided" in r.stdout
 
 
 def test_verify_tsa_ignore_tsa_still_passes(tmp_path):

@@ -3552,14 +3552,17 @@ supported hash algorithms:
             if not tsa_backend_available():
                 _warn("TSA timestamp present but no backend (openssl / rfc3161ng) — "
                       "timestamp not verified")
-                issues.append(f"TSA timestamp could not be verified ({', '.join(_tsa_labels)})")
+                issues.append(f"TSA backend not available ({', '.join(_tsa_labels)})")
             elif args.tsa_cert is None:
                 # A TSA claim exists and wasn't ignored -- leaving it unconfirmed
                 # would let verification silently read as successful even though
-                # part of what the manifest asserts was never checked.
+                # part of what the manifest asserts was never checked. Distinct
+                # reason text from the "checked but inconclusive" case below: we
+                # never had the material to check at all, so "not verified"
+                # would overstate that an attempt was even made.
                 _warn("TSA timestamp present but no --tsa-cert given — "
                       "timestamp not cryptographically verified")
-                issues.append(f"TSA timestamp could not be verified ({', '.join(_tsa_labels)})")
+                issues.append(f"TSA certificate not provided ({', '.join(_tsa_labels)})")
             else:
                 def _check_tsa(label: str, data: bytes, tsr: bytes, extra: str = "") -> None:
                     nonlocal tsa_failed
