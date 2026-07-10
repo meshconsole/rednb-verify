@@ -553,11 +553,12 @@ After writing the report, `--verify` prints a single terminal verdict:
 | `[WARN] Symlinks Present` | The manifest records symbolic links — review the symlink table | — |
 | `[WARN] Symlink points outside the notebook: …` | A symlink's target resolves outside the base directory (data pulled in from elsewhere; a repointing surface). Also printed at create | — |
 | `[WARN] Missing Algorithms: blake3 …` | The manifest uses a hash this build cannot compute (verification can't be completed) | `1` |
-| `[FAIL] Verification completed with issues: …` | Hashes are intact, but something the manifest asserts couldn't be confirmed — an implied signature with none verified, or (see below) any unconfirmed TSA claim. Lists the specific reason(s) | `1` |
+| `[FAIL] Verification completed with issues: …` | Hashes are intact, but something the manifest asserts couldn't be confirmed. Lists the specific reason(s) — `manifest implies a signature, but none could be verified`, `TSA certificate not provided (…)`, `TSA backend not available (…)`, or `TSA timestamp could not be verified (…)`; see the TSA rows below for which is which | `1` |
 | `[OK] TSA timestamp verified: …` | An RFC 3161 token (detached `.tsr` or embedded stamp) verified against `--tsa-cert` | — |
 | `[FAIL] TSA timestamp failed: …` | A timestamp token did not verify (tampering or wrong CA) | `1` |
-| `[WARN] TSA timestamp present but no --tsa-cert given …` | A token exists but can't be cryptographically checked without the TSA's CA certificate — also contributes to `[FAIL] Verification completed with issues` (a TSA claim that's never actually checked shouldn't silently read as a pass) | `1` |
-| `[WARN] TSA timestamp inconclusive: …` | `--tsa-cert` **was** given but the token could not be confirmed either way (e.g. a known backend limitation — see [Backend](#backend-openssl-or-rfc3161ng)). Also contributes to `[FAIL] Verification completed with issues` | `1` |
+| `[WARN] TSA timestamp present but no --tsa-cert given …` | A token exists but no `--tsa-cert` was given, so nothing was even attempted — reason `TSA certificate not provided`. Also contributes to `[FAIL] Verification completed with issues` (an unchecked TSA claim shouldn't silently read as a pass) | `1` |
+| `[WARN] TSA timestamp present but no backend …` | Neither `openssl` nor `rfc3161ng` is available, so the check couldn't even be attempted — reason `TSA backend not available`. Also contributes to `[FAIL] Verification completed with issues` | `1` |
+| `[WARN] TSA timestamp inconclusive: …` | `--tsa-cert` **was** given and a check WAS attempted, but the result couldn't be confirmed either way (e.g. a known backend limitation — see [Backend](#backend-openssl-or-rfc3161ng)) — reason `TSA timestamp could not be verified`. Also contributes to `[FAIL] Verification completed with issues` | `1` |
 
 **Integrity vs. authenticity.** Plain `--verify` checks *both* that files are unchanged **and** — when the manifest implies it is signed — that a valid signature establishes authenticity. How a manifest verifies depends on what it declares about itself:
 

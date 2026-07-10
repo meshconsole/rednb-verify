@@ -729,11 +729,24 @@ The **manifest's own self-declaration** drives whether a signature is required:
   seeing it live: an unconfirmed TSA claim that was neither ignored nor
   actually checked should not produce a clean pass. `_tsa_labels =
   ([_tsr_path.name] if present) + list(_embedded)` built once up front so
-  both branches can name which stamp(s) are affected in the issue message:
-  `"TSA timestamp could not be verified (tsa_stamp)"`. Net effect: ANY
-  present, non-ignored TSA claim now requires either a successful
-  `--tsa-cert` check or `--ignore-tsa` to reach `[PASS]` — there is no more
-  "silently unconfirmed but still passes" state.
+  each branch can name which stamp(s) are affected. Net effect: ANY present,
+  non-ignored TSA claim now requires either a successful `--tsa-cert` check
+  or `--ignore-tsa` to reach `[PASS]` — there is no more "silently
+  unconfirmed but still passes" state.
+- **Three DISTINCT issue-reason strings** (a follow-up correction — the
+  first pass reused one generic string for all three, which the user caught
+  as misleading: "could not be verified" implies an attempt was made, which
+  isn't true for the first two):
+  - no backend at all → `"TSA backend not available (<labels>)"` — nothing
+    could even be attempted.
+  - no `--tsa-cert` given → `"TSA certificate not provided (<labels>)"` —
+    a backend exists but had nothing to check against.
+  - `--tsa-cert` given, checked, result inconclusive → `"TSA timestamp
+    could not be verified (<label>)"` — this phrasing IS accurate here,
+    since a check genuinely ran.
+  A confirmed bad token (`result is False`) is unaffected by any of this —
+  it already went through the separate `tsa_failed`/hard_fail path with its
+  own `[FAIL] TSA timestamp failed: <label>` message.
 - A `tsa_*` field holding the literal string `"failed"` (see below) prints
   `[WARN] Timestamp was not applied (...: failed) — add one later with --resign`
   and is NOT treated as a verification failure (this one stays a soft skip —
