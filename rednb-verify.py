@@ -104,6 +104,13 @@ VERSION = "0.11.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
+# Default parallel hashing workers: leave a couple of cores free for the OS
+# and whatever else the user is doing, rather than defaulting to fully
+# sequential. Floored at 1 so a 1-2 core machine (a budget laptop, a
+# container, a VPS) never computes 0 or negative workers. cpu_count() can
+# return None in some sandboxed environments, hence the "or 1".
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) - 2)
+
 # Manifest structural contract. Separate from VERSION (build identifier).
 # Bump only on a BREAKING structural change (renamed/removed/retyped field),
 # never for an optional addition. Manifests without this field = version 0.
@@ -353,6 +360,77 @@ def utc_timestamp() -> str:
 def _now_stamp() -> str:
     """Human-readable UTC stamp for per-file verbose log lines."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- Hashing progress bar (normal mode only) ----------
+# A hand-rolled \r-overwrite bar (no tqdm/rich dependency) shown ONLY in
+# normal mode: --verbose already gives full per-file lines and shouldn't also
+# fight the bar for the same terminal line; --quiet stays fully silent;
+# --json keeps stdout pipe-clean; a non-TTY (piped/redirected) run gets no
+# escape codes, mirroring _tag()'s own TTY check.
+
+_SPINNER_FRAMES_BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_SPINNER_FRAMES_ASCII = ["|", "/", "-", "\\"]
+_spinner_frames_cache: Optional[List[str]] = None
+
+
+def _spinner_frames() -> List[str]:
+    """Braille spinner when the terminal's encoding can render it, else a
+    plain ASCII fallback. Windows consoles commonly default to cp1252, which
+    cannot encode these characters at all — printing them unconditionally
+    would crash the tool with a UnicodeEncodeError the first time the
+    progress bar ticks, not just render oddly. Checked once and cached."""
+    global _spinner_frames_cache
+    if _spinner_frames_cache is None:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            "".join(_SPINNER_FRAMES_BRAILLE).encode(encoding)
+            _spinner_frames_cache = _SPINNER_FRAMES_BRAILLE
+        except (UnicodeEncodeError, LookupError):
+            _spinner_frames_cache = _SPINNER_FRAMES_ASCII
+    return _spinner_frames_cache
+
+
+def _progress_active() -> bool:
+    return not _quiet and not _verbose and not _json_mode and sys.stdout.isatty()
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Milliseconds while under 1s (finer-grained, matches short hash times),
+    seconds with one decimal once elapsed reaches a full second."""
+    ms = seconds * 1000
+    if ms < 1000:
+        return f"{ms:.0f}ms"
+    return f"{seconds:.1f}s"
+
+
+def _progress_tick(done: int, total: int, phase_start: float) -> None:
+    """Redraw the hashing progress line in place. `done` also drives the
+    spinner frame, so it advances once per completed file rather than on a
+    separate wall-clock timer — simple, thread-safe, and proportional to
+    real progress (a single very large file just holds its frame until done)."""
+    if not _progress_active():
+        return
+    frames = _spinner_frames()
+    spinner = frames[done % len(frames)]
+    pct = round((done / total) * 100) if total else 100
+    elapsed = _format_elapsed(time.perf_counter() - phase_start)
+    text = f"{spinner} Hashing... {done}/{total} files ({pct}%) [Time Elapsed: {elapsed}]"
+    try:
+        sys.stdout.write("\r\x1b[2K" + text)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # Last-resort guard: the cached frame set already matches the
+        # encoding at cache time, but stdout can be reconfigured mid-run in
+        # rare cases. Never let a cosmetic progress update crash the tool.
+        pass
+
+
+def _progress_clear() -> None:
+    """Erase the progress line so the next normal print() starts fresh."""
+    if _progress_active():
+        sys.stdout.write("\r\x1b[2K")
+        sys.stdout.flush()
 
 
 def hash_file(path: Path, algo_spec: str) -> str:
@@ -1479,6 +1557,7 @@ def collect_files(
     in a single read pass (multi mode); a single-spec list yields a one-key dict.
     """
     exclude = exclude or []
+    _info("Counting files...")
 
     # Gather candidate paths first (always sequential — os.walk is not thread-safe)
     paths_to_hash: List[tuple] = []
@@ -1499,6 +1578,8 @@ def collect_files(
 
     files: Dict[str, Dict[str, str]] = {}
     total = len(paths_to_hash)
+    _ok(f"{total} files to hash")
+    phase_start = time.perf_counter()
 
     if jobs == 1:
         for i, (path, rel_str) in enumerate(paths_to_hash, 1):
@@ -1509,34 +1590,41 @@ def collect_files(
                 if _verbose:
                     _vprint(f"{_tag('FAIL', stream=_log_stream())} {i}/{total} "
                             f"{rel_str} {_now_stamp()}")
+                _progress_clear()
                 raise
             if _verbose:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 _vprint(f"{_tag('OK', stream=_log_stream())} {i}/{total} {rel_str} "
                         f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
+            _progress_tick(i, total, phase_start)
     else:
         _lock = threading.Lock()
         _done = 0  # count of files completed so far, in COMPLETION order (not
                    # submission order, since parallel jobs finish out of order)
 
         def _hash_one(path: Path, rel_str: str) -> tuple:
+            # _done increments and both the verbose line and the progress-bar
+            # redraw happen under the SAME lock, so concurrent threads never
+            # interleave writes to the same terminal line.
             nonlocal _done
             t0 = time.perf_counter()
             try:
                 h = hash_file_multi(path, algos)
             except OSError:
-                if _verbose:
-                    with _lock:
-                        _done += 1
-                        _vprint(f"{_tag('FAIL', stream=_log_stream())} {_done}/{total} "
-                                f"{rel_str} {_now_stamp()}")
-                raise
-            if _verbose:
-                elapsed_ms = (time.perf_counter() - t0) * 1000
                 with _lock:
                     _done += 1
+                    if _verbose:
+                        _vprint(f"{_tag('FAIL', stream=_log_stream())} {_done}/{total} "
+                                f"{rel_str} {_now_stamp()}")
+                    _progress_clear()
+                raise
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            with _lock:
+                _done += 1
+                if _verbose:
                     _vprint(f"{_tag('OK', stream=_log_stream())} {_done}/{total} {rel_str} "
                             f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
+                _progress_tick(_done, total, phase_start)
             return rel_str, h
 
         max_workers = jobs if jobs > 0 else None
@@ -1546,6 +1634,7 @@ def collect_files(
                 rel_str, h = future.result()
                 files[rel_str] = h
 
+    _progress_clear()
     return dict(sorted(files.items()))
 
 
@@ -1657,6 +1746,7 @@ def collect_files_per_day(
     """
     yaml = _require_yaml()
     exclude = exclude or []
+    _info("Counting files...")
 
     # Collect all (day_key, day_data) pairs from every month file
     entries: List[tuple] = []
@@ -1680,6 +1770,8 @@ def collect_files_per_day(
 
     files: Dict[str, Dict[str, str]] = {}
     total = len(entries)
+    _ok(f"{total} files to hash")
+    phase_start = time.perf_counter()
 
     def _hash_day(day_key: str, day_data) -> tuple:
         # Canonicalise: dicts → sorted JSON; plain strings kept as-is
@@ -1699,18 +1791,22 @@ def collect_files_per_day(
             if _verbose:
                 _vprint(f"{_tag('OK', stream=_log_stream())} {i}/{total} {key} "
                         f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
+            _progress_tick(i, total, phase_start)
     else:
         _lock = threading.Lock()
         _done = 0  # completion order, same rationale as collect_files
 
         def _hash_day_parallel(day_key: str, day_data) -> tuple:
+            # _done, the verbose line, and the progress redraw all happen
+            # under the SAME lock -- see collect_files for why.
             nonlocal _done
             key, digests, elapsed_ms = _hash_day(day_key, day_data)
-            if _verbose:
-                with _lock:
-                    _done += 1
+            with _lock:
+                _done += 1
+                if _verbose:
                     _vprint(f"{_tag('OK', stream=_log_stream())} {_done}/{total} {key} "
                             f"{_now_stamp()} ({elapsed_ms:.2f}ms)")
+                _progress_tick(_done, total, phase_start)
             return key, digests
 
         max_workers = jobs if jobs > 0 else None
@@ -1719,6 +1815,8 @@ def collect_files_per_day(
             for future in as_completed(futures):
                 key, digests = future.result()
                 files[key] = digests
+
+    _progress_clear()
 
     return dict(sorted(files.items()))
 
@@ -2875,8 +2973,9 @@ supported hash algorithms:
                         help="Exclude files matching glob pattern (repeatable)")
     parser.add_argument("--exclude-from", type=Path, default=None, metavar="FILE",
                         help="File of glob patterns to exclude (one literal pattern per line)")
-    parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
-                        help="Parallel hashing workers (0 = auto, default: 1)")
+    parser.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="N",
+                        help="Parallel hashing workers (0 = auto/all cores; "
+                             f"default: max(1, cores-2) = {DEFAULT_JOBS} on this machine)")
     parser.add_argument("-D", "--per-day", action="store_true",
                         help="Hash individual day entries within month files (requires PyYAML)")
     parser.add_argument("--no-config", "--no-cf", action="store_true", dest="no_config",

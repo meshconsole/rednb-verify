@@ -24,6 +24,7 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Modes](#modes)
 - [Verification Report](#verification-report)
 - [Exit Codes](#exit-codes)
+- [Hashing Progress](#hashing-progress)
 - [Multi-Hashing](#multi-hashing)
 - [Merkle Tree](#merkle-tree)
 - [Move detection](#move-detection)
@@ -138,7 +139,7 @@ Run the tool against a directory to hash its contents and write a manifest.
 | `notebook_dir` | Path to the RedNotebook journal (or any directory) to hash (optional if `dir` is saved in config) |
 | `-m`, `--month-only` | Hash only `YYYY-MM.txt` month files (skip attachments, config, etc.) |
 | `-D`, `--per-day` | Hash individual day entries within month files; manifest path format `YYYY-MM/DD`. Combine with `--month-only` to control whether non-month files are also included (requires `pyyaml`) |
-| `-j N`, `--jobs N` | Parallel hashing workers (`0` = auto via `os.cpu_count()`; default: `1`) |
+| `-j N`, `--jobs N` | Parallel hashing workers. `0` = auto (all cores, via the thread pool's own default). Default: `max(1, cores - 2)` — leaves headroom for the OS and whatever else you're doing, floored at `1` so a 1-2 core machine never computes 0 or fewer workers. Parallelism never changes the manifest's contents (paths are sorted before writing), only speed |
 | `-o`, `--output DIR` | Output directory for the manifest (create), or the report (verify — requires `--report`). Default: parent of the journal directory. With `--verify` it does **not** select which manifest to verify — that's the `--verify` argument |
 | `--manifest-type [txt\|json]` | Manifest file format: `txt` (default) or `json` |
 | `--no-bullets` | In a `txt` manifest, don't prefix per-file hash lines with `- ` (Merkle-root lines are never bulleted) |
@@ -579,6 +580,29 @@ Exit codes always fire regardless of `--quiet`, and security-relevant warnings (
 
 ---
 
+## Hashing Progress
+
+Before hashing, both create and verify print a quick two-line status so a large notebook (or arbitrary directory) never looks like it's hung during the initial scan:
+
+```
+[INFO] Counting files...
+[OK] 214 files to hash
+```
+
+What happens next depends on the mode:
+
+- **Normal mode** (no `--verbose`, no `--quiet`, and stdout is a real terminal) shows a live, self-overwriting progress line:
+  ```
+  ⠹ Hashing... 87/214 files (41%) [Time Elapsed: 2.3s]
+  ```
+  The spinner frame advances once per completed file (not on a wall-clock timer), so it's simple, thread-safe under `--jobs`, and proportional to real progress. Elapsed time shows milliseconds while under a second, then seconds with one decimal. On a terminal whose encoding can't render the spinner glyph (some Windows consoles default to `cp1252`), it automatically falls back to a plain `| / - \` spinner instead — detected once per run, never crashes.
+- **`--verbose`** replaces the bar with one line per file instead: `[OK] 87/214 2026-05.txt 2026-07-10T11:57:37Z (1.34ms)` — more detail, less concise.
+- **`--quiet`** suppresses both the counting lines and the bar entirely.
+- **`--json`** suppresses the bar (stdout must stay pure JSON) but keeps the counting lines on stderr.
+- Piped or redirected output (not a real TTY) never receives the bar's escape codes, regardless of the above — same detection `_tag()` already uses for colour.
+
+---
+
 ## Multi-Hashing
 
 Pass more than one comma-separated algorithm to `--hash` to record several independent hashes per file:
@@ -906,7 +930,7 @@ Every field is optional; an absent field simply falls back to the tool's default
 | `ssh_key` | string (path) | `--ssh FILE` | SSH key to sign with; `~` is expanded |
 | `exclude` | array of strings | `--exclude PATTERN` | Glob patterns excluded from every run |
 | `manifest_age_warn_days` | integer | `--warn-age DAYS` | Warn during `--verify` when the manifest is older than N days |
-| `jobs` | integer | `--jobs N` | Parallel hashing workers (`0` = auto) |
+| `jobs` | integer | `--jobs N` | Parallel hashing workers (`0` = auto; default when unset: `max(1, cores-2)`) |
 | `trust_level` | `"high"` \| `"low"` | `--trust high\|low` | Default trust level; written by `--set-cf trust-level:high` |
 | `dir` | string (path) | *(positional)* | Default notebook directory when none is given; written by `--set-cf dir:...` |
 | `trust.gpg` | array of strings | — | Pinned GPG fingerprints for `--trust high`; written by `--add-trust trust-gpg:...` |
@@ -1006,7 +1030,6 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 ## Planned
 
 - Manifest chaining (each manifest references the previous one, making history tamper-evident)
-- Progress bar in normal (non-verbose) mode — hashing currently shows nothing until it finishes, which reads as a blank/frozen pause on a large notebook
 - Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
 - RedNotebook UI integration
 - **rednb-verify-config** — GUI config editor (desktop app for managing `~/.config/rednb-verify/config.json`, trusted keys, and saved paths without touching the CLI)

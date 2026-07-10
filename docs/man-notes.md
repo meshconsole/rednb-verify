@@ -10,7 +10,7 @@
 
 - Current stable: **0.11.0** (main branch)
 - Manifest schema: **v3** (v2 added RFC 6962 Merkle hardening + symlink table; v3 adds the move-invariant content root)
-- See "Feature 6: RFC 3161 trusted timestamping (v0.11.0)" below for the latest behavior
+- See "Feature 10: progress bar in normal mode" and the TSA bugfix section below for the latest behavior (still on the unreleased v0.11.0 line)
 
 ---
 
@@ -817,7 +817,7 @@ The **manifest's own self-declaration** drives whether a signature is required:
   works off in-memory YAML content already parsed successfully, not a live
   file read, so there's no OSError path analogous to `collect_files`'.
 
-## Planned: progress bar in normal (non-verbose) mode — SPEC CONVERGED, NOT IMPLEMENTED
+## Feature 10: progress bar in normal (non-verbose) mode — ✅ IMPLEMENTED
 
 - User complaint: normal (non-verbose) mode shows nothing at all while
   hashing a large notebook — reads as a frozen/blank pause. `--verbose` is
@@ -872,14 +872,72 @@ does). There is no blank pause there to fix, so nothing changes in that
 part of verify. The progress bar's scope is exactly "counting → hashing";
 everything after hashing in both create and verify is unaffected.
 
-### Constraints to respect when implementing
-Stdlib-only (no hard dependency on `rich`/`tqdm` — see above, not needed
-anyway); must not corrupt `--quiet` (still fully silent) or `--json`/piped
-output (progress-bar `\r` updates must never hit stdout in `--json` mode —
-route to stderr, or disable entirely when not a TTY, mirroring the existing
-`_tag()` TTY-detection pattern); must coexist sensibly with `--verbose`
-(mutually exclusive display modes — verbose already gives full per-file
-detail, the two shouldn't both try to own the same line).
+### Constraints — all respected in the implementation
+Stdlib-only (no hard dependency on `rich`/`tqdm`); does not run under
+`--quiet` (fully silent), `--verbose` (its own per-file lines instead), or
+`--json` (stdout stays pure JSON); disabled entirely on a non-TTY stdout
+(`_progress_active()` checks `sys.stdout.isatty()`, mirroring `_tag()`'s own
+check) so a piped/redirected run never receives escape codes.
+
+### Implementation
+- `_progress_active()` = `not _quiet and not _verbose and not _json_mode and
+  sys.stdout.isatty()` — single gate checked before every tick.
+- `_progress_tick(done, total, phase_start)` writes `\r\x1b[2K` (clear line)
+  + the formatted text, no trailing newline, `flush=True`.
+  `_progress_clear()` writes `\r\x1b[2K` alone so the next normal `print()`
+  (e.g. `[OK] Manifest created: ...`) starts on a clean line — called once
+  after the hashing loop/executor block finishes (and also on the OSError
+  path, before re-raising, so a crash never leaves the terminal mid-line).
+- `_format_elapsed(seconds)`: `f"{ms:.0f}ms"` under 1000ms, else
+  `f"{seconds:.1f}s"`.
+- Spinner frame = `done % len(frames)` — advances once per completed file,
+  not on a wall-clock timer. Deliberate simplification: thread-safe with no
+  extra synchronisation beyond what the completion counter already needed,
+  proportional to real work, at the cost of not animating smoothly during a
+  single very large file's hash (the frame just holds until that file
+  finishes). Flagged as a documented tradeoff, not silently swept under.
+- **Real bug found and fixed before shipping**: the braille spinner
+  (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` — the exact style the user picked from the animated
+  design gallery) is NOT encodable in `cp1252`, which is Windows' default
+  console codepage — printing it unconditionally would `UnicodeEncodeError`
+  crash the tool the moment the bar first ticks, precisely on the target
+  Windows audience. Reproduced directly: `'⠋...'.encode('cp1252')` raises.
+  Fixed with `_spinner_frames()`: tries encoding the braille set against
+  `sys.stdout.encoding` once, falls back to a plain `["|","/","-","\\"]`
+  ASCII spinner on `UnicodeEncodeError`/`LookupError`, caches the result
+  (`_spinner_frames_cache`) so the check runs once per process, not once per
+  tick. `_progress_tick` also wraps its own `write()` in a defensive
+  `try/except UnicodeEncodeError: pass` as a last-resort guard (stdout could
+  theoretically be reconfigured mid-run) — a cosmetic progress update must
+  never be the thing that crashes an integrity tool.
+- **Two-phase counting/hashing**, wired into BOTH `collect_files` (file
+  walk) and `collect_files_per_day` (`--per-day` month-file parse): `_info
+  ("Counting files...")` before enumeration, `_ok(f"{total} files to
+  hash")` right after — plain `_info`/`_ok` calls (existing tiering: shown
+  in normal + verbose, suppressed by `--quiet`), not part of the animated
+  bar itself. `phase_start = time.perf_counter()` recorded right after, so
+  elapsed time reflects the hashing phase only, not the enumeration.
+- **Thread-safety fix caught during implementation, before it shipped**: an
+  early draft of the parallel path incremented the shared `_done` counter
+  under `_lock` but called `_progress_tick` OUTSIDE it — two threads
+  finishing near-simultaneously could interleave their `\r`+text writes to
+  the same terminal line, producing garbled output. Fixed by moving the
+  counter increment, the verbose line, AND the progress tick into one
+  block, all under the same lock (mirrors the existing pattern already used
+  for the verbose fraction feature — see Feature 9).
+- `-j`/`--jobs` default (module constant `DEFAULT_JOBS`): `max(1,
+  (os.cpu_count() or 1) - 2)`, replacing the old static default of `1`
+  (fully sequential). Floored at 1 for 1-2 core machines (budget laptops,
+  containers, VPS — an explicit concern given non-technical users are part
+  of the audience); `os.cpu_count() or 1` guards the rare case it returns
+  `None`. `--jobs 0` (explicit "auto/all cores", via the thread pool's own
+  default sizing) is unchanged. Parallelism was already provably
+  correctness-neutral (`collect_files`/`collect_files_per_day` both
+  `sorted()` their output before returning) — this only changes speed and
+  the (already handled) completion-order verbose numbering, never manifest
+  content. `--help` shows the computed value live (`f"... = {DEFAULT_JOBS}
+  on this machine"`), and a config-file `jobs` value still overrides it
+  exactly as before (`parser.set_defaults` timing unchanged).
 
 ## Bugs found via live testing against a real TSA (freetsa.org) — ✅ FIXED
 
