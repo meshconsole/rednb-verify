@@ -16,6 +16,9 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Quick Start](#quick-start)
 - [What This Tool Is Not](#what-this-tool-is-not)
 - [Non-Repudiation Warning](#non-repudiation-warning-)
+- [Threat Model](#threat-model)
+- [Forensic Considerations](#forensic-considerations)
+- [Design Principles](#design-principles)
 - [Usage](#usage)
   - [Manifest creation](#manifest-creation) · [Signing](#signing) · [Timestamping](#timestamping) · [Verification](#verification) · [Validation](#validation) · [Config management](#config-management) · [Examples](#examples) · [Other](#other)
 - [Missing Dependencies (--install-opt)](#missing-dependencies---install-opt)
@@ -33,9 +36,6 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Trust & Signing](#trust--signing)
 - [Trusted Timestamping (RFC 3161)](#trusted-timestamping-rfc-3161)
 - [Config File](#config-file)
-- [Threat Model](#threat-model)
-- [Forensic Considerations](#forensic-considerations)
-- [Design Principles](#design-principles)
 - [Planned](#planned)
 - [Project Status](#project-status)
 
@@ -121,6 +121,61 @@ By signing, you assert that these files existed in this exact form at or before 
 - If your signing key is compromised, past signatures remain valid
 - Sign only on trusted systems
 - Prefer hardware-backed keys (FIDO2 / smart cards)
+
+---
+
+## Threat Model
+
+### Assets Protected
+- Integrity of RedNotebook entries
+- Trustworthiness of timestamps
+- Authenticity of signed manifests
+
+### Adversaries Considered
+- Curious or careless users
+- Malicious insiders with filesystem access
+- Malware modifying journal files
+- Post-event tampering attempts
+- Attackers without access to signing keys
+
+### Out of Scope
+- Full system compromise
+- Kernel-level attackers
+- Live memory attacks
+- Supply-chain attacks on cryptographic libraries
+
+### Threats Addressed
+- Silent modification of entries
+- Deletion of journal files
+- Rewriting history after the fact
+- Undetected retroactive edits
+
+### Threats Not Fully Prevented
+- Tampering **before** signing
+- Editing on a compromised system
+- Timestamp manipulation at OS level
+- Forged history using stolen signing keys
+
+---
+
+## Forensic Considerations
+
+rednb-verify proves **that** tampering occurred, not **who** did it.
+
+Standard filesystems do not reliably record who edited a file, from which program, or with what intent. `mtime` and `ctime` are not cryptographically trustworthy and can be altered.
+
+True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immutable logs, and mandatory access controls. rednb-verify is intentionally filesystem-agnostic and does not claim attribution beyond integrity proof.
+
+---
+
+## Design Principles
+
+- Single file, minimal dependencies (stdlib only; PyYAML optional for `--per-day`, jsonschema optional for `--validate`)
+- Deterministic output
+- Explicit trust boundaries
+- No hidden metadata
+- Human-inspectable manifests
+- Hardware security encouraged, not required
 
 ---
 
@@ -384,18 +439,18 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
   "merkle_hash": "sha256",
   "merkle_root": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf",
   "content_root": "7b1d8c0a4e6f2391c5a0bb9d4e7f10238acf45e6d9b2c1708f3a6e5d4c2b1a09",
+  "symlink_targets": "hash:sha256",
+  "symlinks": [],
   "files": [
     {
       "path": "2026-05.txt",
       "sha256": "fe2402e74e8d9a317b6469875e3c704ec2b9fa585db1f49c495282f53a3410cf"
     }
-  ],
-  "symlink_targets": "hash:sha256",
-  "symlinks": []
+  ]
 }
 ```
 
-The full JSON structure is described by the published schema — see [Schema & Validation](#schema--validation).
+A signing run also adds a `signed_by` entry, and any advisory (e.g. an unsigned manifest, or a present timestamp) appears under `warnings`; both are omitted above for brevity. The full JSON structure is described by the published schema — see [Schema & Validation](#schema--validation).
 
 **Fields:**
 - `schema_version` — manifest format version (`3`); verifying an older one prints a security warning
@@ -407,6 +462,7 @@ The full JSON structure is described by the published schema — see [Schema & V
 - `created` — full UTC timestamp for machine use
 - `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
 - `symlink_targets` / `symlinks` — symlink recording policy and table (see [Symlinks](#symlinks))
+- `files` — always the **last** key, so the (potentially long) file list never buries the header fields
 
 ---
 
@@ -992,65 +1048,9 @@ Equivalent to running `--set-cf trust-level:high`, `--add-trust trust-gpg:AB12�
 
 ---
 
-## Threat Model
-
-### Assets Protected
-- Integrity of RedNotebook entries
-- Trustworthiness of timestamps
-- Authenticity of signed manifests
-
-### Adversaries Considered
-- Curious or careless users
-- Malicious insiders with filesystem access
-- Malware modifying journal files
-- Post-event tampering attempts
-- Attackers without access to signing keys
-
-### Out of Scope
-- Full system compromise
-- Kernel-level attackers
-- Live memory attacks
-- Supply-chain attacks on cryptographic libraries
-
-### Threats Addressed
-- Silent modification of entries
-- Deletion of journal files
-- Rewriting history after the fact
-- Undetected retroactive edits
-
-### Threats Not Fully Prevented
-- Tampering **before** signing
-- Editing on a compromised system
-- Timestamp manipulation at OS level
-- Forged history using stolen signing keys
-
----
-
-## Forensic Considerations
-
-rednb-verify proves **that** tampering occurred, not **who** did it.
-
-Standard filesystems do not reliably record who edited a file, from which program, or with what intent. `mtime` and `ctime` are not cryptographically trustworthy and can be altered.
-
-True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immutable logs, and mandatory access controls. rednb-verify is intentionally filesystem-agnostic and does not claim attribution beyond integrity proof.
-
----
-
-## Design Principles
-
-- Single file, minimal dependencies (stdlib only; PyYAML optional for `--per-day`, jsonschema optional for `--validate`)
-- Deterministic output
-- Explicit trust boundaries
-- No hidden metadata
-- Human-inspectable manifests
-- Hardware security encouraged, not required
-
----
-
 ## Planned
 
-- Manifest chaining (each manifest references the previous one, making history tamper-evident)
-- Direct FIDO2/CTAP2 integration (hardware signing without SSH key setup)
+- Manifest chaining (each manifest links the previous one by hash, making the *sequence* of manifests tamper-evident) — targeted for 0.12
 - RedNotebook UI integration
 - **rednb-verify-config** — GUI config editor (desktop app for managing `~/.config/rednb-verify/config.json`, trusted keys, and saved paths without touching the CLI)
 
@@ -1059,3 +1059,7 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 ## Project Status
 
 Active development. Review, testing, and cryptographic scrutiny are welcome.
+
+### Successor: writ-vigil
+
+rednb-verify is, and will remain, focused on **RedNotebook journals** — including planned integration with RedNotebook itself. For tamper-evidence over **general files** (any directory, not just journals), that work is moving to **writ-vigil**, a fork that carries this tool's design forward as a general-purpose successor. writ-vigil is in early development; this note will link to it once it's public. rednb-verify stays the right choice for RedNotebook users.
