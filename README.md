@@ -19,6 +19,7 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Threat Model](#threat-model)
 - [Forensic Considerations](#forensic-considerations)
 - [Design Principles](#design-principles)
+- [File Safety](#file-safety)
 - [Usage](#usage)
   - [Manifest creation](#manifest-creation) · [Signing](#signing) · [Timestamping](#timestamping) · [Verification](#verification) · [Validation](#validation) · [Config management](#config-management) · [Examples](#examples) · [Other](#other)
 - [Missing Dependencies (--install-opt)](#missing-dependencies---install-opt)
@@ -176,6 +177,22 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 - No hidden metadata
 - Human-inspectable manifests
 - Hardware security encouraged, not required
+
+---
+
+## File Safety
+
+**rednb-verify never modifies the files it monitors.** Verification is strictly read-only: the verify path only *reads and hashes* your files (and reads symlink targets) — there is no code path that writes to, renames, or deletes a monitored file. Everything the tool writes — the manifest, an optional report, signatures, and timestamp tokens — goes to the **output location you choose** with `-o`, never into your files.
+
+- Keep the output directory **separate** from the directory you are monitoring, so the manifest and reports never mingle with your data.
+- The tool is **tamper-*evidence*, not tamper-*prevention*.** It proves whether files changed; it does not stop a change. Pair it with prevention at the storage/OS layer for defense in depth.
+
+**Recommended hardening (optional, OS-level):**
+- **Store the manifest on write-once or read-only media** — WORM storage, object-lock buckets (e.g. S3 Object Lock), or simply a separate drive — so a compromised system can't rewrite the baseline. This is the strongest protection for the record itself.
+- **Mark the manifest immutable** after creation: `chmod 0444` (any OS), `attrib +R` (Windows), `chattr +i` (Linux, needs root), or `chflags uchg` (macOS).
+- **Run verify as a least-privileged user** that has no write permission on the monitored files — enforcing the read-only property at the OS level, not just by trusting the code.
+
+**Detecting tampering with the *record itself*** is already built in and needs no special storage: **sign** the manifest (GPG/SSH) so it can't be forged, and **timestamp** it (`--tsa`) so it can't be back-dated. A future release adds manifest chaining, making the whole *sequence* of manifests append-only and tamper-evident.
 
 ---
 
