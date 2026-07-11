@@ -1071,13 +1071,35 @@ def show_randomart_gpg(fpr: str) -> None:
 # line. The single network operation is the timestamp REQUEST at create time;
 # verification of a token is fully local (openssl ts -verify against a CA).
 
-TSA_SERVERS: Dict[str, str] = {
-    "digicert":   "http://timestamp.digicert.com",
-    "sectigo":    "http://timestamp.sectigo.com",
-    "globalsign": "http://timestamp.globalsign.com/tsa/r6advanced1",
-    "certum":     "http://time.certum.pl",
-    "apple":      "http://timestamp.apple.com/ts01",
-    "freetsa":    "https://freetsa.org/tsr",
+@dataclass(frozen=True)
+class _TSA:
+    """A known timestamp authority.
+
+    key_type is the signing-key family observed in live testing (2026-07):
+    RSA hosts verify with this tool alone (the bundled rfc3161ng backend);
+    EC hosts require openssl on PATH to verify locally, because rfc3161ng's
+    signature check is RSA-only. ca_url points at the provider's official CA
+    repository so a user can obtain a trust anchor for --tsa-cert (a pointer
+    only — the tool never downloads or bundles these itself).
+    """
+    url: str
+    key_type: str   # "RSA" or "EC"
+    ca_url: str      # official CA/root repository page (pointer, may be "")
+
+
+TSA_SERVERS: Dict[str, _TSA] = {
+    "digicert":   _TSA("http://timestamp.digicert.com", "RSA",
+                       "https://www.digicert.com/kb/digicert-root-certificates.htm"),
+    "sectigo":    _TSA("http://timestamp.sectigo.com", "RSA",
+                       "https://www.sectigo.com/knowledge-base/detail/Sectigo-Root-Certificates"),
+    "globalsign": _TSA("http://timestamp.globalsign.com/tsa/r6advanced1", "RSA",
+                       "https://support.globalsign.com/ca-certificates/root-certificates"),
+    "certum":     _TSA("http://time.certum.pl", "RSA",
+                       "https://www.certum.eu/en/cert_expertise_root_certificates/"),
+    "apple":      _TSA("http://timestamp.apple.com/ts01", "RSA",
+                       "https://www.apple.com/certificateauthority/"),
+    "freetsa":    _TSA("https://freetsa.org/tsr", "EC",
+                       "https://freetsa.org/"),
 }
 
 # Manifest fields that may carry an embedded timestamp entry.
@@ -1100,7 +1122,7 @@ def resolve_tsa(arg: str) -> str:
     always be an explicit user choice.
     """
     if arg.lower() in TSA_SERVERS:
-        return TSA_SERVERS[arg.lower()]
+        return TSA_SERVERS[arg.lower()].url
     if arg.startswith(("http://", "https://")):
         return arg
     _err(f"Unknown TSA {arg!r}. Use --tsa-list for known names, "
@@ -1158,20 +1180,293 @@ def _lib_request(data: bytes, url: str) -> Optional[bytes]:
         return None
 
 
-def _lib_verify(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
+def _find_signer_certificate_der(signed_data) -> Optional[bytes]:
+    """Find the DER bytes of the actual TSA signer certificate inside a CMS
+    `certificates` SET, by matching signerInfo's issuerAndSerialNumber.
+
+    RFC 5652 does not define an order for the `certificates` SET. Some TSAs
+    (e.g. DigiCert, GlobalSign, Certum) happen to send the leaf/signer cert
+    first, which is what rfc3161ng.api.load_certificate()'s default
+    (certificates[0]) silently assumes. Others (Apple, Sectigo) send it
+    root-first — under that ordering, load_certificate() picks the CA's own
+    certificate instead of the signer's, so any signature check against it
+    fails with InvalidSignature even though the token itself is valid. This
+    identifies the real signer the spec-correct way instead of guessing
+    index 0, so the fix works regardless of the order a given TSA uses.
+    Returns None (falls back to the library's own default) if the SET or
+    signerInfo isn't shaped as expected.
+    """
+    try:
+        from pyasn1.codec.der import encoder as der_encoder
+        from cryptography import x509
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        certs = signed_data['certificates']
+        signer_info = signed_data['signerInfos'][0]
+        issuer_and_serial = signer_info['issuerAndSerialNumber']
+        issuer_der = der_encoder.encode(issuer_and_serial['issuer'])
+        serial = int(issuer_and_serial['serialNumber'])
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        for i in range(len(certs)):
+            cert_der = der_encoder.encode(certs[i][0])
+            cert_obj = x509.load_der_x509_certificate(cert_der)
+            if cert_obj.issuer.public_bytes() == issuer_der and cert_obj.serial_number == serial:
+                return cert_der
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _embedded_certs(signed_data) -> list:
+    """All certificates carried inside the token, as cryptography x509 objects.
+    These are the intermediates (and often the root) a TSA bundles so a
+    verifier can build the chain without fetching anything."""
+    from pyasn1.codec.der import encoder as der_encoder
+    from cryptography import x509
+    out = []
+    try:
+        certs = signed_data['certificates']
+    except Exception:  # noqa: BLE001
+        return out
+    for i in range(len(certs)):
+        try:
+            out.append(x509.load_der_x509_certificate(der_encoder.encode(certs[i][0])))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _cert_signed_by(child, parent) -> bool:
+    """True if `parent`'s public key verifies `child`'s signature (i.e. parent
+    issued child). Signature-only: no date/EKU/revocation checks."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
+    try:
+        key = parent.public_key()
+        algo = child.signature_hash_algorithm
+        if isinstance(key, rsa.RSAPublicKey):
+            key.verify(child.signature, child.tbs_certificate_bytes,
+                       padding.PKCS1v15(), algo)
+        elif isinstance(key, ec.EllipticCurvePublicKey):
+            key.verify(child.signature, child.tbs_certificate_bytes, ec.ECDSA(algo))
+        else:
+            return False
+        return True
+    except (InvalidSignature, Exception):  # noqa: BLE001
+        return False
+
+
+def _build_and_verify_chain(leaf, intermediates: list, anchors: list,
+                            max_depth: int = 10) -> bool:
+    """Build a signature chain from `leaf` up through `intermediates` until a
+    certificate is issued by (or equal to) one of the trusted `anchors`.
+
+    This is what lets a user pass a provider's ROOT to --tsa-cert and have it
+    work even when the signer is issued by an intermediate (openssl's -CAfile
+    behaviour). It is deliberately a *signature* chain only — it does NOT do
+    full RFC 5280 path validation (no revocation, no EKU, no validity-period
+    checks; the latter is intentional, since a timestamp must stay verifiable
+    after the signing cert expires). openssl remains the fully-rigorous path.
+    """
+    from cryptography.hazmat.primitives import hashes
+    if not anchors:
+        return False
+    anchor_fps = set()
+    anchor_by_subject: Dict[bytes, list] = {}
+    for a in anchors:
+        try:
+            anchor_fps.add(a.fingerprint(hashes.SHA256()))
+            anchor_by_subject.setdefault(a.subject.public_bytes(), []).append(a)
+        except Exception:  # noqa: BLE001
+            continue
+    inter_by_subject: Dict[bytes, list] = {}
+    for c in intermediates:
+        try:
+            inter_by_subject.setdefault(c.subject.public_bytes(), []).append(c)
+        except Exception:  # noqa: BLE001
+            continue
+
+    current = leaf
+    seen = set()
+    for _ in range(max_depth):
+        try:
+            fp = current.fingerprint(hashes.SHA256())
+        except Exception:  # noqa: BLE001
+            return False
+        # If the current cert is itself a trusted anchor, we're done.
+        if fp in anchor_fps:
+            return True
+        if fp in seen:
+            return False
+        seen.add(fp)
+        issuer_bytes = current.issuer.public_bytes()
+        # Directly issued by a trusted anchor?
+        for a in anchor_by_subject.get(issuer_bytes, []):
+            if _cert_signed_by(current, a):
+                return True
+        # Otherwise step up through an embedded intermediate.
+        nxt = None
+        for c in inter_by_subject.get(issuer_bytes, []):
+            if c.fingerprint(hashes.SHA256()) not in seen and _cert_signed_by(current, c):
+                nxt = c
+                break
+        if nxt is None:
+            return False
+        current = nxt
+    return False
+
+
+def _system_trust_anchors() -> list:
+    """Root certificates from the OS trust store (Windows ROOT store, macOS
+    keychain roots, or the system bundle on Linux), as x509 objects. Returns
+    [] if none can be loaded. No network."""
+    import ssl
+    import warnings
+    from cryptography import x509
+    from cryptography.utils import CryptographyDeprecationWarning
+    anchors = []
+    try:
+        ctx = ssl.create_default_context()
+        for der in ctx.get_ca_certs(binary_form=True):
+            try:
+                # Some real, OS-trusted roots predate RFC 5280 and carry a
+                # non-positive serial number; cryptography warns (not yet a
+                # hard error) when loading these. It's expected noise about a
+                # store we don't control, not something the user can act on —
+                # the per-cert except below already handles the day this
+                # becomes a real exception instead of a warning.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", CryptographyDeprecationWarning)
+                    anchors.append(x509.load_der_x509_certificate(der))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return []
+    return anchors
+
+
+def _fetch_issuers_via_aia(certs: list, timeout: int = 30) -> list:
+    """Follow each cert's Authority Information Access 'caIssuers' URL and
+    download the issuer certificate(s). Network — callers must gate this behind
+    explicit consent (never --offline, never without a prompt). Returns the
+    fetched x509 certs (best effort; failures are skipped silently)."""
+    import urllib.request
+    import urllib.error
+    from cryptography import x509
+    from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
+    fetched = []
+    seen_urls = set()
+    for cert in certs:
+        try:
+            aia = cert.extensions.get_extension_for_oid(
+                ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+        except Exception:  # noqa: BLE001
+            continue
+        for desc in aia:
+            if desc.access_method != AuthorityInformationAccessOID.CA_ISSUERS:
+                continue
+            url = getattr(desc.access_location, "value", None)
+            if not url or not url.startswith(("http://", "https://")) or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read()
+            except (urllib.error.URLError, OSError):
+                continue
+            for loader in (x509.load_der_x509_certificate, x509.load_pem_x509_certificate):
+                try:
+                    fetched.append(loader(body))
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+    return fetched
+
+
+def _signer_key_type(tst) -> Optional[str]:
+    """'RSA' or 'EC' for a token's signer certificate, or None if it can't be
+    determined. Used at create time to tell the user whether this tool alone
+    (rfc3161ng, RSA-only) can later verify the token."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+    try:
+        der = _find_signer_certificate_der(tst.content)
+        if der is None:
+            return None
+        key = x509.load_der_x509_certificate(der).public_key()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(key, rsa.RSAPublicKey):
+        return "RSA"
+    if isinstance(key, ec.EllipticCurvePublicKey):
+        return "EC"
+    return None
+
+
+def _token_key_type(tsr: bytes) -> Optional[str]:
+    """'RSA'/'EC'/None for a raw .tsr's signer. Convenience wrapper that decodes
+    the token first (used where only the token bytes are on hand)."""
+    try:
+        import rfc3161ng
+        tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+        return _signer_key_type(tst)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tsa_keytype_confirm(tsr: bytes, *, assume_yes: bool, quiet: bool) -> bool:
+    """At create time, tell the user whether the just-obtained token can be
+    verified by this tool alone, and — only when it can't (an EC signer with no
+    openssl on PATH) — ask whether to keep it. Returns True to keep, False to
+    drop. Auto-keeps under -y / --quiet / a non-interactive stdin (with the
+    warning still printed, so the record isn't silently lost)."""
+    kt = _token_key_type(tsr)
+    if kt == "RSA":
+        _info("Timestamp signer key: RSA — verifiable by this tool alone at "
+              "--verify (with --tsa-cert <CA>, or omit it to use your system store).")
+        return True
+    if kt == "EC":
+        if openssl_available():
+            _info("Timestamp signer key: EC — verifiable here via openssl.")
+            return True
+        _warn("Timestamp signer key: EC — this tool's built-in backend (rfc3161ng) "
+              "cannot verify EC signatures and openssl isn't on PATH, so you will "
+              "NOT be able to verify this timestamp on this machine (it stays valid "
+              "and verifiable on any host with openssl).")
+        if assume_yes or quiet or not sys.stdin.isatty():
+            return True
+        try:
+            ans = input(f"{_tag('WARN')} Keep this EC timestamp anyway? [Y/n] ")
+        except EOFError:
+            return True
+        return ans.strip().lower() not in ("n", "no")
+    # Undetectable key type (e.g. rfc3161ng not installed): stay silent, keep.
+    return True
+
+
+def _lib_verify(data: bytes, tsr: bytes, ca_file: Optional[Path],
+                *, system_store: bool = False, allow_online: bool = False) -> Optional[bool]:
     """Verify via rfc3161ng: (1) the token's own signature validates over
-    `data` using its embedded certificate, and (2) that embedded certificate
-    was actually issued by the given CA. Both must hold for True. EXPERIMENTAL.
+    `data` using its embedded signer certificate, and (2) that signer chains to
+    a trusted anchor. Both must hold for True. EXPERIMENTAL.
+
+    The trust anchor for step 2 comes from, in order: `ca_file` (a PEM bundle
+    of one or more certs passed as --tsa-cert); else, if `system_store` is set,
+    the OS root store. Step 2 builds the chain through the token's embedded
+    intermediates (via _build_and_verify_chain), so passing a provider's ROOT
+    works even when the signer was issued by an intermediate — matching
+    openssl's -CAfile behaviour. If `allow_online` is set and the offline chain
+    can't reach an anchor, missing issuers are fetched via each cert's AIA
+    caIssuers URL and the chain is retried (callers MUST gate this behind
+    explicit consent — never under --offline).
 
     check_timestamp()'s `certificate=` parameter is NOT "the CA to trust" — it
-    is the certificate the SIGNATURE is checked against. Passing our CA root
-    there (an earlier bug here) verifies the token's signature against the
-    CA's key instead of the TSA's own signing key, which always fails. The
-    correct two-step is: let check_timestamp extract and use the token's own
-    embedded certificate (its OWN default of certificate=None is actually
-    broken — it must be passed explicitly as b"", matching load_certificate's
-    default), then separately confirm that embedded certificate was signed by
-    our CA.
+    is the certificate the SIGNATURE is checked against; we pass the correctly
+    identified signer cert (see _find_signer_certificate_der).
 
     Known limitation: check_timestamp's final signature check always calls
     the RSA PKCS1v15 verify path regardless of key type, so a token signed
@@ -1180,30 +1475,49 @@ def _lib_verify(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
     cheaper message-imprint check (which is the actual tamper-evidence
     mechanism) still runs and still catches a data/token mismatch regardless
     of key type, so tamper detection is unaffected by this limitation — only
-    full cryptographic non-repudiation is.
+    full cryptographic non-repudiation is. Step 2 is a signature chain only,
+    not full RFC 5280 path validation (no revocation/EKU); openssl with
+    --tsa-cert remains the fully-rigorous path.
     """
     try:
         import rfc3161ng
-        from rfc3161ng.api import load_certificate
         from cryptography import x509
         from cryptography.exceptions import InvalidSignature
-        from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
         return None
 
     try:
         tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
-        ca_cert = x509.load_pem_x509_certificate(ca_file.read_bytes())
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
         return None
 
+    # Resolve trust anchors up front so a caller that provided nothing usable
+    # gets a clear inconclusive rather than a misleading failure.
+    anchors: list = []
+    if ca_file is not None:
+        try:
+            anchors = x509.load_pem_x509_certificates(ca_file.read_bytes())
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"Library-backend timestamp verify inconclusive: {exc}")
+            return None
+    elif system_store:
+        anchors = _system_trust_anchors()
+        if not anchors:
+            _warn("Library-backend timestamp verify inconclusive: could not load "
+                  "any system trust-store roots")
+            return None
+
+    # Correctly-identified signer cert DER bytes, or None to fall back to
+    # the library's own certificates[0] default (see _find_signer_certificate_der).
+    signer_cert_der = _find_signer_certificate_der(tst.content)
+    certificate_arg = signer_cert_der if signer_cert_der is not None else b""
+
     # Step 1: the token's own signature over `data`, checked against its own
-    # embedded certificate (certificate=b"" — NOT the library's own default of
-    # None, which raises inside load_certificate; see docstring).
+    # embedded signer certificate.
     try:
-        rfc3161ng.check_timestamp(tst, certificate=b"", data=data, hashname="sha256")
+        rfc3161ng.check_timestamp(tst, certificate=certificate_arg, data=data, hashname="sha256")
     except InvalidSignature:
         return False
     except ValueError:
@@ -1213,27 +1527,38 @@ def _lib_verify(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
     except TypeError:
         _warn("Library-backend timestamp verify inconclusive: token uses an EC "
               "signing key, which this backend cannot check (RSA-only) — "
-              "verify with openssl externally")
+              "verify with openssl externally or install openssl")
         return None
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
         return None
 
-    # Step 2: the embedded certificate was actually issued by the given CA.
+    # Step 2: the signer certificate chains to a trusted anchor.
     try:
-        leaf_cert = load_certificate(tst.content, b"")
-        ca_key = ca_cert.public_key()
-        if isinstance(ca_key, rsa.RSAPublicKey):
-            ca_key.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes,
-                          padding.PKCS1v15(), leaf_cert.signature_hash_algorithm)
-        elif isinstance(ca_key, ec.EllipticCurvePublicKey):
-            ca_key.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes,
-                          ec.ECDSA(leaf_cert.signature_hash_algorithm))
+        from rfc3161ng.api import load_certificate
+        if signer_cert_der is not None:
+            leaf_cert = x509.load_der_x509_certificate(signer_cert_der)
         else:
-            _warn("Library-backend timestamp verify inconclusive: unsupported CA key type")
+            leaf_cert = load_certificate(tst.content, b"")
+        intermediates = _embedded_certs(tst.content)
+        if _build_and_verify_chain(leaf_cert, intermediates, anchors):
+            return True
+        if allow_online:
+            fetched = _fetch_issuers_via_aia([leaf_cert] + intermediates)
+            if fetched and _build_and_verify_chain(leaf_cert, intermediates + fetched, anchors):
+                return True
+        # The signer's own signature over the data already validated (step 1),
+        # so this is NOT tampering — it's a trust-anchor problem.
+        if ca_file is None:
+            # System-store path: the user pinned no CA, so an unknown root is
+            # inconclusive, not a failure. Crying "failed" here would be a
+            # false tamper report for a legitimate-but-untrusted TSA.
+            _warn("Library-backend timestamp verify inconclusive: the token's "
+                  "signer does not chain to any system trust-store root (unknown "
+                  "CA) — pass --tsa-cert with the provider's root, or install openssl")
             return None
-        return True
-    except InvalidSignature:
+        # A CA was explicitly pinned and the token does not chain to it: that is
+        # a real verification failure (as openssl -CAfile would also report).
         return False
     except Exception as exc:  # noqa: BLE001
         _warn(f"Library-backend timestamp verify inconclusive: {exc}")
@@ -1297,10 +1622,17 @@ def tsa_token_time(tsr: bytes) -> str:
     return ""
 
 
-def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
+def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Optional[Path],
+                    *, allow_online: bool = False) -> Optional[bool]:
     """Verify a token against data, locally. True/False = verified/failed;
-    None = no usable backend or inconclusive. Prefers openssl -CAfile."""
-    if openssl_available():
+    None = no usable backend or inconclusive.
+
+    ca_file is the trust anchor (--tsa-cert). When given AND openssl is on PATH,
+    the rigorous openssl -CAfile path is used. When ca_file is None, the anchor
+    is the OS system trust store (via the library backend). allow_online lets
+    the library backend fetch missing issuer certs over the network (AIA) — the
+    caller must have already obtained the user's consent."""
+    if ca_file is not None and openssl_available():
         with tempfile.NamedTemporaryFile(delete=False) as df:
             df.write(data)
             data_tmp = Path(df.name)
@@ -1318,7 +1650,8 @@ def tsa_verify_data(data: bytes, tsr: bytes, ca_file: Path) -> Optional[bool]:
             data_tmp.unlink(missing_ok=True)
             tsr_tmp.unlink(missing_ok=True)
     if _tsa_lib_available():
-        return _lib_verify(data, tsr, ca_file)
+        return _lib_verify(data, tsr, ca_file,
+                           system_store=(ca_file is None), allow_online=allow_online)
     return None
 
 
@@ -3063,7 +3396,16 @@ supported hash algorithms:
     if args.tsa_list:
         print("Known timestamp authorities (use with --tsa <name>, or pass any URL):")
         for name in sorted(TSA_SERVERS):
-            print(f"  {name:<12} {TSA_SERVERS[name]}")
+            e = TSA_SERVERS[name]
+            tag = "" if e.key_type == "RSA" else "  [EC: needs openssl to verify locally]"
+            print(f"  {name:<12} {e.url}{tag}")
+            if e.ca_url:
+                print(f"  {'':<12}   CA certs: {e.ca_url}")
+        print()
+        print("Key type: RSA hosts can be verified by this tool alone (bundled")
+        print("rfc3161ng backend). EC hosts (marked) need openssl on PATH to verify")
+        print("locally. Pass a provider's root/intermediate to --tsa-cert at --verify,")
+        print("or omit it to try your system trust store.")
         return
 
     # ---- --install-opt alone: install every missing optional package, exit ----
@@ -3555,42 +3897,76 @@ supported hash algorithms:
                 _warn("TSA timestamp present but no backend (openssl / rfc3161ng) — "
                       "timestamp not verified")
                 issues.append(f"TSA backend not available ({', '.join(_tsa_labels)})")
-            elif args.tsa_cert is None:
-                # A TSA claim exists and wasn't ignored -- leaving it unconfirmed
-                # would let verification silently read as successful even though
-                # part of what the manifest asserts was never checked. Distinct
-                # reason text from the "checked but inconclusive" case below: we
-                # never had the material to check at all, so "not verified"
-                # would overstate that an attempt was even made.
-                _warn("TSA timestamp present but no --tsa-cert given — "
-                      "timestamp not cryptographically verified")
-                issues.append(f"TSA certificate not provided ({', '.join(_tsa_labels)})")
             else:
                 if not openssl_available():
                     # Only the rfc3161ng fallback has shown issues so far; openssl
                     # itself has no known problems, so don't alarm users who have it.
-                    _warn("--tsa-cert verification is EXPERIMENTAL on this backend "
-                          "(rfc3161ng, used because openssl isn't on PATH). Testing "
-                          "found real false-negative results for EC-signed and at "
-                          "least one legacy SHA-1-signed token — a [FAIL] here is "
-                          "not yet fully trustworthy for those cases. Modern SHA-256/"
-                          "RSA tokens have verified correctly in testing. See README "
-                          "'Trusted Timestamping'.")
+                    _warn("--tsa verification is EXPERIMENTAL on this backend "
+                          "(rfc3161ng, used because openssl isn't on PATH). RSA-signed "
+                          "tokens have verified correctly across every provider tested "
+                          "(digicert, globalsign, certum, apple, sectigo). EC-signed "
+                          "tokens (e.g. freetsa) can't be checked here — RSA-only "
+                          "library limitation — and correctly surface as inconclusive "
+                          "rather than a false failure. See README 'Trusted "
+                          "Timestamping'.")
+                if args.tsa_cert is None:
+                    # No pinned CA: verify the token's cert chain against the OS
+                    # trust store instead of refusing outright. The user can still
+                    # pin a CA with --tsa-cert or skip with --ignore-tsa.
+                    _info("No --tsa-cert given — checking the timestamp's certificate "
+                          "chain against your system trust store (pass --tsa-cert to "
+                          "pin a specific CA, or --ignore-tsa to skip).")
+
+                # Network is opt-in: only when the offline (system-store) check is
+                # inconclusive, only in the no-cert path, and never under --offline
+                # / -y / --quiet / a non-interactive stdin.
+                _online = {"asked": False, "ok": False}
+
+                def _online_allowed() -> bool:
+                    if args.offline:
+                        return False
+                    if _online["asked"]:
+                        return _online["ok"]
+                    _online["asked"] = True
+                    if args.yes or args.quiet or not sys.stdin.isatty():
+                        return False
+                    try:
+                        ans = input(f"{_tag('WARN')} Timestamp CA not in your system "
+                                    "store. Fetch the issuer certificate(s) online to "
+                                    "complete verification? [y/N] ")
+                    except EOFError:
+                        ans = ""
+                    _online["ok"] = ans.strip().lower() in ("y", "yes")
+                    return _online["ok"]
 
                 def _check_tsa(label: str, data: bytes, tsr: bytes, extra: str = "") -> None:
                     nonlocal tsa_failed
                     result = tsa_verify_data(data, tsr, args.tsa_cert)
+                    # Online issuer-fetch can only help an RSA token whose signature
+                    # already validates but whose chain is missing an intermediate.
+                    # It cannot help an EC token (the signature itself is uncheckable
+                    # here), so don't prompt for a fetch that can't change the result.
+                    if (result is None and args.tsa_cert is None
+                            and _token_key_type(tsr) == "RSA" and _online_allowed()):
+                        result = tsa_verify_data(data, tsr, None, allow_online=True)
                     if result is True:
-                        _ok(f"TSA timestamp verified: {label}{extra}")
+                        _src = " [system trust store]" if args.tsa_cert is None else ""
+                        _ok(f"TSA timestamp verified: {label}{extra}{_src}")
                     elif result is False:
                         _qprint(f"{_tag('FAIL')} TSA timestamp failed: {label}")
                         tsa_failed = True
                     else:
-                        # None: inconclusive. --tsa-cert was explicitly given, so
-                        # the user asked for this check — an inconclusive result
-                        # must not still let verification read as a clean PASS.
-                        _warn(f"TSA timestamp inconclusive: {label} "
-                              "(verify with openssl externally)")
+                        # None: inconclusive. A TSA claim exists and wasn't ignored,
+                        # so an unconfirmed result must not read as a clean PASS.
+                        if args.tsa_cert is None:
+                            # Reason (EC key, or CA not in store) is in the preceding
+                            # backend warning; keep this line cause-neutral.
+                            _warn(f"TSA timestamp inconclusive: {label} (unconfirmed; "
+                                  "pass --tsa-cert with the provider's root, or install "
+                                  "openssl)")
+                        else:
+                            _warn(f"TSA timestamp inconclusive: {label} "
+                                  "(verify with openssl externally or install openssl)")
                         issues.append(f"TSA timestamp could not be verified ({label})")
 
                 if _tsr_path.exists():
@@ -3719,6 +4095,23 @@ supported hash algorithms:
             # markers and is written anyway; --resign can add a real token later.
             _warn("Timestamping failed — recorded as 'failed' in the manifest; "
                   "add a token later with --resign.")
+        else:
+            # Tell the user whether these stamps are verifiable by the tool alone;
+            # drop them if they're EC-signed and unverifiable here and the user
+            # declines (all stamps share the TSA's key type, so one check suffices).
+            _sample = next((manifest[f] for f in TSA_FIELDS
+                            if isinstance(manifest.get(f), dict)), None)
+            if _sample is not None:
+                try:
+                    _tok = base64.b64decode(_sample.get("token_b64", ""))
+                except (ValueError, TypeError):
+                    _tok = b""
+                if _tok and not _tsa_keytype_confirm(_tok, assume_yes=args.yes,
+                                                     quiet=args.quiet):
+                    for _f in TSA_FIELDS:
+                        manifest.pop(_f, None)
+                    _warn("EC timestamp dropped at your request — manifest written "
+                          "without a stamp.")
 
     manifest_fmt = args.manifest_type  # "txt" or "json"
     ext = ".json" if manifest_fmt == "json" else ".txt"
@@ -3812,6 +4205,9 @@ supported hash algorithms:
             # Halt so an interactive user notices; -y (or non-interactive) continues.
             if sys.stdin.isatty() and not args.yes:
                 sys.exit(1)
+        elif not _tsa_keytype_confirm(tsr, assume_yes=args.yes, quiet=args.quiet):
+            _warn("EC timestamp dropped at your request — manifest written "
+                  "without a .tsr token.")
         else:
             tsr_path = manifest_path.with_suffix(manifest_path.suffix + ".tsr")
             tsr_path.write_bytes(tsr)

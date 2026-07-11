@@ -810,7 +810,7 @@ Before each signing or verification, the key's **fingerprint randomart** is show
 
 ## Trusted Timestamping (RFC 3161)
 
-> **⚠ EXPERIMENTAL.** `--tsa` is new, and live testing against real Timestamp Authorities has found real (if narrow) verification gaps — see [Backend](#backend-openssl-or-rfc3161ng) below for exactly what's confirmed working and what isn't yet. The tool prints a warning whenever `--tsa` or a `--tsa-cert` check runs.
+> **⚠ EXPERIMENTAL.** `--tsa` is new. Live testing against all six `--tsa-list` providers found and fixed a real verification bug in the `rfc3161ng` fallback backend; one known limitation (EC-signed tokens) remains — see [Backend](#backend-openssl-or-rfc3161ng) below for exactly what's confirmed working. The tool prints a warning whenever `--tsa` or a `--tsa-cert` check runs.
 
 A signature proves *who* vouched for a manifest; a **trusted timestamp** proves *when* it existed. `--tsa` sends the manifest's hash (never its contents) to a Timestamp Authority, which returns a signed token binding that hash to a UTC time. Anyone can later verify — **fully offline** — that the manifest existed at or before that moment, which defeats back-dating even by the manifest's own author.
 
@@ -885,20 +885,26 @@ openssl ts -verify -data hashes-20260703T000000Z.txt \
 
 `--tsa` needs a way to build and check RFC 3161 requests. **`openssl` is tried first** (widely available on Linux/macOS, and well field-tested); if it isn't on PATH — as on a stock Windows machine, which ships no openssl — the optional **`rfc3161ng`** Python package is used instead (`pip install rfc3161ng`, or `--install-opt`). Nothing else about `--tsa` changes based on the backend.
 
-**Status as of live testing (2026-07-10):**
+**Status as of live testing (2026-07-11):**
 
-| | Request (create) | Verify (`--tsa-cert`) |
+| | Request (create) | Verify |
 |---|---|---|
 | `openssl` | ✅ Not yet independently live-tested, but the standard, mature path | ✅ No known issues |
-| `rfc3161ng` | ✅ Confirmed working against freeTSA, Apple, and DigiCert | ⚠️ Mixed — see below |
+| `rfc3161ng` | ✅ Confirmed working against freeTSA, Apple, DigiCert, Sectigo, GlobalSign, and Certum | ✅ RSA tokens verify against a pinned CA **or** the system trust store (all six providers); EC is a known limitation — see below |
 
-The `rfc3161ng` verify path has two **confirmed** false-negative bugs, both found against real tokens from real TSAs, not synthetic test data:
-- An **EC-signed token** (e.g. freeTSA's) crashes the library's hardcoded-RSA signature check — caught and reported as `[WARN] ... inconclusive`, never a false pass or false tamper report.
-- A **legacy SHA-1-signed token** (Apple's TSA, whose signing cert dates to 2012) raises `InvalidSignature` in the library despite being independently proven cryptographically valid (cross-checked with real `openssl cms -verify -noverify`). This one is more serious: it currently surfaces as `[FAIL] TSA timestamp failed` — a false *tampering* report for a legitimate token — rather than a safe "inconclusive."
+Live testing against all six `--tsa-list` providers found and fixed a real false-negative bug in the `rfc3161ng` verify path: the CMS `certificates` field is an *unordered* set (RFC 5652 defines no order), but the library's own cert lookup naively assumes the first entry is the signer's certificate. Apple and Sectigo both send that set root-first (root/intermediate before the actual signer), so the library ended up checking the signature against the wrong certificate entirely — a false `[FAIL] TSA timestamp failed` for a completely legitimate token (independently proven valid via real `openssl cms -verify -noverify`). Fixed by identifying the true signer certificate via `signerInfo`'s issuer+serial number instead of guessing index 0; regression tests pin both real tokens.
 
-Against that, a **modern SHA-256/RSA-4096 token (DigiCert) verified cleanly** through the same `rfc3161ng` code path with no issues. So the gap looks narrow — legacy/uncommon signing conventions, not the library broadly — but the exact root cause of the Apple case isn't pinned down yet (ruled out so far: SHA-1 OID resolution, CMS attribute re-encoding, signature-length mismatch — all correct). Until that's resolved, treat any `rfc3161ng`-backend `[FAIL]` as worth double-checking with `openssl` externally before concluding a manifest was tampered with. `openssl`, when available, has shown no equivalent issues.
+One limitation remains, and is expected to stay: an **EC-signed token** (e.g. freeTSA's) crashes the library's hardcoded-RSA signature check. This is caught and reported as `[WARN] ... inconclusive`, never a false pass or false tamper report — tamper detection itself is unaffected, since the message-imprint check (does this token actually match this data?) runs *before* the signature step and doesn't depend on key type. `openssl`, when available, has no equivalent issue with EC-signed tokens and is used automatically in preference to `rfc3161ng` whenever it's on PATH. `--tsa-list` marks which hosts are EC.
 
-Note that for EC-signed tokens specifically, tamper detection itself is unaffected: the message-imprint check (does this token actually match this data?) runs *before* the broken signature step and is unaffected by key type, so a genuinely mismatched/tampered token is still correctly reported as `[FAIL]`. Only the SHA-1 case has shown a false-tampering report for a legitimate token — see above.
+#### Obtaining a trust anchor (`--tsa-cert`)
+
+At `--verify`, the trust anchor comes from one of three places, in order:
+
+1. **`--tsa-cert <file>`** — a PEM with the provider's root (or any cert on the signer's chain). You can pass the **root**; the tool builds the chain through the intermediates the token already carries (matching `openssl -CAfile`). `--tsa-list` links each provider's official CA page. With `openssl` on PATH this uses `openssl ts -verify`; otherwise it uses the `rfc3161ng` backend, which does a signature-chain check only (no revocation/EKU/temporal validation — `openssl` remains the fully-rigorous path).
+2. **No `--tsa-cert`** → the tool validates the token's chain against your **OS system trust store** (Windows/macOS/Linux). For well-known commercial TSAs (whose roots ship in the OS store) this means `--verify` "just works" with no cert file and no network. A signer that doesn't chain to any trusted root is reported **inconclusive**, never as tampering.
+3. **Online fetch (opt-in)** — if a system-store check is inconclusive only because an intermediate is missing, the tool offers to fetch it via the certificate's AIA `caIssuers` URL. This is the sole verify-time network action: it prompts for a yes/no, is skipped under `-y`/`--quiet`, and is blocked by `--offline`.
+
+At **create** time, the tool reports the token's signer key type (RSA or EC) so you know up-front whether this machine can verify it. If a token is EC-signed and no `openssl` is present, it warns (and, interactively, asks whether to keep the un-verifiable-here token).
 
 ---
 

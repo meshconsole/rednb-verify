@@ -1116,3 +1116,87 @@ Next TSA suggested for testing: **sectigo** or **globalsign** (both
 modern/actively-maintained, likely to pattern-match DigiCert's clean
 result) — would further confirm "legacy signing conventions" as the actual
 boundary rather than "TSA vendor" being the relevant variable.
+
+**UPDATE 2026-07-11: root cause found, this was wrong.** "Legacy SHA-1" was
+not the boundary — GlobalSign and Certum both sign with SHA-384 and both
+verify cleanly, ruling out digest algorithm entirely. The actual boundary is
+certificate ORDER in the token's CMS `certificates` SET (see next section).
+
+## rfc3161ng cert-selection bug: root-caused and fixed (2026-07-11)
+
+Continuing the multi-host test round (all six `--tsa-list` entries tested),
+found the real differentiator: `rfc3161ng.api.load_certificate()` takes
+`certificates[0]` and assumes it's the signer/leaf cert. RFC 5652 defines NO
+order for that SET. DigiCert/GlobalSign/Certum happen to send it leaf-first
+(index[0] correct); Apple/Sectigo send it root-first (index[0] = root or
+intermediate — verifying the signature against the CA's own key instead of
+the actual signer's, which of course fails with `InvalidSignature` even
+though the token is completely valid).
+
+Confirmed directly: for Sectigo, `certificates[0]` decoded to "Sectigo Public
+Time Stamping **Root** R46" — the true signer ("...**Signer** R37") was at
+index [2]. Cross-referenced against `signerInfo.issuerAndSerialNumber` (the
+spec-correct way to identify the signer among multiple certs) to confirm,
+rather than just eyeballing subject names.
+
+**Fix**: `_find_signer_certificate_der(signed_data)` — matches
+`signerInfo`'s issuer DN + serial number against each cert in the
+`certificates` SET, returns the correctly-identified signer's DER bytes (or
+`None` to fall back to the library's own default if matching fails for any
+reason). `_lib_verify` now passes this explicitly to
+`rfc3161ng.check_timestamp(certificate=...)` instead of relying on its
+`b""` auto-lookup. Confirmed against real captured Apple + Sectigo tokens —
+both now pass. Regression tests use the real tokens as fixtures
+(`tests/fixtures/tsa/{apple,sectigo}.tsr` + data, small enough to commit).
+
+Todoist task `6h4gHjcrQh4Gp9r3` (the deferred investigation) closed.
+
+## Five follow-on features (2026-07-11, user: "proceed on all five")
+
+Triggered by the user hitting exactly the friction this predicts: fetched a
+Sectigo token, asked how to verify it, and manual CA extraction turned out
+to need the *intermediate* specifically (single-hop chain check) — which
+would silently behave differently on Linux/openssl (root works there) vs
+Windows/rfc3161ng (root fails, intermediate required). Two design questions
+resolved via `AskUserQuestion` before building (see claude-notes
+rednb-verify/2026-07-11.md for the full reasoning), then all five landed
+together:
+
+1. `TSA_SERVERS` → `Dict[str, _TSA]` (frozen dataclass: `url`, `key_type`
+   "RSA"/"EC", `ca_url`). `--tsa-list` prints each host's official CA-repo
+   pointer URL (looked up live, not guessed) and flags EC hosts inline.
+   Pointer only — tool never downloads/bundles CA certs (would make it a
+   trust-root distributor).
+2. Offline chain-building: `_embedded_certs()` + `_cert_signed_by()` +
+   `_build_and_verify_chain()` — step 2 now walks the token's own embedded
+   intermediates up to the pinned `--tsa-cert`, so a **root** works, matching
+   `openssl -CAfile`. Was previously single-hop (direct-issuer only).
+3. System trust store: `_system_trust_anchors()` via
+   `ssl.create_default_context().get_ca_certs(binary_form=True)` (no
+   network). Used when `--tsa-cert` is omitted. **Confirmed end-to-end** with
+   every `openssl` binary stripped from `PATH` (this dev box has two: Git's
+   `mingw64\bin` and `usr\bin`) — a real Sectigo token gets a genuine
+   `[PASS]` with zero cert file. This is the "tool alone is sufficient"
+   outcome.
+   - **Safety invariant, explicitly tested**: unknown/untrusted root in the
+     system-store path → `None` (inconclusive), NEVER `False`. An
+     untrusted-but-legitimate TSA (or freeTSA's uncheckable EC signature) is
+     not tampering. A **pinned** CA that doesn't match stays `False` (real
+     failure, matches openssl). See
+     `test_lib_verify_system_store_unknown_ca_is_none_not_false` and
+     `test_lib_verify_system_store_ec_is_none_not_false`.
+4. Opt-in online AIA `caIssuers` fetch (`_fetch_issuers_via_aia`) as a
+   last-resort fallback when the offline chain can't reach an anchor. Gated:
+   `[y/N]` prompt, skipped under `-y`/`--quiet`/non-interactive stdin,
+   blocked by `--offline`, and — added after noticing it uselessly prompted
+   for EC tokens in an early version — only offered when the signer key is
+   RSA (fetching a cert can't fix an EC signature this backend can't check
+   anyway).
+5. Create-time RSA/EC notice: `_tsa_keytype_confirm()`, wired into both the
+   detached and embedded create paths. RSA → informational. EC with openssl
+   → informational. EC without openssl → warns clearly and interactively
+   asks whether to keep the token (auto-keeps under
+   `-y`/`--quiet`/non-interactive so scripted runs don't silently drop data).
+
+140 tests passing (was 130 before this round). All work as of 2026-07-11 is
+**uncommitted** — user is testing manually first.
