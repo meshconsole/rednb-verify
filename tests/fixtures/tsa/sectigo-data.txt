@@ -1,0 +1,33 @@
+rednb-verify manifest
+version: 0.11.0
+schema_version: 3
+created: 20260710T200235Z
+date: 2026-07-10
+hash_algorithm: sha256
+mode: full-tree
+merkle_hash: sha256
+warnings: MANIFEST UNSIGNED
+merkle_root: 458080ee8a4b46f77cbb23fea8f4cabad0a1ed4e4bbc8168bc9cfaf0aa97eac2
+content_root: 14678789319e756f954fc5db5be66c381427bb2a4bb35d3c7c8543319a90940b
+
+symlinks: (targets: hash:sha256)
+
+files:
+      1. #.txt
+         - sha256: 5574ad0b24ba07231d571bde1e8419e24c1cc5f1e6fa7a11ecfaac508141693e
+      2. 2025_10.txt
+         - sha256: f8ff606cbbbb3a9dc28718d17d08c17847b4cde96218234c15a073905bea139c
+      3. 2025_11.txt
+         - sha256: 3f3f62e356bc7bbd1ae21a3730a99d5f3e81d3f1d808d1d56ac2a39c71c4615b
+      4. 2026-05.txt
+         - sha256: f4b5a8ce4d86101169b6ff2e5c4da0b8b9ba3e2d3d4d01f2fa51b78404fa79e1
+      5. 2026-06.txt
+         - sha256: d3d03d2deedf01afe822e3df3a58d1978ee5453cded9d6e8a57727b52dcd1d83
+      6. hashes-20260528T090805Z.json
+         - sha256: 69f467f044a4fb8cd3d7ac35e5e321c0595ee3174c6dbe48d550db06a8b6ee9a
+      7. newbie.txt
+         - sha256: 815cab3078e880b902575a9ab18a9b7bc58f44ea1286de30abe15f728debe9cb
+      8. pexels-jonas-f-25733583-6752832.jpg
+         - sha256: 0381ef69a996491a7d37564c629f57853b2dd63226919becf7df2d03ebacfeca
+      9. report.txt
+         - sha256: 67de4f4e35b45ff89885f49df942684b155d6b31fcb97a059f36eecee234712f

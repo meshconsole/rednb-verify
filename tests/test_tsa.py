@@ -206,10 +206,14 @@ def _create_with_fake_stamp(tmp_path):
 
 
 def test_verify_warns_without_tsa_cert(tmp_path):
+    # With no --tsa-cert the tool now tries the system trust store rather than
+    # refusing outright; a fake/unverifiable token still can't confirm, so the
+    # unconfirmed TSA claim must still block PASS.
     nb, mf = _create_with_fake_stamp(tmp_path)
     r = _run(str(nb), "--verify", str(mf), "--no-sign")
+    out = r.stdout + r.stderr
     assert r.returncode == 1                                  # unconfirmed TSA claim blocks PASS
-    assert "no --tsa-cert" in r.stdout + r.stderr
+    assert "system trust store" in out
     assert "Verification completed with issues" in r.stdout
 
 
@@ -219,7 +223,7 @@ def test_verify_ignore_tsa_skips(tmp_path):
     out = r.stdout + r.stderr
     assert r.returncode == 0
     assert "--ignore-tsa in use" in out
-    assert "no --tsa-cert" not in out
+    assert "system trust store" not in out
 
 
 # ---- openssl query generation (skips when openssl absent) ----
@@ -442,10 +446,13 @@ def test_verify_tsa_no_cert_given_also_blocks_pass(tmp_path):
     mf.write_text(json.dumps(doc))
 
     r = _run(str(nb), "--verify", str(mf), "--no-sign")
+    out = r.stdout + r.stderr
     assert r.returncode == 1
     assert "[PASS]" not in r.stdout
     assert "Verification completed with issues" in r.stdout
-    assert "TSA certificate not provided" in r.stdout
+    # The tool tried the system trust store but couldn't confirm this token.
+    assert "system trust store" in out
+    assert "could not be verified" in r.stdout
 
 
 def test_verify_tsa_ignore_tsa_still_passes(tmp_path):
@@ -587,3 +594,216 @@ def test_verify_experimental_warning_skipped_when_openssl_available(tool, tmp_pa
     ca = _throwaway_pem_cert(tmp_path)
     r = _run(str(nb), "--verify", str(mf), "--no-sign", "--tsa-cert", str(ca))
     assert "EXPERIMENTAL" not in r.stdout
+
+
+# ---- root-first certificate ordering (real Apple + Sectigo tokens found the
+# certificates[0]-is-the-signer assumption in rfc3161ng.api.load_certificate
+# is wrong when a TSA sends its `certificates` SET root-first rather than
+# leaf-first -- both orderings are legal per RFC 5652, the SET has no defined
+# order. That mis-selection made _lib_verify fail real, untampered tokens
+# with InvalidSignature. _find_signer_certificate_der fixes this by matching
+# signerInfo's issuerAndSerialNumber instead of guessing index 0.) ----
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "tsa"
+
+
+@pytest.mark.parametrize("name", ["apple", "sectigo"])
+def test_find_signer_certificate_der_picks_non_zero_index(tool, name):
+    # Both fixtures are real captured tokens whose certificates SET is
+    # root-first: the actual signer is at index [2], not [0].
+    pytest.importorskip("rfc3161ng")
+    pytest.importorskip("pyasn1")
+    pytest.importorskip("cryptography")
+    import rfc3161ng
+    from pyasn1.codec.der import encoder as der_encoder
+    from cryptography import x509
+
+    tsr = (_FIXTURES / f"{name}.tsr").read_bytes()
+    tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+    signed_data = tst.content
+    certs = signed_data["certificates"]
+
+    signer_der = tool._find_signer_certificate_der(signed_data)
+    assert signer_der is not None
+
+    index_zero_der = der_encoder.encode(certs[0][0])
+    assert signer_der != index_zero_der, (
+        "fixture no longer exercises the root-first ordering this test guards"
+    )
+
+    signer_cert = x509.load_der_x509_certificate(signer_der)
+    assert "Signer" in signer_cert.subject.rfc4514_string()
+
+
+@pytest.mark.parametrize("name", ["apple", "sectigo"])
+def test_lib_verify_step1_passes_for_root_first_cert_order(tool, name):
+    # Before the fix, both of these raised InvalidSignature in _lib_verify's
+    # step 1 (checked against the wrong -- root/intermediate -- certificate)
+    # despite being real, untampered, independently-valid tokens.
+    pytest.importorskip("rfc3161ng")
+    import rfc3161ng
+    from cryptography.exceptions import InvalidSignature
+
+    data = (_FIXTURES / f"{name}-data.txt").read_bytes()
+    tsr = (_FIXTURES / f"{name}.tsr").read_bytes()
+    tst = rfc3161ng.decode_timestamp_response(tsr).time_stamp_token
+    signer_der = tool._find_signer_certificate_der(tst.content)
+    assert signer_der is not None
+
+    try:
+        rfc3161ng.check_timestamp(tst, certificate=signer_der, data=data, hashname="sha256")
+    except InvalidSignature:
+        pytest.fail(f"{name}: signature check failed even with the correct signer cert")
+
+
+# ---- chain-building: --tsa-cert can be the ROOT, not just the direct issuer
+# (a 3-level chain signer<-intermediate<-root must verify when any ancestor,
+# including the root, is the pinned anchor -- matching openssl -CAfile) ----
+
+def _embedded_cert_pem(tsr_bytes, needle):
+    import rfc3161ng
+    from pyasn1.codec.der import encoder
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding
+    tst = rfc3161ng.decode_timestamp_response(tsr_bytes).time_stamp_token
+    certs = tst.content["certificates"]
+    for i in range(len(certs)):
+        der = encoder.encode(certs[i][0])
+        c = x509.load_der_x509_certificate(der)
+        if needle in c.subject.rfc4514_string():
+            return c.public_bytes(Encoding.PEM)
+    return None
+
+
+@pytest.mark.parametrize("anchor", ["Root", "CA R41", "Signer"])
+def test_lib_verify_chains_to_any_anchor_level(tool, tmp_path, anchor):
+    # Sectigo sends signer<-CA R41<-Root R46; pinning ANY of the three as
+    # --tsa-cert must verify the token.
+    pytest.importorskip("rfc3161ng")
+    pytest.importorskip("cryptography")
+    data = (_FIXTURES / "sectigo-data.txt").read_bytes()
+    tsr = (_FIXTURES / "sectigo.tsr").read_bytes()
+    pem = _embedded_cert_pem(tsr, anchor)
+    assert pem is not None, f"no embedded cert matching {anchor!r}"
+    ca = tmp_path / "anchor.pem"
+    ca.write_bytes(pem)
+    assert tool._lib_verify(data, tsr, ca) is True
+
+
+def test_lib_verify_wrong_pinned_ca_is_false(tool, tmp_path):
+    # An Apple token pinned against Sectigo's ROOT does not chain to it, so a
+    # PINNED-cert mismatch is a real failure (False), as openssl -CAfile reports.
+    pytest.importorskip("rfc3161ng")
+    a_data = (_FIXTURES / "apple-data.txt").read_bytes()
+    a_tsr = (_FIXTURES / "apple.tsr").read_bytes()
+    s_tsr = (_FIXTURES / "sectigo.tsr").read_bytes()
+    pem = _embedded_cert_pem(s_tsr, "Root")
+    ca = tmp_path / "sectigo-root.pem"
+    ca.write_bytes(pem)
+    assert tool._lib_verify(a_data, a_tsr, ca) is False
+
+
+def test_lib_verify_system_store_unknown_ca_is_none_not_false(tool, tmp_path, monkeypatch):
+    # CRITICAL false-tamper safety: in the system-store path (no pinned CA), a
+    # signer whose root isn't a trusted anchor must be INCONCLUSIVE (None), never
+    # a failure (False) -- an untrusted-but-legitimate TSA is not tampering.
+    pytest.importorskip("rfc3161ng")
+    from cryptography import x509
+    unrelated = x509.load_pem_x509_certificate(_throwaway_pem_cert(tmp_path).read_bytes())
+    monkeypatch.setattr(tool, "_system_trust_anchors", lambda: [unrelated])
+    data = (_FIXTURES / "sectigo-data.txt").read_bytes()
+    tsr = (_FIXTURES / "sectigo.tsr").read_bytes()
+    assert tool._lib_verify(data, tsr, None, system_store=True) is None
+
+
+def test_lib_verify_system_store_ec_is_none_not_false(tool, monkeypatch):
+    # An EC token in the system-store path must also be inconclusive, not a
+    # false tamper report.
+    pytest.importorskip("rfc3161ng")
+    from cryptography import x509
+    # A non-empty anchor set (some unrelated real cert) so we exercise the step-1
+    # EC path rather than the empty-store guard.
+    root_pem = _embedded_cert_pem((_FIXTURES / "sectigo.tsr").read_bytes(), "Root")
+    anchor = x509.load_pem_x509_certificate(root_pem)
+    monkeypatch.setattr(tool, "_system_trust_anchors", lambda: [anchor])
+    data = (_FIXTURES / "freetsa-ec-data.txt").read_bytes()
+    tsr = (_FIXTURES / "freetsa-ec.tsr").read_bytes()
+    assert tool._lib_verify(data, tsr, None, system_store=True) is None
+
+
+def test_build_and_verify_chain_empty_anchors_is_false(tool):
+    # No anchors -> cannot establish trust -> False (the caller maps this to
+    # None in the system-store path; here we assert the primitive itself).
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    leaf = x509.load_pem_x509_certificate(
+        _embedded_cert_pem((_FIXTURES / "sectigo.tsr").read_bytes(), "Signer"))
+    assert tool._build_and_verify_chain(leaf, [], []) is False
+
+
+# ---- --tsa-list carries CA pointers and marks EC hosts ----
+
+def test_tsa_list_shows_ca_pointers_and_ec_mark():
+    r = _run("--tsa-list")
+    assert r.returncode == 0
+    assert "CA certs:" in r.stdout                      # pointer URLs present
+    assert "sectigo.com" in r.stdout
+    assert "[EC" in r.stdout                            # freetsa flagged EC
+    # RSA hosts are not flagged EC
+    for line in r.stdout.splitlines():
+        if line.strip().startswith("digicert"):
+            assert "[EC" not in line
+
+
+# ---- create-time RSA/EC signer notice ----
+
+def test_keytype_confirm_rsa_keeps_and_announces(tool, capsys):
+    pytest.importorskip("rfc3161ng")
+    tsr = (_FIXTURES / "sectigo.tsr").read_bytes()
+    assert tool._tsa_keytype_confirm(tsr, assume_yes=False, quiet=False) is True
+    cap = capsys.readouterr()
+    assert "RSA" in (cap.out + cap.err)
+
+
+def test_keytype_confirm_ec_without_openssl_warns_but_autokeeps(tool, capsys, monkeypatch):
+    # Non-interactive stdin (pytest) => auto-keep, but the EC warning must fire so
+    # the record isn't silently lost.
+    pytest.importorskip("rfc3161ng")
+    monkeypatch.setattr(tool, "openssl_available", lambda: False)
+    tsr = (_FIXTURES / "freetsa-ec.tsr").read_bytes()
+    assert tool._tsa_keytype_confirm(tsr, assume_yes=True, quiet=False) is True
+    cap = capsys.readouterr()
+    assert "EC" in (cap.out + cap.err)
+
+
+def test_keytype_confirm_ec_no_openssl_piped_stdin_autokeeps(tool, monkeypatch):
+    # A piped/non-tty stdin (the common case: input isn't a real terminal) must
+    # also auto-keep without blocking on input() -- assume_yes=False here, so
+    # this specifically exercises the "not sys.stdin.isatty()" branch, not the
+    # assume_yes shortcut.
+    pytest.importorskip("rfc3161ng")
+    monkeypatch.setattr(tool, "openssl_available", lambda: False)
+    monkeypatch.setattr(tool.sys.stdin, "isatty", lambda: False)
+    tsr = (_FIXTURES / "freetsa-ec.tsr").read_bytes()
+    assert tool._tsa_keytype_confirm(tsr, assume_yes=False, quiet=False) is True
+
+
+def test_keytype_confirm_ec_no_openssl_real_tty_declines_when_user_says_no(tool, monkeypatch):
+    # On a genuine TTY with no openssl, the user is asked, and "n" must
+    # actually decline (return False) -- the one branch that can drop data,
+    # so it needs its own direct check beyond the auto-keep paths above.
+    pytest.importorskip("rfc3161ng")
+    monkeypatch.setattr(tool, "openssl_available", lambda: False)
+    monkeypatch.setattr(tool.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    tsr = (_FIXTURES / "freetsa-ec.tsr").read_bytes()
+    assert tool._tsa_keytype_confirm(tsr, assume_yes=False, quiet=False) is False
+
+
+def test_keytype_confirm_ec_no_openssl_real_tty_keeps_when_user_says_yes(tool, monkeypatch):
+    pytest.importorskip("rfc3161ng")
+    monkeypatch.setattr(tool, "openssl_available", lambda: False)
+    monkeypatch.setattr(tool.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    tsr = (_FIXTURES / "freetsa-ec.tsr").read_bytes()
+    assert tool._tsa_keytype_confirm(tsr, assume_yes=False, quiet=False) is True
