@@ -25,6 +25,7 @@ Manifest creation:
 "--symlink-targets MODE"      : Record symlink targets: none|full|hash[:ALGO[:LEN]] (default: hash = sha256 of target)
 "--no-symlink-table"          : Omit the symlink table (alias for --symlink-targets none)
 "--privacy"                   : Minimise manifest disclosure (currently implies --no-symlink-table)
+"--lock"                      : After writing, chmod the manifest (and any .asc/.sshsig/.sig/.tsr) read-only (best-effort, not true WORM)
 
 Signing:
 "--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
@@ -2312,6 +2313,25 @@ def _manifest_files_last(manifest: Dict) -> None:
         manifest["files"] = manifest.pop("files")
 
 
+def _lock_file_readonly(path: Path) -> bool:
+    """Best-effort mark a file read-only via chmod. Cross-platform: on POSIX
+    this clears the write bits; on Windows, Python's chmod maps directly to
+    the FILE_ATTRIBUTE_READONLY flag (Explorer's "Read-only" checkbox), no
+    subprocess needed.
+
+    This is defense-in-depth, not true WORM: the owner (or root/Administrator)
+    can always chmod it back. It protects against accidental overwrite and
+    casual tampering, not a privileged attacker. For a real write-once
+    guarantee, store the manifest on WORM/object-lock media — see the README
+    'File Safety' section.
+    """
+    try:
+        path.chmod(0o444)
+        return True
+    except OSError:
+        return False
+
+
 # ---------- Verification ----------
 
 def verify_manifest(
@@ -3265,6 +3285,12 @@ supported hash algorithms:
                         help="Skip all signing")
     parser.add_argument("--resign", type=Path, default=None, metavar="MANIFEST",
                         help="Re-sign an existing manifest (requires --gpg and/or --ssh)")
+    parser.add_argument("--lock", action="store_true",
+                        help="After writing, chmod the manifest (and any .asc/.sshsig/.sig/"
+                             ".tsr sidecar) read-only. Best-effort defense-in-depth against "
+                             "accidental overwrite/tampering, not true WORM — the owner can "
+                             "still chmod it back. See README 'File Safety' for real "
+                             "write-once storage options.")
     # --- Timestamping (RFC 3161) — the ONLY flags that can touch the network ---
     parser.add_argument("--tsa", default=None, metavar="NAME|URL",
                         help="Request an RFC 3161 timestamp at create time from a known "
@@ -4180,16 +4206,19 @@ supported hash algorithms:
     if args.no_sign:
         _info("Signing skipped (--no-sign)")
     _ok(f"Manifest created: {manifest_path}")
+    _written_files = [manifest_path]   # tracks this run's own output, for --lock
 
     # ---- Sign the finished file ----
     if gpg_fpr:
         if do_gpg_sign(manifest_path, gpg_fpr, args.gpg_k):
             _ok("Manifest signed with GPG.")
+            _written_files.append(manifest_path.with_suffix(manifest_path.suffix + ".asc"))
         else:
             _warn("GPG signing failed.")
     if ssh_signer:
         if ssh_sign_manifest(manifest_path, ssh_signer.priv_path, ssh_sig_out):
             _ok(f"SSH signature created: {ssh_sig_out.name}")
+            _written_files.append(ssh_sig_out)
         else:
             _warn("SSH signing failed.")
 
@@ -4214,6 +4243,17 @@ supported hash algorithms:
             _time = tsa_token_time(tsr)
             _ok(f"Timestamp token saved: {tsr_path.name}"
                 + (f" ({_time})" if _time else ""))
+            _written_files.append(tsr_path)
+
+    # ---- --lock: chmod this run's own output read-only, last (after every
+    # write above). Best-effort defense-in-depth, not true WORM — see
+    # _lock_file_readonly's docstring and README 'File Safety'. ----
+    if args.lock:
+        locked = [p for p in _written_files if _lock_file_readonly(p)]
+        if locked:
+            _ok("Locked read-only: " + ", ".join(p.name for p in locked))
+        else:
+            _warn("--lock: could not mark any output file read-only")
 
     # --json: echo the finished manifest to stdout for piping (logs are on stderr).
     if args.json:

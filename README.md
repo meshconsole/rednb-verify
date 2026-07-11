@@ -187,9 +187,11 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 - Keep the output directory **separate** from the directory you are monitoring, so the manifest and reports never mingle with your data.
 - The tool is **tamper-*evidence*, not tamper-*prevention*.** It proves whether files changed; it does not stop a change. Pair it with prevention at the storage/OS layer for defense in depth.
 
-**Recommended hardening (optional, OS-level):**
-- **Store the manifest on write-once or read-only media** — WORM storage, object-lock buckets (e.g. S3 Object Lock), or simply a separate drive — so a compromised system can't rewrite the baseline. This is the strongest protection for the record itself.
-- **Mark the manifest immutable** after creation: `chmod 0444` (any OS), `attrib +R` (Windows), `chattr +i` (Linux, needs root), or `chflags uchg` (macOS).
+**`--lock`** marks a manifest (and any `.asc`/`.sshsig`/`.sig`/`.tsr` sidecar produced in the same run) **read-only** immediately after writing — `chmod 0444`, which Python maps to the Windows read-only attribute too, so it works the same way on every platform with no extra dependency. This is **defense-in-depth against accidental overwrite and casual tampering, not true WORM**: the file's owner (or an administrator/root) can always `chmod` it back. Use it any time you don't intend to touch a manifest again (the common case — manifests aren't meant to be edited).
+
+**For a genuine write-once guarantee (optional, OS/infrastructure-level):**
+- **Store the manifest on write-once or read-only media** — WORM storage, object-lock buckets (e.g. S3 Object Lock), or simply a separate drive — so even a compromised system, or someone with `chmod` access, can't rewrite the baseline. This is the strongest protection available for the record itself, and `--lock` doesn't replace it.
+- **Immutable filesystem flags** go further than `--lock`'s plain `chmod`: `chattr +i` (Linux, needs root) or `chflags uchg` (macOS) block changes even by the file's own owner without first clearing the flag.
 - **Run verify as a least-privileged user** that has no write permission on the monitored files — enforcing the read-only property at the OS level, not just by trusting the code.
 
 **Detecting tampering with the *record itself*** is already built in and needs no special storage: **sign** the manifest (GPG/SSH) so it can't be forged, and **timestamp** it (`--tsa`) so it can't be back-dated. A future release adds manifest chaining, making the whole *sequence* of manifests append-only and tamper-evident.
@@ -224,6 +226,7 @@ Run the tool against a directory to hash its contents and write a manifest.
 | `--symlink-targets MODE` | How to record symlink targets: `none` \| `full` \| `hash[:ALGO[:LEN]]` (default: `hash` = sha256 of the target). See [Symlinks](#symlinks) |
 | `--no-symlink-table` | Omit the symlink table (alias for `--symlink-targets none`) |
 | `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
+| `--lock` | After writing, `chmod` this run's own output (manifest + any `.asc`/`.sshsig`/`.sig`/`.tsr`) read-only. Best-effort defense-in-depth, not true WORM. See [File Safety](#file-safety) |
 
 ### Signing
 
@@ -302,6 +305,9 @@ python rednb-verify.py ~/journal --no-sign --verbose
 
 # Use blake2b for file hashes, sha256 for the Merkle tree
 python rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
+
+# Create, sign, and lock the manifest read-only (defense-in-depth — see File Safety)
+python rednb-verify.py ~/journal --gpg --lock -o ~/manifests
 
 # Create and sign — interactive menu asks how to sign
 python rednb-verify.py ~/journal
