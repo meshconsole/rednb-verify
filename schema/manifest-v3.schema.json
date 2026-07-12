@@ -303,6 +303,37 @@
           "const": "failed"
         }
       ]
+    },
+    "prev": {
+      "type": "object",
+      "required": [
+        "file",
+        "hashes"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Filename of the previous manifest in the chain"
+        },
+        "created": {
+          "type": "string",
+          "description": "The previous manifest's own 'created' timestamp (informational)"
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Position in the chain (1 = first link after genesis)"
+        },
+        "hashes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Hash(es) of the previous manifest FILE's raw bytes, keyed by algorithm spec (--prev-hash)"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
