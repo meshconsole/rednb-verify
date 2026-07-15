@@ -1200,3 +1200,90 @@ together:
 
 140 tests passing (was 130 before this round). All work as of 2026-07-11 is
 **uncommitted** — user is testing manually first.
+
+## v0.12.0 (2026-07-15): self-protection + manifest chaining + --files-only
+
+Released as v0.12.0. Three feature groups, developed on branch
+`self-protection-verify-lock`, merged `--no-ff`. Schema stayed v3 (the new
+`prev` field is optional, added the same way the tsa_* fields were). Tests:
+176 passing (was 143 at v0.11.0), 9 skipped (symlink creation needs OS
+privilege unavailable on this dev box).
+
+### Self-protection (from a user/friend FIM discussion)
+
+Confirmed by reading the code that verify is already strictly read-only on
+monitored files (`verify_manifest` only reads/hashes; all writes go to the
+chosen `-o` output dir, config, temp dirs, or sig sidecars next to the
+manifest). Documented that guarantee in a new README "File Safety" section
+and BACKED it with `tests/test_file_safety.py` (asserts a `--verify` run
+leaves the notebook byte-for-byte identical, including the failing/tampered
+case, so the claim can't silently regress).
+
+`--lock`: after writing, `chmod` this run's own output (manifest + any
+`.asc`/`.sshsig`/`.sig`/`.tsr`) read-only via a single `Path.chmod(0o444)` —
+on Windows that maps directly to the read-only file attribute, no subprocess
+needed. Explicitly defense-in-depth, NOT true WORM (owner/admin can chmod
+back). Only locks files this run actually wrote (tracked in a list), so a
+failed TSA request doesn't leave a phantom lock target. WORM/`chattr +i`/
+`chflags uchg`/least-privilege-user are documented as the real
+write-once options, not implemented (OS/infra concerns, and platform-
+specific code would break the single-file/stdlib principle).
+
+Rejected from the discussion's suggestions: seccomp/eBPF/auditd syscall
+sandboxing, separate unprivileged verify user, read-only bind mounts — all
+Linux-specific OS-deployment concerns, out of scope for a single-file
+cross-platform (Windows-primary) tool; documented as recommendations only.
+
+### Manifest chaining (`--prev-manifest` / `--prev-hash`)
+
+Links each manifest to the previous one by HASH (a hash-linked chain, NOT a
+growing full list — same construction as git/blockchains/CT logs; O(1) per
+manifest, same tamper-evidence). Design chosen with the user over
+AskUserQuestion in the prior session.
+
+- `--prev-manifest FILE|DIR` — dir auto-selects latest, reusing
+  `_resolve_manifest_path` (gained an optional `label` param; default
+  unchanged so --verify/--validate messages are identical).
+- `--prev-hash ALGO[:LEN][,ALGO...]` — multi-hash, same syntax as `--hash`
+  (default sha256). `prev.hashes` is always a dict keyed by algo spec.
+- New `prev` field {file, created, height, hashes}; `height` counts links
+  back to genesis (first manifest has no `prev`). Hashes the previous
+  manifest's RAW FILE BYTES (same "hash the file as written" approach --tsa
+  uses), added before signing so the sig + any --tsa stamp cover the link.
+- Text format: `prev` round-trips as one inline-JSON header line, same
+  pattern as the tsa_* fields.
+- Not compatible with `--resign` (which never rewrites content) — errors
+  loudly rather than silently no-op'ing. (Note: `--tsa` has this same
+  pre-existing silent-no-op-with-resign gap; left as-is, only guarded the
+  new flag.)
+- Verify: `verify_chain()` walks links back to genesis, re-hashing each
+  previous manifest found alongside the current one. CRITICAL distinction —
+  a hash MISMATCH is `broken` (hard [FAIL], file altered after chaining); a
+  file that can't be FOUND is `missing` (soft issue blocking clean [PASS],
+  NOT a tamper signal — operator may have pruned old manifests). `--ignore-
+  chain` skips it, parallel to the other --ignore-* flags.
+
+### --files-only
+
+Shorthand for `--ignore-sig --ignore-tsa --ignore-chain` together — skips the
+provenance/metadata checks that don't directly examine the files. Implemented
+as one flag setting the other three `ignore_*` args (mirrors
+--quiet-implies-no-sign), so it composes for free.
+
+IMPORTANT design correction (user caught it): symlinks are NOT included —
+a symlink is a monitored filesystem entry like any other, so it stays checked
+under --files-only. `--ignore-symlinks` remains its own separate, deliberate
+opt-out. First implementation wrongly bundled --ignore-symlinks in; corrected
+before merge. The actual file-hash comparison (missing/modified/new + content-
+root/move detection) is of course never skipped.
+
+### Considered and declined: `--show` / interactive report browser
+
+User floated a `--show <report|manifest>` with man-page-style browsing +
+search-by-name/hash. Declined for rednb-verify: (a) `--verbose` (per-file
+OK/FAIL), `--json`, and `--report` already cover printing results; (b) an
+interactive pager needs curses (→ windows-curses dependency) or a big pile of
+platform terminal code — reimplements `less`; pipe to a pager instead; (c) the
+value of search/browse scales with tree size, which is exactly writ-vigil's
+domain (general large trees), not rednb-verify's (small journals). Carried the
+structure-aware search idea forward as a writ-vigil design note.

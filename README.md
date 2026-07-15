@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.11.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`, `rfc3161ng` for `--tsa` without openssl)
+**Version:** 0.12.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`, `rfc3161ng` for `--tsa` without openssl)
 
 ---
 
@@ -448,7 +448,7 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.11.0
+version: 0.12.0
 schema_version: 3
 created: 20260528T120000Z
 date: 2026-05-28
@@ -474,7 +474,7 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "schema_version": 3,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
@@ -863,7 +863,7 @@ A minimal valid manifest looks like:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "schema_version": 3,
   "created": "20260617T120000Z",
   "date": "2026-06-17",
