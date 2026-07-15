@@ -6,7 +6,7 @@ It creates cryptographic manifests of notebook entries and optionally signs them
 
 The project focuses on **tamper detection, auditability, and long-term trust** — not secrecy.
 
-**Version:** 0.11.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`, `rfc3161ng` for `--tsa` without openssl)
+**Version:** 0.12.0 | **Python:** 3.10+ | **Dependencies:** stdlib only (`pyyaml` for `--per-day`, `jsonschema` for `--validate`, `rfc3161ng` for `--tsa` without openssl)
 
 ---
 
@@ -21,7 +21,7 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Design Principles](#design-principles)
 - [File Safety](#file-safety)
 - [Usage](#usage)
-  - [Manifest creation](#manifest-creation) · [Signing](#signing) · [Timestamping](#timestamping) · [Verification](#verification) · [Validation](#validation) · [Config management](#config-management) · [Examples](#examples) · [Other](#other)
+  - [Manifest creation](#manifest-creation) · [Signing](#signing) · [Timestamping](#timestamping) · [Manifest chaining](#manifest-chaining) · [Verification](#verification) · [Validation](#validation) · [Config management](#config-management) · [Examples](#examples) · [Other](#other)
 - [Missing Dependencies (--install-opt)](#missing-dependencies---install-opt)
 - [Manifest Format](#manifest-format)
 - [Signing](#signing-1)
@@ -36,6 +36,7 @@ The project focuses on **tamper detection, auditability, and long-term trust** �
 - [Schema & Validation](#schema--validation)
 - [Trust & Signing](#trust--signing)
 - [Trusted Timestamping (RFC 3161)](#trusted-timestamping-rfc-3161)
+- [Manifest Chaining](#manifest-chaining-1)
 - [Config File](#config-file)
 - [Planned](#planned)
 - [Project Status](#project-status)
@@ -187,9 +188,11 @@ True forensic attribution requires audit frameworks (e.g. Linux `auditd`), immut
 - Keep the output directory **separate** from the directory you are monitoring, so the manifest and reports never mingle with your data.
 - The tool is **tamper-*evidence*, not tamper-*prevention*.** It proves whether files changed; it does not stop a change. Pair it with prevention at the storage/OS layer for defense in depth.
 
-**Recommended hardening (optional, OS-level):**
-- **Store the manifest on write-once or read-only media** — WORM storage, object-lock buckets (e.g. S3 Object Lock), or simply a separate drive — so a compromised system can't rewrite the baseline. This is the strongest protection for the record itself.
-- **Mark the manifest immutable** after creation: `chmod 0444` (any OS), `attrib +R` (Windows), `chattr +i` (Linux, needs root), or `chflags uchg` (macOS).
+**`--lock`** marks a manifest (and any `.asc`/`.sshsig`/`.sig`/`.tsr` sidecar produced in the same run) **read-only** immediately after writing — `chmod 0444`, which Python maps to the Windows read-only attribute too, so it works the same way on every platform with no extra dependency. This is **defense-in-depth against accidental overwrite and casual tampering, not true WORM**: the file's owner (or an administrator/root) can always `chmod` it back. Use it any time you don't intend to touch a manifest again (the common case — manifests aren't meant to be edited).
+
+**For a genuine write-once guarantee (optional, OS/infrastructure-level):**
+- **Store the manifest on write-once or read-only media** — WORM storage, object-lock buckets (e.g. S3 Object Lock), or simply a separate drive — so even a compromised system, or someone with `chmod` access, can't rewrite the baseline. This is the strongest protection available for the record itself, and `--lock` doesn't replace it.
+- **Immutable filesystem flags** go further than `--lock`'s plain `chmod`: `chattr +i` (Linux, needs root) or `chflags uchg` (macOS) block changes even by the file's own owner without first clearing the flag.
 - **Run verify as a least-privileged user** that has no write permission on the monitored files — enforcing the read-only property at the OS level, not just by trusting the code.
 
 **Detecting tampering with the *record itself*** is already built in and needs no special storage: **sign** the manifest (GPG/SSH) so it can't be forged, and **timestamp** it (`--tsa`) so it can't be back-dated. A future release adds manifest chaining, making the whole *sequence* of manifests append-only and tamper-evident.
@@ -224,6 +227,7 @@ Run the tool against a directory to hash its contents and write a manifest.
 | `--symlink-targets MODE` | How to record symlink targets: `none` \| `full` \| `hash[:ALGO[:LEN]]` (default: `hash` = sha256 of the target). See [Symlinks](#symlinks) |
 | `--no-symlink-table` | Omit the symlink table (alias for `--symlink-targets none`) |
 | `--privacy` | Minimise what the manifest discloses (currently implies `--no-symlink-table`) |
+| `--lock` | After writing, `chmod` this run's own output (manifest + any `.asc`/`.sshsig`/`.sig`/`.tsr`) read-only. Best-effort defense-in-depth, not true WORM. See [File Safety](#file-safety) |
 
 ### Signing
 
@@ -253,6 +257,15 @@ Prove a manifest existed at a point in time via an RFC 3161 Timestamp Authority.
 | `--tsa-list` | Print the built-in TSA registry (names → URLs) and exit — no network |
 | `--offline` | Assert that no network is used: refuses `--tsa`. The tool is offline by default; this makes the guarantee explicit in the command |
 
+### Manifest chaining
+
+Link a new manifest to the previous one by hash, so the *sequence* of manifests over time is tamper-evident, not just each one individually. Fully local — no network. See [Manifest Chaining](#manifest-chaining-1).
+
+| Flag | Description |
+|---|---|
+| `--prev-manifest FILE\|DIR` | Link this manifest to a previous one. A directory auto-selects its latest manifest, like `--verify`. Not compatible with `--resign` (which never rewrites manifest content) |
+| `--prev-hash ALGO[:LEN][,ALGO...]` | Hash algorithm(s) for the link (default: `sha256`). Comma-separate for multiple, same syntax as `--hash`. Requires `--prev-manifest` |
+
 ### Verification
 
 Check a directory against a previously created manifest.
@@ -264,6 +277,8 @@ Check a directory against a previously created manifest.
 | `--ssh-verify` | Force SSH signature check during `--verify` |
 | `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
 | `--ignore-symlinks` | During `--verify`, skip the symlink-table comparison and symlink warnings (parallel to `--ignore-sig`) |
+| `--ignore-chain` | During `--verify`, skip manifest chain verification (parallel to `--ignore-sig`/`--ignore-symlinks`/`--ignore-tsa`) |
+| `--files-only` | During `--verify`, skip checks that aren't about the files themselves: signatures, TSA timestamps, and manifest chain history. Shorthand for `--ignore-sig --ignore-tsa --ignore-chain` together. Symlinks are still checked (they're a monitored filesystem entry, not a provenance check) — add `--ignore-symlinks` separately if you want those skipped too |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
 | `--schema-ignore` | Verify a manifest whose schema is newer than this tool supports (risky) |
@@ -302,6 +317,12 @@ python rednb-verify.py ~/journal --no-sign --verbose
 
 # Use blake2b for file hashes, sha256 for the Merkle tree
 python rednb-verify.py ~/journal --hash blake2b --hash-merkle sha256
+
+# Create, sign, and lock the manifest read-only (defense-in-depth — see File Safety)
+python rednb-verify.py ~/journal --gpg --lock -o ~/manifests
+
+# Chain to the previous manifest (dir auto-selects the latest) — see Manifest Chaining
+python rednb-verify.py ~/journal --gpg --prev-manifest ~/manifests -o ~/manifests
 
 # Create and sign — interactive menu asks how to sign
 python rednb-verify.py ~/journal
@@ -357,6 +378,12 @@ python rednb-verify.py ~/journal \
 python rednb-verify.py ~/journal \
   --verify ~/journal/hashes-20260528T120000Z.txt \
   --warn-age 90
+
+# Verify without checking the manifest chain (--prev-manifest history)
+python rednb-verify.py ~/journal --verify --ignore-chain
+
+# Quick integrity-only check: files (incl. symlinks), skip sig/TSA/chain
+python rednb-verify.py ~/journal --verify --files-only
 
 # Record symlink targets as cleartext (local/forensic use)
 python rednb-verify.py ~/journal --no-sign --symlink-targets full
@@ -421,7 +448,7 @@ Manifests are named `hashes-<timestamp>.txt` (default) or `hashes-<timestamp>.js
 
 ```
 rednb-verify manifest
-version: 0.11.0
+version: 0.12.0
 schema_version: 3
 created: 20260528T120000Z
 date: 2026-05-28
@@ -447,7 +474,7 @@ Per-file hash lines are bulleted with `- ` for readability; Merkle-root lines ar
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "schema_version": 3,
   "created": "20260528T120000Z",
   "date": "2026-05-28",
@@ -480,6 +507,7 @@ A signing run also adds a `signed_by` entry, and any advisory (e.g. an unsigned 
 - `mode` — one of `full-tree`, `month-only`, `per-day/full-tree`, `per-day/month-only`
 - `symlink_targets` / `symlinks` — symlink recording policy and table (see [Symlinks](#symlinks))
 - `files` — always the **last** key, so the (potentially long) file list never buries the header fields
+- `prev` — optional; present only when created with `--prev-manifest`. Links this manifest to the previous one by hash, for tamper-evidence across the whole *sequence* of manifests — see [Manifest Chaining](#manifest-chaining-1)
 
 ---
 
@@ -835,7 +863,7 @@ A minimal valid manifest looks like:
 ```json
 {
   "tool": "rednb-verify",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "schema_version": 3,
   "created": "20260617T120000Z",
   "date": "2026-06-17",
@@ -981,6 +1009,58 @@ At **create** time, the tool reports the token's signer key type (RSA or EC) so 
 
 ---
 
+## Manifest Chaining
+
+A signature and a timestamp each protect *one* manifest. **Chaining** protects the *sequence*: linking each new manifest to the previous one by hash means altering — or quietly deleting — an old manifest breaks every link after it, not just that one file. Fully local; no network.
+
+```bash
+# First manifest in a chain (genesis) — nothing special, just a normal create
+python rednb-verify.py ~/journal --gpg -o ~/manifests
+
+# Link the next one to it explicitly
+python rednb-verify.py ~/journal --gpg -o ~/manifests \
+    --prev-manifest ~/manifests/hashes-20260610T120000Z.json
+
+# Or point at the directory — it auto-selects the latest manifest, like --verify
+python rednb-verify.py ~/journal --gpg -o ~/manifests --prev-manifest ~/manifests
+
+# Multiple hash algorithms for the link (crypto-agility, same syntax as --hash)
+python rednb-verify.py ~/journal --gpg -o ~/manifests \
+    --prev-manifest ~/manifests --prev-hash sha256,blake2b
+
+# Verify walks the whole chain back to genesis automatically
+python rednb-verify.py ~/journal --verify ~/manifests/hashes-20260611T090000Z.json
+```
+
+### How it works
+
+`--prev-manifest` hashes the **previous manifest's raw file bytes** (the same "hash the file as written" approach `--tsa` uses) and records the result in a new `prev` field:
+
+```json
+"prev": {
+  "file": "hashes-20260610T120000Z.json",
+  "created": "20260610T120000Z",
+  "height": 1,
+  "hashes": {"sha256": "9f3c1234..."}
+}
+```
+
+- **`height`** counts links back to genesis (the first manifest, which carries no `prev` at all) — so you can tell where in the chain a manifest sits without walking the whole thing.
+- The link is added **before signing**, so a GPG/SSH signature (and any `--tsa` timestamp) also covers it — you can't strip or rewrite the link without invalidating the signature too.
+- `--prev-hash` supports **multiple algorithms** (`--prev-hash sha256,blake2b`), exactly like `--hash` — `hashes` becomes a small dict of `{algo: digest}` regardless of whether you used one algorithm or several.
+- Not compatible with `--resign`: re-signing never rewrites manifest content (it only adds a signature alongside the existing file), so there's nothing for `--resign` to link.
+
+### Verification
+
+`--verify` reads the `prev` field, locates the referenced manifest **alongside** the one being verified, and re-hashes it — then repeats for *that* manifest's own `prev`, walking all the way back to genesis. Two distinct outcomes on a broken chain, so a routine cleanup doesn't read as an attack:
+
+- **Broken** — the previous manifest's bytes no longer match the recorded hash. This means it was altered *after* being chained: a hard `[FAIL]`, the same severity as a failed signature.
+- **Missing** — the previous manifest file can't be found (e.g. you deliberately pruned old manifests). This can't confirm the link, but it doesn't prove tampering either — it's a soft issue that still blocks a clean `[PASS]`, distinctly worded so it's never confused with "broken."
+
+`--ignore-chain` skips the check entirely (parallel to `--ignore-sig`/`--ignore-symlinks`/`--ignore-tsa`) — useful if you intentionally don't keep the full history around.
+
+---
+
 ## Config File
 
 `~/.config/rednb-verify/config.json` is loaded automatically as a default layer. CLI flags always override config values. An empty or missing config file is silently ignored.
@@ -1067,7 +1147,6 @@ Equivalent to running `--set-cf trust-level:high`, `--add-trust trust-gpg:AB12�
 
 ## Planned
 
-- Manifest chaining (each manifest links the previous one by hash, making the *sequence* of manifests tamper-evident) — targeted for 0.12
 - RedNotebook UI integration
 - **rednb-verify-config** — GUI config editor (desktop app for managing `~/.config/rednb-verify/config.json`, trusted keys, and saved paths without touching the CLI)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rednb-verify
-Version: 0.11.0
+Version: 0.12.0
 
 RedNotebook integrity verification tool.
 Creates and verifies cryptographic manifests for notebook directories.
@@ -25,6 +25,11 @@ Manifest creation:
 "--symlink-targets MODE"      : Record symlink targets: none|full|hash[:ALGO[:LEN]] (default: hash = sha256 of target)
 "--no-symlink-table"          : Omit the symlink table (alias for --symlink-targets none)
 "--privacy"                   : Minimise manifest disclosure (currently implies --no-symlink-table)
+"--lock"                      : After writing, chmod the manifest (and any .asc/.sshsig/.sig/.tsr) read-only (best-effort, not true WORM)
+
+Manifest chaining (each manifest links the previous one by hash — makes the SEQUENCE tamper-evident):
+"--prev-manifest FILE|DIR"    : Link to a previous manifest (a directory auto-selects its latest, like --verify)
+"--prev-hash ALGO[:LEN][,...]" : Hash algorithm(s) for the link (default: sha256; comma-separate for multiple)
 
 Signing:
 "--gpg [FINGERPRINT]"         : Sign with GPG; optional fingerprint pre-selects key
@@ -50,6 +55,8 @@ Verification:
 "--ssh-verify"                : Force SSH signature check during --verify
 "--ignore-sig"                : Verify integrity only; skip all signature checks
 "--ignore-symlinks"           : During --verify, skip the symlink-table comparison and symlink warnings
+"--ignore-chain"              : During --verify, skip manifest chain verification (--prev-manifest)
+"--files-only"                : During --verify, skip checks that aren't about the files themselves; shorthand for --ignore-sig --ignore-tsa --ignore-chain (symlinks still checked)
 "--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
 "--warn-age DAYS"             : Warn during verify if manifest is older than N days
 "--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
@@ -100,7 +107,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 HASH_ALGO = "sha256"
 CONFIG_PATH = Path(os.path.expanduser("~/.config/rednb-verify/config.json"))
 
@@ -2312,6 +2319,25 @@ def _manifest_files_last(manifest: Dict) -> None:
         manifest["files"] = manifest.pop("files")
 
 
+def _lock_file_readonly(path: Path) -> bool:
+    """Best-effort mark a file read-only via chmod. Cross-platform: on POSIX
+    this clears the write bits; on Windows, Python's chmod maps directly to
+    the FILE_ATTRIBUTE_READONLY flag (Explorer's "Read-only" checkbox), no
+    subprocess needed.
+
+    This is defense-in-depth, not true WORM: the owner (or root/Administrator)
+    can always chmod it back. It protects against accidental overwrite and
+    casual tampering, not a privileged attacker. For a real write-once
+    guarantee, store the manifest on WORM/object-lock media — see the README
+    'File Safety' section.
+    """
+    try:
+        path.chmod(0o444)
+        return True
+    except OSError:
+        return False
+
+
 # ---------- Verification ----------
 
 def verify_manifest(
@@ -2479,6 +2505,11 @@ def _write_text_manifest(manifest: Dict, bullets: bool = True) -> str:
         lines.append(f"merkle_root: {manifest.get('merkle_root', '')}")
         if manifest.get("content_root"):
             lines.append(f"content_root: {manifest['content_root']}")
+    # Manifest chaining: one inline-JSON header line, same round-trip approach
+    # as the TSA fields below (a nested dict doesn't fit the flat key: value
+    # header format otherwise).
+    if manifest.get("prev"):
+        lines.append(f"prev: {json.dumps(manifest['prev'], ensure_ascii=False)}")
     # Embedded TSA stamps: one inline-JSON header line per field, so the token
     # round-trips exactly through the text format.
     for _tf in TSA_FIELDS:
@@ -2626,6 +2657,12 @@ def _parse_text_manifest(text: str) -> Dict:
             manifest["schema_version"] = int(manifest["schema_version"])
         except (TypeError, ValueError):
             pass
+    # Manifest chaining: "prev" was written as inline JSON — rebuild the dict.
+    if isinstance(manifest.get("prev"), str):
+        try:
+            manifest["prev"] = json.loads(manifest["prev"])
+        except json.JSONDecodeError:
+            pass
     # Embedded TSA stamps were written as inline JSON — rebuild the dicts.
     for _tf in TSA_FIELDS:
         if isinstance(manifest.get(_tf), str):
@@ -2725,30 +2762,106 @@ def write_report(results: Dict[str, List[str]], report_path: Path, manifest_path
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _resolve_manifest_path(arg: str, out_dir: Path) -> Path:
-    """Resolve a --verify / --validate argument to a manifest file path.
+def _resolve_manifest_path(arg: str, out_dir: Path, label: str = "manifest") -> Path:
+    """Resolve a --verify / --validate / --prev-manifest argument to a manifest
+    file path.
 
     Accepts an explicit file, a directory to search for the latest manifest, or
-    the '__auto__' sentinel (search the output directory).
+    the '__auto__' sentinel (search the output directory). `label` only affects
+    the messages printed (default "manifest", matching the original behaviour);
+    --prev-manifest passes "previous manifest" so its messages read clearly.
     """
     if arg == "__auto__":
         arg = str(out_dir)
     target = Path(arg)
     if target.is_dir():
-        _info("Directory provided for manifest, choosing latest")
+        _info(f"Directory provided for {label}, choosing latest")
         candidates = sorted(
             list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
         )
         if not candidates:
-            _err(f"No manifest found in {target}")
+            _err(f"No {label} found in {target}")
             sys.exit(2)
-        _info(f"Using latest manifest: {candidates[-1].name}")
+        _info(f"Using latest {label}: {candidates[-1].name}")
         return candidates[-1]
     target = target.resolve()
     if not target.exists():
-        _err(f"Manifest not found: {target}" + _bad_path_hint(arg))
+        _err(f"{label.capitalize()} not found: {target}" + _bad_path_hint(arg))
         sys.exit(2)
     return target
+
+
+def compute_prev_link(prev_path: Path, hash_specs: List[str]) -> Dict:
+    """Build the 'prev' chain-link field for --prev-manifest: hash(es) of the
+    PREVIOUS manifest FILE's raw bytes (not its parsed contents -- the same
+    "hash the file as written" approach --tsa already uses), plus enough of
+    its own metadata (filename, created, height) to inspect the chain without
+    opening every prior manifest.
+
+    Called before signing, so the signature covers the link -- altering an
+    earlier manifest breaks its hash here and every link after it.
+    """
+    hashes = hash_file_multi(prev_path, hash_specs)
+    prev_manifest = _load_manifest(prev_path)
+    prev_height = 0
+    prev_chain = prev_manifest.get("prev")
+    if isinstance(prev_chain, dict):
+        try:
+            prev_height = int(prev_chain.get("height", 0))
+        except (TypeError, ValueError):
+            prev_height = 0
+    return {
+        "file": prev_path.name,
+        "created": prev_manifest.get("created", ""),
+        "height": prev_height + 1,
+        "hashes": hashes,
+    }
+
+
+def verify_chain(manifest_path: Path, manifest: Dict) -> tuple:
+    """Walk a manifest chain backward from `manifest`, verifying each link's
+    stored hash(es) against the actual previous-manifest file, all the way to
+    genesis (the first manifest with no 'prev' field) or the first broken
+    link. Previous manifests are expected alongside the current one (i.e. in
+    manifest_path's own directory) since 'prev.file' stores a bare filename.
+
+    Returns (status, detail):
+      "no-chain" -- manifest has no 'prev' field; nothing to check
+      "ok"       -- every link back to genesis verified; detail says how many
+      "broken"   -- a hash mismatch was found -- the linked file was altered
+                    after being chained (tampering signal, not inconclusive)
+      "missing"  -- a previous manifest file could not be found/read/parsed
+                    (inconclusive: can't confirm, but doesn't prove tampering
+                    -- e.g. the operator may have deliberately pruned old
+                    manifests)
+    """
+    prev = manifest.get("prev")
+    if not isinstance(prev, dict):
+        return "no-chain", ""
+    current_dir = manifest_path.parent
+    depth = 0
+    while isinstance(prev, dict):
+        depth += 1
+        prev_file = prev.get("file", "")
+        prev_path = current_dir / prev_file
+        hashes = prev.get("hashes", {})
+        if not prev_file or not hashes:
+            return "missing", f"link {depth} has an incomplete 'prev' record"
+        if not prev_path.exists():
+            return "missing", f"{prev_file} (link {depth}) not found in {current_dir}"
+        try:
+            actual = hash_file_multi(prev_path, list(hashes.keys()))
+        except (OSError, ValueError) as exc:
+            return "missing", f"{prev_file} (link {depth}) could not be hashed: {exc}"
+        if actual != hashes:
+            return "broken", (f"{prev_file} (link {depth}) hash mismatch -- it was "
+                              "altered after being chained")
+        try:
+            prev_manifest = _load_manifest(prev_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            return "missing", f"{prev_file} (link {depth}) could not be parsed: {exc}"
+        prev = prev_manifest.get("prev")
+    return "ok", f"verified {depth} link(s) back to genesis"
 
 
 # JSON Schemas are EMBEDDED here as the single source of truth so --validate is
@@ -2769,6 +2882,27 @@ _TSA_ENTRY_SCHEMA: Dict = {
 # A tsa_* field is either a token entry or the literal "failed" marker (a stamp
 # that was attempted but couldn't be obtained — see --resign to add one later).
 _TSA_FIELD_SCHEMA: Dict = {"oneOf": [_TSA_ENTRY_SCHEMA, {"const": "failed"}]}
+
+# Manifest chaining (--prev-manifest): links this manifest to the previous one
+# by hash of its raw file bytes, so the SEQUENCE of manifests is tamper-evident
+# (altering an earlier manifest breaks every link after it). Optional field,
+# schema v3 -- no version bump, same as how the tsa_* fields were added.
+_PREV_SCHEMA: Dict = {
+    "type": "object",
+    "required": ["file", "hashes"],
+    "properties": {
+        "file": {"type": "string", "description": "Filename of the previous manifest in the chain"},
+        "created": {"type": "string", "description": "The previous manifest's own 'created' timestamp (informational)"},
+        "height": {"type": "integer", "minimum": 1, "description": "Position in the chain (1 = first link after genesis)"},
+        "hashes": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {"type": "string"},
+            "description": "Hash(es) of the previous manifest FILE's raw bytes, keyed by algorithm spec (--prev-hash)",
+        },
+    },
+    "additionalProperties": False,
+}
 
 MANIFEST_SCHEMA: Dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2863,6 +2997,7 @@ MANIFEST_SCHEMA: Dict = {
         "tsa_merkle": _TSA_FIELD_SCHEMA,
         "tsa_concat": _TSA_FIELD_SCHEMA,
         "tsa_content": _TSA_FIELD_SCHEMA,
+        "prev": _PREV_SCHEMA,
     },
 }
 
@@ -3257,6 +3392,16 @@ supported hash algorithms:
     parser.add_argument("--ignore-symlinks", action="store_true", dest="ignore_symlinks",
                         help="During --verify, skip the symlink-table comparison and "
                              "symlink warnings (parallel to --ignore-sig)")
+    parser.add_argument("--ignore-chain", action="store_true", dest="ignore_chain",
+                        help="During --verify, skip manifest chain verification "
+                             "(parallel to --ignore-sig/--ignore-symlinks/--ignore-tsa)")
+    parser.add_argument("--files-only", action="store_true", dest="files_only",
+                        help="During --verify, skip checks that aren't about the files "
+                             "themselves: signatures, TSA timestamps, and manifest chain "
+                             "verification. Shorthand for --ignore-sig --ignore-tsa "
+                             "--ignore-chain together. Symlinks are still checked -- "
+                             "use --ignore-symlinks separately if you want those skipped "
+                             "too.")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
                         help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
@@ -3265,6 +3410,23 @@ supported hash algorithms:
                         help="Skip all signing")
     parser.add_argument("--resign", type=Path, default=None, metavar="MANIFEST",
                         help="Re-sign an existing manifest (requires --gpg and/or --ssh)")
+    parser.add_argument("--lock", action="store_true",
+                        help="After writing, chmod the manifest (and any .asc/.sshsig/.sig/"
+                             ".tsr sidecar) read-only. Best-effort defense-in-depth against "
+                             "accidental overwrite/tampering, not true WORM — the owner can "
+                             "still chmod it back. See README 'File Safety' for real "
+                             "write-once storage options.")
+    # --- Manifest chaining: link this manifest to the previous one by hash,
+    # making the SEQUENCE of manifests tamper-evident. ---
+    parser.add_argument("--prev-manifest", type=str, default=None, metavar="FILE|DIR",
+                        dest="prev_manifest",
+                        help="Link to a previous manifest by hash (manifest chaining). "
+                             "A directory auto-selects its latest manifest, like --verify.")
+    parser.add_argument("--prev-hash", default=None, dest="prev_hash_algo",
+                        metavar="ALGO[:LEN][,ALGO...]",
+                        help="Hash algorithm(s) for the --prev-manifest link (default: "
+                             "sha256). Comma-separate for multiple algorithms, same "
+                             "syntax as --hash. Requires --prev-manifest.")
     # --- Timestamping (RFC 3161) — the ONLY flags that can touch the network ---
     parser.add_argument("--tsa", default=None, metavar="NAME|URL",
                         help="Request an RFC 3161 timestamp at create time from a known "
@@ -3502,6 +3664,17 @@ supported hash algorithms:
     if args.quiet and args.gpg is None and args.ssh is None:
         args.no_sign = True
 
+    # --files-only: at --verify, skip every check that does NOT directly
+    # examine the files themselves -- signatures, TSA timestamps, and manifest
+    # chain history are all checks on metadata/provenance, not on file
+    # content. Symlinks are NOT included here: a symlink is a monitored
+    # filesystem entry like any other, so --ignore-symlinks stays a separate,
+    # deliberate opt-out rather than something --files-only silently implies.
+    if args.files_only:
+        args.ignore_sig = True
+        args.ignore_tsa = True
+        args.ignore_chain = True
+
     # Resolve effective trust level (CLI > config > "low") and warn if mis-set.
     trust_level = resolve_trust_level(args.trust, config)
     if trust_level == "high":
@@ -3555,6 +3728,27 @@ supported hash algorithms:
     # --hash-merkle-concatenate: validate combiner algo if requested.
     if args.merkle_concat:
         _validate_algo_spec_or_exit(args.merkle_concat, "--hash-merkle-concatenate")
+
+    # --prev-hash may carry multiple comma-separated algos, same as --hash;
+    # requires --prev-manifest (mirrors --tsa-embed requiring --tsa).
+    if args.prev_hash_algo is not None and args.prev_manifest is None:
+        _err("--prev-hash requires --prev-manifest.")
+        sys.exit(2)
+    if args.prev_manifest is not None and args.resign:
+        _err("--prev-manifest cannot be combined with --resign (chaining only "
+             "applies when a NEW manifest is created — --resign never rewrites "
+             "manifest content, only adds a signature).")
+        sys.exit(2)
+    args.prev_hash_specs = []
+    if args.prev_manifest is not None:
+        prev_hash_specs = [a.strip() for a in (args.prev_hash_algo or "sha256").split(",")
+                           if a.strip()]
+        if not prev_hash_specs:
+            _err("--prev-hash requires at least one algorithm.")
+            sys.exit(2)
+        for spec in prev_hash_specs:
+            _validate_algo_spec_or_exit(spec, "--prev-hash")
+        args.prev_hash_specs = prev_hash_specs
 
     # Parse --sig
     sig_paths: List[Path] = (
@@ -3986,6 +4180,25 @@ supported hash algorithms:
                         _qprint(f"{_tag('FAIL')} TSA timestamp failed: {_field}")
                         tsa_failed = True
 
+        # ---- Manifest chain verification (--prev-manifest at create time).
+        # Fully local: walks 'prev' links back to genesis, re-hashing each
+        # previous manifest file found alongside this one. ----
+        chain_failed = False
+        if args.ignore_chain:
+            if isinstance(manifest.get("prev"), dict):
+                _warn("Flag --ignore-chain in use")
+        else:
+            _chain_status, _chain_detail = verify_chain(manifest_path, manifest)
+            if _chain_status == "ok":
+                _ok(f"Manifest chain verified: {_chain_detail}")
+            elif _chain_status == "broken":
+                _qprint(f"{_tag('FAIL')} Manifest chain broken: {_chain_detail}")
+                chain_failed = True
+            elif _chain_status == "missing":
+                _warn(f"Manifest chain could not be fully verified: {_chain_detail}")
+                issues.append(f"manifest chain incomplete ({_chain_detail})")
+            # "no-chain": this manifest isn't chained -- nothing to report.
+
         # ------------------------- Terminal verdict ------------------------- #
         if args.ignore_symlinks:
             _warn("Flag --ignore-symlinks in use")
@@ -4014,7 +4227,7 @@ supported hash algorithms:
             _qprint(f"{_tag('FAIL')} Untrusted signer (--trust high)")
 
         hard_fail = (integrity_failed or symlink_failed or sig_invalid
-                     or trust_failed or tsa_failed)
+                     or trust_failed or tsa_failed or chain_failed)
         # A manifest that expects a signature but produced none: hashes are
         # intact, but authenticity could not be established.
         if sig_required and not sig_verified:
@@ -4086,6 +4299,21 @@ supported hash algorithms:
     # from elsewhere, and they are a repointing attack surface.
     for _esc in escaping_symlinks(args.notebook_dir, exclude=exclude):
         _warn(f"Symlink points outside the notebook: {_esc}")
+
+    # ---- Manifest chaining (--prev-manifest, before write so the signature
+    # and any --tsa timestamp also cover the link). Hashes the PREVIOUS
+    # manifest's raw file bytes -- if that file is later altered, this hash
+    # no longer matches, and the break is detectable at verify time. ----
+    if args.prev_manifest is not None:
+        prev_path = _resolve_manifest_path(args.prev_manifest, out_dir,
+                                           label="previous manifest")
+        try:
+            manifest["prev"] = compute_prev_link(prev_path, args.prev_hash_specs)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _err(f"Could not read --prev-manifest: {exc}")
+            sys.exit(2)
+        _ok(f"Linked to previous manifest: {prev_path.name} "
+            f"(height {manifest['prev']['height']})")
 
     # ---- Embedded TSA stamps (before write, so signatures cover them). The
     # stamps cover root VALUES, so adding them cannot invalidate themselves. ----
@@ -4180,16 +4408,19 @@ supported hash algorithms:
     if args.no_sign:
         _info("Signing skipped (--no-sign)")
     _ok(f"Manifest created: {manifest_path}")
+    _written_files = [manifest_path]   # tracks this run's own output, for --lock
 
     # ---- Sign the finished file ----
     if gpg_fpr:
         if do_gpg_sign(manifest_path, gpg_fpr, args.gpg_k):
             _ok("Manifest signed with GPG.")
+            _written_files.append(manifest_path.with_suffix(manifest_path.suffix + ".asc"))
         else:
             _warn("GPG signing failed.")
     if ssh_signer:
         if ssh_sign_manifest(manifest_path, ssh_signer.priv_path, ssh_sig_out):
             _ok(f"SSH signature created: {ssh_sig_out.name}")
+            _written_files.append(ssh_sig_out)
         else:
             _warn("SSH signing failed.")
 
@@ -4214,6 +4445,17 @@ supported hash algorithms:
             _time = tsa_token_time(tsr)
             _ok(f"Timestamp token saved: {tsr_path.name}"
                 + (f" ({_time})" if _time else ""))
+            _written_files.append(tsr_path)
+
+    # ---- --lock: chmod this run's own output read-only, last (after every
+    # write above). Best-effort defense-in-depth, not true WORM — see
+    # _lock_file_readonly's docstring and README 'File Safety'. ----
+    if args.lock:
+        locked = [p for p in _written_files if _lock_file_readonly(p)]
+        if locked:
+            _ok("Locked read-only: " + ", ".join(p.name for p in locked))
+        else:
+            _warn("--lock: could not mark any output file read-only")
 
     # --json: echo the finished manifest to stdout for piping (logs are on stderr).
     if args.json:
