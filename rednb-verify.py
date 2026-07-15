@@ -56,6 +56,7 @@ Verification:
 "--ignore-sig"                : Verify integrity only; skip all signature checks
 "--ignore-symlinks"           : During --verify, skip the symlink-table comparison and symlink warnings
 "--ignore-chain"              : During --verify, skip manifest chain verification (--prev-manifest)
+"--files-only"                : During --verify, skip checks that aren't about the files themselves; shorthand for --ignore-sig --ignore-tsa --ignore-chain (symlinks still checked)
 "--sig FILE[,FILE]"           : Signature file(s) comma-separated (.asc=GPG, .sshsig/.sig=SSH)
 "--warn-age DAYS"             : Warn during verify if manifest is older than N days
 "--schema-ignore"             : Verify a newer-schema manifest anyway (risky)
@@ -3394,6 +3395,13 @@ supported hash algorithms:
     parser.add_argument("--ignore-chain", action="store_true", dest="ignore_chain",
                         help="During --verify, skip manifest chain verification "
                              "(parallel to --ignore-sig/--ignore-symlinks/--ignore-tsa)")
+    parser.add_argument("--files-only", action="store_true", dest="files_only",
+                        help="During --verify, skip checks that aren't about the files "
+                             "themselves: signatures, TSA timestamps, and manifest chain "
+                             "verification. Shorthand for --ignore-sig --ignore-tsa "
+                             "--ignore-chain together. Symlinks are still checked -- "
+                             "use --ignore-symlinks separately if you want those skipped "
+                             "too.")
     parser.add_argument("--sig", type=str, default=None, metavar="FILE[,FILE]",
                         help="Signature file(s), comma-separated (.asc=GPG, .sshsig/.sig=SSH)")
     parser.add_argument("--ssh-fido", nargs="?", const="", metavar="KEYNAME",
@@ -3655,6 +3663,17 @@ supported hash algorithms:
     # --quiet implies --no-sign unless an explicit signing method was given
     if args.quiet and args.gpg is None and args.ssh is None:
         args.no_sign = True
+
+    # --files-only: at --verify, skip every check that does NOT directly
+    # examine the files themselves -- signatures, TSA timestamps, and manifest
+    # chain history are all checks on metadata/provenance, not on file
+    # content. Symlinks are NOT included here: a symlink is a monitored
+    # filesystem entry like any other, so --ignore-symlinks stays a separate,
+    # deliberate opt-out rather than something --files-only silently implies.
+    if args.files_only:
+        args.ignore_sig = True
+        args.ignore_tsa = True
+        args.ignore_chain = True
 
     # Resolve effective trust level (CLI > config > "low") and warn if mis-set.
     trust_level = resolve_trust_level(args.trust, config)

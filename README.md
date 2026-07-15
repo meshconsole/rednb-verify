@@ -278,6 +278,7 @@ Check a directory against a previously created manifest.
 | `--ignore-sig` | During `--verify`, check integrity only and skip all signature checks (returns `0` when hashes match) |
 | `--ignore-symlinks` | During `--verify`, skip the symlink-table comparison and symlink warnings (parallel to `--ignore-sig`) |
 | `--ignore-chain` | During `--verify`, skip manifest chain verification (parallel to `--ignore-sig`/`--ignore-symlinks`/`--ignore-tsa`) |
+| `--files-only` | During `--verify`, skip checks that aren't about the files themselves: signatures, TSA timestamps, and manifest chain history. Shorthand for `--ignore-sig --ignore-tsa --ignore-chain` together. Symlinks are still checked (they're a monitored filesystem entry, not a provenance check) — add `--ignore-symlinks` separately if you want those skipped too |
 | `--sig FILE[,FILE]` | Signature file(s), comma-separated; `.asc`=GPG, `.sshsig`/`.sig`=SSH |
 | `--warn-age DAYS` | During `--verify`, print a warning if the manifest is older than N days |
 | `--schema-ignore` | Verify a manifest whose schema is newer than this tool supports (risky) |
@@ -380,6 +381,9 @@ python rednb-verify.py ~/journal \
 
 # Verify without checking the manifest chain (--prev-manifest history)
 python rednb-verify.py ~/journal --verify --ignore-chain
+
+# Quick integrity-only check: files (incl. symlinks), skip sig/TSA/chain
+python rednb-verify.py ~/journal --verify --files-only
 
 # Record symlink targets as cleartext (local/forensic use)
 python rednb-verify.py ~/journal --no-sign --symlink-targets full
