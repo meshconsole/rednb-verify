@@ -8,9 +8,9 @@
 
 ## Version context
 
-- Current stable: **0.11.0** (main branch)
-- Manifest schema: **v3** (v2 added RFC 6962 Merkle hardening + symlink table; v3 adds the move-invariant content root)
-- See "Feature 10: progress bar in normal mode" and the TSA bugfix section below for the latest behavior (still on the unreleased v0.11.0 line)
+- Current stable: **0.12.0** (main branch) — rednb-verify is now feature-complete/finished; see `MOVINGON.md` in the repo root
+- Manifest schema: **v3** (v2 added RFC 6962 Merkle hardening + symlink table; v3 adds the move-invariant content root, plus the optional `prev` chaining field added in v0.12.0)
+- See the "v0.12.0" section below for the latest behavior (self-protection/`--lock`, manifest chaining, `--files-only`)
 
 ---
 
