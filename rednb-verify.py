@@ -816,6 +816,16 @@ def select_ssh_key(
 
 
 def ssh_sign_manifest(manifest_path: Path, key_path: Path, sig_path: Path) -> bool:
+    # Resolve every path passed to ssh-keygen BEFORE the subprocess call: the
+    # child process's cwd is set to manifest_path.parent below, so any
+    # argument that's still relative gets re-interpreted against that NEW
+    # cwd rather than ours, silently doubling the directory prefix (e.g.
+    # ".testing/output" + cwd ".testing/output" -> looks for
+    # ".testing/output/.testing/output/..."). Matches the pattern
+    # gpg_verify() already uses (it resolves its paths and sets no cwd).
+    manifest_path = manifest_path.resolve()
+    key_path = key_path.resolve()
+    sig_path = sig_path.resolve()
     default_sig = manifest_path.with_suffix(manifest_path.suffix + ".sig")
     appended_sig = manifest_path.parent / f"{manifest_path.name}.sig"
     for c in (default_sig, appended_sig):
@@ -851,31 +861,49 @@ def ssh_verify_manifest(
     sig_path: Path,
     pub_path: Path,
     multiple_signatures: bool,
-    nonstandard_sig: bool,
 ) -> SshVerifyResult:
+    # The signature file's NAME carries no cryptographic weight -- ssh-keygen
+    # -Y verify checks the signature bytes against the data bytes via the
+    # allowed-signers key, never the filename. So a signature file located via
+    # an explicitly-given --sig (the documented, fully-supported way to point
+    # at one) used to trigger a "non-standard filename" [WARN] on every single
+    # use, even though nothing was wrong -- removed rather than kept as a
+    # lower-severity note, since it has no actionable signal either way.
     warnings: List[str] = []
     if multiple_signatures:
         warnings.append("Multiple SSH signatures found; only the selected signature was verified.")
-    if nonstandard_sig:
-        warnings.append("SSH signature verified using a non-standard filename.")
+    # Resolve BEFORE the subprocess call: its cwd is set to manifest_path.parent
+    # below, so a still-relative sig_path would get re-interpreted against that
+    # NEW cwd instead of ours, silently doubling the directory prefix (e.g.
+    # ".testing/output" + cwd ".testing/output" -> looks for the nonexistent
+    # ".testing/output/.testing/output/..."). This was a real bug: any --sig
+    # given as a relative path, or a manifest located via `--verify <dir>`
+    # (whose auto-selected path was itself left relative), failed verification
+    # with an opaque "signature verification failed" and no visible reason.
+    manifest_path = manifest_path.resolve()
+    sig_path = sig_path.resolve()
     allowed_path = _write_allowed_signers(pub_path)
     try:
         # `ssh-keygen -Y verify` reads the signed data from STDIN (not a
         # positional argument), so feed the manifest file on stdin.
         with manifest_path.open("rb") as data_in:
-            subprocess.run(
+            result = subprocess.run(
                 ["ssh-keygen", "-Y", "verify",
                  "-f", str(allowed_path),
                  "-I", SSH_SIGNER_IDENTITY,
                  "-n", SSH_NAMESPACE,
                  "-s", str(sig_path)],
-                stdin=data_in, cwd=manifest_path.parent, check=True,
+                stdin=data_in, cwd=manifest_path.parent,
                 capture_output=True, text=True,
             )
-    except subprocess.CalledProcessError:
-        return SshVerifyResult("FAIL", "SSH signature verification failed.", warnings)
     finally:
         Path(allowed_path).unlink(missing_ok=True)
+    if result.returncode != 0:
+        # Surface WHY (e.g. "Couldn't read signature file", a genuine bad
+        # signature, wrong key) instead of a bare, undiagnosable failure.
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else "unknown reason"
+        return SshVerifyResult("FAIL", f"SSH signature verification failed: {reason}", warnings)
     return SshVerifyResult("OK", "SSH signature verified.", warnings)
 
 
@@ -2783,7 +2811,11 @@ def _resolve_manifest_path(arg: str, out_dir: Path, label: str = "manifest") -> 
             _err(f"No {label} found in {target}")
             sys.exit(2)
         _info(f"Using latest {label}: {candidates[-1].name}")
-        return candidates[-1]
+        # Resolved to absolute, matching the explicit-file branch below: signing/
+        # verification (SSH in particular) runs subprocesses with cwd set to this
+        # path's parent, so a still-relative path here gets silently re-resolved
+        # against that new cwd by anything derived from it later.
+        return candidates[-1].resolve()
     target = target.resolve()
     if not target.exists():
         _err(f"{label.capitalize()} not found: {target}" + _bad_path_hint(arg))
@@ -3090,6 +3122,22 @@ NON_REPUDIATION_WARNING = """
 ╚══════════════════════════════════════════════════╝
 """
 
+# Plain-ASCII fallback: printing the box-drawing version unconditionally would
+# crash with UnicodeEncodeError on a cp1252 console (the common Windows
+# default) -- the same class of bug already fixed for the progress spinner,
+# see _spinner_frames(). _confirm_sign() picks one based on what sys.stdout
+# can actually encode.
+NON_REPUDIATION_WARNING_PLAIN = """
+--- Non-Repudiation Warning ---
+
+Signing a manifest is a serious cryptographic act. By signing, you assert that:
+  - These files existed
+  - In this exact form
+  - At or before the signing time
+
+Anyone with your public key can verify this.
+"""
+
 SSH_NON_REPUDIATION_WARNING = """
 ╔═════════════════════════════════════════════════════╗
 ║             SSH Non-Repudiation Warning             ║
@@ -3104,6 +3152,18 @@ SSH_NON_REPUDIATION_WARNING = """
 ║ Anyone with your public key can verify this.        ║
 ║ FIDO2/hardware keys are kept offline on the device. ║
 ╚═════════════════════════════════════════════════════╝
+"""
+
+SSH_NON_REPUDIATION_WARNING_PLAIN = """
+--- SSH Non-Repudiation Warning ---
+
+Signing with an SSH key binds your identity to this manifest. By signing, you assert that:
+  - These files existed
+  - In this exact form
+  - At or before the signing time
+
+Anyone with your public key can verify this.
+FIDO2/hardware keys are kept offline on the device.
 """
 
 
@@ -3126,11 +3186,22 @@ How would you like to sign this manifest?
     return 4
 
 
-def _confirm_sign(warning_box: str, prompt: str, yes: bool) -> bool:
-    """Show the non-repudiation warning and confirm. -y / --quiet auto-confirm."""
+def _confirm_sign(warning_box: str, warning_plain: str, prompt: str, yes: bool) -> bool:
+    """Show the non-repudiation warning and confirm. -y / --quiet auto-confirm.
+
+    Falls back to warning_plain if the terminal's encoding can't render the
+    Unicode box-drawing border (e.g. cp1252, the common Windows console
+    default) -- printing it unconditionally would crash the tool the first
+    time an interactive sign confirmation is shown.
+    """
     if _quiet or yes:
         return True
-    print(warning_box)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        warning_box.encode(encoding)
+        print(warning_box)
+    except (UnicodeEncodeError, LookupError):
+        print(warning_plain)
     return input(prompt).strip().lower() == "y"
 
 
@@ -3182,7 +3253,7 @@ def resolve_gpg_signer(
 
     show_randomart_gpg(fpr)
     trust_gate_signing("gpg", fpr, trust_level, config)   # may exit(3)
-    if not _confirm_sign(NON_REPUDIATION_WARNING,
+    if not _confirm_sign(NON_REPUDIATION_WARNING, NON_REPUDIATION_WARNING_PLAIN,
                          "Sign this manifest with GPG? [y/N]: ", yes):
         _info("GPG signing cancelled.")
         return None
@@ -3209,7 +3280,7 @@ def resolve_ssh_signer(
     fpr = ssh_key_fingerprint(signer.pub_path)
     show_randomart_ssh(signer.pub_path)
     trust_gate_signing("ssh", fpr, trust_level, config)   # may exit(3)
-    if not _confirm_sign(SSH_NON_REPUDIATION_WARNING,
+    if not _confirm_sign(SSH_NON_REPUDIATION_WARNING, SSH_NON_REPUDIATION_WARNING_PLAIN,
                          "Sign this manifest with SSH? [y/N]: ", yes):
         _info("SSH signing cancelled.")
         return None
@@ -3879,28 +3950,12 @@ supported hash algorithms:
                  + _bad_path_hint(str(args.notebook_dir)))
             sys.exit(2)
 
-        # Resolve manifest path from --verify argument or auto-search
-        verify_arg = args.verify
-        if verify_arg == "__auto__":
-            verify_arg = str(out_dir)
-
-        target = Path(verify_arg)
-        if target.is_dir():
-            _info("Directory provided for manifest, choosing latest")
-            candidates = sorted(
-                list(target.glob("hashes-*.json")) + list(target.glob("hashes-*.txt"))
-            )
-            if not candidates:
-                _err(f"No manifest found in {target}")
-                sys.exit(2)
-            manifest_path = candidates[-1]
-            _info(f"Using latest manifest: {manifest_path.name}")
-        else:
-            manifest_path = target.resolve()
-            if not manifest_path.exists():
-                _err(f"Manifest not found: {manifest_path}"
-                     + _bad_path_hint(verify_arg))
-                sys.exit(2)
+        # Resolve manifest path from --verify argument or auto-search. Shares
+        # _resolve_manifest_path with --validate/--prev-manifest (previously a
+        # separate, drifted copy here — that duplication is exactly how this
+        # code path missed the directory-branch absolute-path fix applied to
+        # the shared helper).
+        manifest_path = _resolve_manifest_path(args.verify, out_dir)
 
         try:
             manifest = _load_manifest(manifest_path)
@@ -4051,11 +4106,9 @@ supported hash algorithms:
                 if signer is None:
                     _warn("No suitable SSH key found for verification")
                     continue
-                canonical_ssh = manifest_path.with_suffix(manifest_path.suffix + ".sshsig")
                 result = ssh_verify_manifest(
                     manifest_path, ssh_sig, signer.pub_path,
                     multiple_signatures=len(ssh_sigs) > 1,
-                    nonstandard_sig=ssh_sig != canonical_ssh,
                 )
                 if result.status == "OK":
                     _ok(result.message)
@@ -4066,6 +4119,7 @@ supported hash algorithms:
                         trust_failed = True
                 else:
                     sig_invalid = True
+                    _warn(result.message)
                 for w in result.warnings:
                     _warn(w)
 
